@@ -1,0 +1,7 @@
+streamlit
+plotly
+pandas
+numpy
+smartapi-python
+pyotp
+requests
