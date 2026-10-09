@@ -1,5 +1,6 @@
 import datetime
 import json
+import re
 import pandas as pd
 import numpy as np
 import pyotp
@@ -69,6 +70,105 @@ api = get_authenticated_api()
 if not api:
     st.error("Authentication failed. Please verify credentials in Secrets.")
     st.stop()
+
+
+# Angel One Instrument Scrip Master for Nifty Options
+@st.cache_data(ttl=1800)
+def load_nfo_scrip_master():
+    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+    try:
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        nfo_items = [
+            x
+            for x in data
+            if x.get("exch_seg") == "NFO"
+            and x.get("name") == "NIFTY"
+            and x.get("instrumenttype") == "OPTIDX"
+        ]
+        df_nfo = pd.DataFrame(nfo_items)
+        if not df_nfo.empty:
+            df_nfo["strike_num"] = (
+                pd.to_numeric(df_nfo["strike"], errors="coerce") / 100.0
+            )
+            df_nfo["exp_dt"] = pd.to_datetime(
+                df_nfo["expiry"], format="%d%b%Y", errors="coerce"
+            )
+        return df_nfo
+    except Exception:
+        return pd.DataFrame()
+
+
+nfo_df = load_nfo_scrip_master()
+
+# Query parameters for option positioning
+params = st.query_params
+active_strike_input = params.get("opt_strike", "23000 CE").strip()
+active_expiry_input = params.get("opt_expiry", "AUTO").strip()
+active_lot_input = int(params.get("opt_lots", "1"))
+
+# Extract available future expirations
+available_expiries = []
+if not nfo_df.empty:
+    today_dt = datetime.datetime.now(IST).date()
+    valid_exps = nfo_df[nfo_df["exp_dt"].dt.date >= today_dt].sort_values("exp_dt")
+    available_expiries = (
+        valid_exps["expiry"].dropna().drop_duplicates().tolist()
+    )
+
+
+def resolve_option_ltp(strike_query_str, selected_expiry="AUTO"):
+    if nfo_df.empty or not strike_query_str:
+        return 0.0, None
+
+    clean_str = strike_query_str.upper().replace(" ", "").strip()
+    match = re.match(r"^(\d+)(CE|PE)$", clean_str)
+    if not match:
+        return 0.0, None
+
+    strike_val = float(match.group(1))
+    opt_type = match.group(2)
+
+    try:
+        subset = nfo_df[
+            (nfo_df["symbol"].str.endswith(opt_type))
+            & (nfo_df["strike_num"] == strike_val)
+        ].copy()
+
+        if subset.empty:
+            return 0.0, None
+
+        if selected_expiry != "AUTO" and selected_expiry in subset["expiry"].values:
+            target_contract = subset[subset["expiry"] == selected_expiry].iloc[0]
+        else:
+            today_dt = datetime.datetime.now(IST).date()
+            fut_contracts = subset[subset["exp_dt"].dt.date >= today_dt].sort_values("exp_dt")
+            target_contract = (
+                fut_contracts.iloc[0] if not fut_contracts.empty else subset.iloc[0]
+            )
+
+        token = str(target_contract["token"])
+        symbol = str(target_contract["symbol"])
+        exp_name = str(target_contract["expiry"])
+
+        ltp_resp = api.getLtpData("NFO", symbol, token)
+        if (
+            isinstance(ltp_resp, dict)
+            and ltp_resp.get("status")
+            and ltp_resp.get("data")
+        ):
+            return float(ltp_resp["data"].get("ltp", 0.0)), exp_name
+    except Exception:
+        pass
+
+    return 0.0, None
+
+
+live_option_ltp, resolved_expiry = resolve_option_ltp(
+    active_strike_input, active_expiry_input
+)
+if active_expiry_input == "AUTO" and resolved_expiry:
+    active_expiry_input = resolved_expiry
 
 
 def fetch_nifty_candles_live_prioritized(total_chunks=5, chunk_days=6):
@@ -163,6 +263,28 @@ if df is None or len(df) == 0:
     st.info("Market feed is initializing...")
     st.stop()
 
+# --- Previous Day Levels (PDH, PDL, PDC, Pivot & Gap Pullback Line) ---
+unique_dates = sorted(df["date"].unique())
+pdh, pdl, pdc, pivot_pt, gap_ref = None, None, None, None, None
+
+if len(unique_dates) >= 2:
+    prev_date = unique_dates[-2]
+    prev_day_df = df[df["date"] == prev_date]
+    if len(prev_day_df) > 0:
+        pdh = round(float(prev_day_df["high"].max()), 2)
+        pdl = round(float(prev_day_df["low"].min()), 2)
+        pdc = round(float(prev_day_df["close"].iloc[-1]), 2)
+        pivot_pt = round((pdh + pdl + pdc) / 3.0, 2)
+        gap_ref = pdc
+
+pivot_lines_data = {
+    "pdh": pdh,
+    "pdl": pdl,
+    "pdc": pdc,
+    "pivot": pivot_pt,
+    "gap_ref": gap_ref,
+}
+
 # --- Strategy Engine ---
 markers = []
 historical_trade_cards = {}
@@ -192,7 +314,6 @@ for session_date, day_df in grouped:
         vwap_val = row["vwap"]
         atr_val = row["atr"]
 
-        # Track active trade throughout the full session
         if session_trade and not session_trade["closed"]:
             t_type = session_trade["type"]
             entry = session_trade["entry"]
@@ -284,9 +405,8 @@ for session_date, day_df in grouped:
 
         # Breakout Entry Window: 09:30 to 10:30 AM
         if datetime.time(9, 30) < t <= datetime.time(10, 30) and not trade_executed_today:
-            # PURE STRUCTURAL STOP LOSS: Candle Low/High +/- 5 pts (No arbitrary point cap)
             if c > day_orb_h and c > vwap_val and c > ema:
-                init_sl = round(l - 5.0, 1)  # Strictly Candle Low - 5 pts
+                init_sl = round(l - 5.0, 1)
                 risk = round(c - init_sl, 1)
                 tp1 = round(c + (atr_val * 3.0), 1)
                 tp_final = round(c + (risk * 3.0), 1)
@@ -331,7 +451,7 @@ for session_date, day_df in grouped:
                     alarm_signal_triggered = True
 
             elif c < day_orb_l and c < vwap_val and c < ema:
-                init_sl = round(h + 5.0, 1)  # Strictly Candle High + 5 pts
+                init_sl = round(h + 5.0, 1)
                 risk = round(init_sl - c, 1)
                 tp1 = round(c - (atr_val * 3.0), 1)
                 tp_final = round(c - (risk * 3.0), 1)
@@ -436,6 +556,8 @@ ema_json = json.dumps(
 )
 markers_json = json.dumps(markers)
 history_cards_json = json.dumps(historical_trade_cards)
+pivots_json = json.dumps(pivot_lines_data)
+available_expiries_json = json.dumps(available_expiries)
 
 # HUD Table Payload
 hud_payload = None
@@ -448,6 +570,7 @@ if trade_executed_in_latest_session and latest_trade_for_hud:
     risk_pts = latest_trade_for_hud["risk"]
     target1_pts = round(abs(latest_trade_for_hud["tp1"] - entry_p), 1)
     target_final_pts = round(abs(latest_trade_for_hud["tp_final"] - entry_p), 1)
+    current_pts = round(curr["close"] - entry_p, 1) if is_ce else round(entry_p - curr["close"], 1)
 
     hud_payload = {
         "is_no_trade": False,
@@ -460,6 +583,11 @@ if trade_executed_in_latest_session and latest_trade_for_hud:
         "trailing_sl": f"{trail_p:.1f}",
         "trail_stage": latest_trade_for_hud["trail_stage"],
         "secured_pts": f"{secured_pts:+.1f} pts",
+        "current_pts": current_pts,
+        "raw_risk_pts": risk_pts,
+        "raw_target1_pts": target1_pts,
+        "raw_target_final_pts": target_final_pts,
+        "raw_secured_pts": secured_pts,
         "theme": "#089981" if is_ce else "#f23645",
     }
 elif (not trade_executed_in_latest_session) and (latest_bar_time >= datetime.time(10, 30)):
@@ -478,6 +606,7 @@ elif latest_trade_for_hud:
     risk_pts = latest_trade_for_hud["risk"]
     target1_pts = round(abs(latest_trade_for_hud["tp1"] - entry_p), 1)
     target_final_pts = round(abs(latest_trade_for_hud["tp_final"] - entry_p), 1)
+    current_pts = round(curr["close"] - entry_p, 1) if is_ce else round(entry_p - curr["close"], 1)
 
     hud_payload = {
         "is_no_trade": False,
@@ -490,6 +619,11 @@ elif latest_trade_for_hud:
         "trailing_sl": f"{trail_p:.1f}",
         "trail_stage": latest_trade_for_hud["trail_stage"],
         "secured_pts": f"{secured_pts:+.1f} pts",
+        "current_pts": current_pts,
+        "raw_risk_pts": risk_pts,
+        "raw_target1_pts": target1_pts,
+        "raw_target_final_pts": target_final_pts,
+        "raw_secured_pts": secured_pts,
         "theme": "#089981" if is_ce else "#f23645",
     }
 
@@ -528,7 +662,7 @@ html_code = f"""
             max-width: calc(100vw - 80px);
         }}
         .top-row-1 {{
-            display: flex; align-items: center; gap: 8px; pointer-events: auto; flex-wrap: wrap;
+            display: flex; align-items: center; gap: 6px; pointer-events: auto; flex-wrap: wrap;
         }}
         .sym-group {{
             display: flex; align-items: center; gap: 5px;
@@ -551,6 +685,23 @@ html_code = f"""
         }}
         .tf-btn.active {{
             background: #2962ff; color: #ffffff; font-weight: 700; cursor: default; opacity: 1.0;
+        }}
+
+        /* Option Sizing Bar: Strike + Expiry Dropdown + Lots */
+        .pos-bar {{
+            display: flex; align-items: center; gap: 4px; background: rgba(22, 26, 37, 0.95);
+            padding: 2px 6px; border-radius: 4px; border: 1px solid #363c4e; font-size: 9.5px;
+            color: #d1d4dc;
+        }}
+        .pos-input {{
+            background: #0b0e14; border: 1px solid #2a2e39; color: #00e5ff;
+            font-size: 10px; padding: 1px 4px; border-radius: 2px; text-align: center;
+            font-weight: 700;
+        }}
+        .pos-select {{
+            background: #0b0e14; border: 1px solid #2a2e39; color: #ffd600;
+            font-size: 9.5px; padding: 1px 2px; border-radius: 2px; font-weight: 600;
+            outline: none; cursor: pointer;
         }}
 
         .alarm-toggle-btn {{
@@ -581,12 +732,13 @@ html_code = f"""
         }}
         .dynamic-ohlc-row b {{ color: #d1d4dc; }}
 
+        /* Draggable HUD Table (3 Columns: Metric, Index Points, Option Points/₹) */
         .draggable-strategy-box {{
             position: absolute; bottom: 48px; right: 65px; z-index: 60;
             background: rgba(19, 23, 34, 0.97); border: 1px solid #2a2e39;
             border-radius: 6px; font-size: 9.5px; color: #d1d4dc; overflow: hidden;
             box-shadow: 0 4px 18px rgba(0,0,0,0.9); cursor: grab; user-select: none;
-            touch-action: none;
+            touch-action: none; min-width: 310px;
         }}
         .draggable-strategy-box:active {{ cursor: grabbing; }}
         .box-drag-handle {{
@@ -594,11 +746,17 @@ html_code = f"""
             color: #787b86; text-align: center; border-bottom: 1px solid #2a2e39;
             letter-spacing: 0.5px;
         }}
-        .draggable-strategy-box table {{ border-collapse: collapse; }}
-        .draggable-strategy-box td {{ padding: 3px 8px; border-bottom: 1px solid #222631; white-space: nowrap; }}
+        .draggable-strategy-box table {{ border-collapse: collapse; width: 100%; }}
+        .draggable-strategy-box th {{
+            background: #131722; padding: 3px 6px; font-size: 8.5px; font-weight: 700;
+            color: #787b86; border-bottom: 1px solid #2a2e39; text-align: right;
+        }}
+        .draggable-strategy-box th:first-child {{ text-align: left; }}
+        .draggable-strategy-box td {{ padding: 3px 6px; border-bottom: 1px solid #222631; white-space: nowrap; }}
         .draggable-strategy-box tr:last-child td {{ border-bottom: none; }}
-        .label-cell {{ color: #787b86; font-weight: 500; }}
+        .label-cell {{ color: #787b86; font-weight: 500; text-align: left; }}
         .val-cell {{ font-weight: 700; color: #ffffff; text-align: right; }}
+        .opt-cell {{ font-weight: 700; color: #ffd600; text-align: right; }}
         .tag-pill {{ color: #fff; font-weight: bold; border-radius: 2px; padding: 1px 5px; text-align: center; font-size: 9px; }}
         .text-red {{ color: #f23645; }}
         .text-green {{ color: #089981; }}
@@ -636,6 +794,20 @@ html_code = f"""
                 <button class="tf-btn" disabled>1D</button>
             </div>
 
+            <!-- Strike + Expiry Date Dropdown + Lots -->
+            <div class="pos-bar">
+                <span>Strike:</span>
+                <input id="strikeInput" class="pos-input" type="text" style="width: 65px;" value="{active_strike_input}" onchange="applyOptionContractChange()" />
+                <span>Expiry:</span>
+                <select id="expirySelect" class="pos-select" onchange="applyOptionContractChange()">
+                    <!-- Injected Expiries -->
+                </select>
+                <span>LTP: <b id="dispLTP" style="color: #ffd600;">₹{live_option_ltp:.1f}</b></span>
+                <span>Lots:</span>
+                <input id="lotCount" class="pos-input" type="number" style="width: 35px;" value="{active_lot_input}" onchange="updateLivePL()" />
+                <span>Qty: <b id="totalQty" style="color:#00bfa5;">{active_lot_input * 25}</b></span>
+            </div>
+
             <button id="alarmBtn" class="alarm-toggle-btn" onclick="toggleAudioAlarm()">
                 🔔 <span id="alarmTxt">Enable Audio</span>
             </button>
@@ -656,6 +828,37 @@ html_code = f"""
     <div id="chartArea"></div>
 
     <script>
+        const expList = {available_expiries_json};
+        const currentSelectedExp = "{active_expiry_input}";
+        const expDropdown = document.getElementById('expirySelect');
+
+        if (expList && expList.length > 0) {{
+            expList.forEach(exp => {{
+                const opt = document.createElement('option');
+                opt.value = exp;
+                opt.innerText = exp;
+                if (exp === currentSelectedExp) opt.selected = true;
+                expDropdown.appendChild(opt);
+            }});
+        }} else {{
+            const opt = document.createElement('option');
+            opt.value = currentSelectedExp;
+            opt.innerText = currentSelectedExp;
+            opt.selected = true;
+            expDropdown.appendChild(opt);
+        }}
+
+        function applyOptionContractChange() {{
+            const strk = document.getElementById('strikeInput').value;
+            const exp = document.getElementById('expirySelect').value;
+            const lots = document.getElementById('lotCount').value;
+            const url = new URL(window.parent.location.href);
+            url.searchParams.set('opt_strike', strk);
+            url.searchParams.set('opt_expiry', exp);
+            url.searchParams.set('opt_lots', lots);
+            window.parent.location.href = url.href;
+        }}
+
         let audioCtx = null;
         let alarmUnlocked = localStorage.getItem('nifty_alarm_active') === 'true';
         let alarmTimer = null;
@@ -807,6 +1010,7 @@ html_code = f"""
 
         candleSeries.setMarkers({markers_json});
 
+        // 1. Session ORB Reference Lines
         candleSeries.createPriceLine({{
             price: {curr_orb_h:.2f},
             color: '#089981',
@@ -825,34 +1029,181 @@ html_code = f"""
             title: 'ORB LOW'
         }});
 
+        // 2. Previous Day Pivot Points & Gap Pullback Line
+        const pv = {pivots_json};
+        if (pv && pv.pdh) {{
+            candleSeries.createPriceLine({{
+                price: pv.pdh,
+                color: '#ffd600',
+                lineWidth: 1,
+                lineStyle: LightweightCharts.LineStyle.Dashed,
+                axisLabelVisible: true,
+                title: 'PDH'
+            }});
+            candleSeries.createPriceLine({{
+                price: pv.pdl,
+                color: '#ff9100',
+                lineWidth: 1,
+                lineStyle: LightweightCharts.LineStyle.Dashed,
+                axisLabelVisible: true,
+                title: 'PDL'
+            }});
+            candleSeries.createPriceLine({{
+                price: pv.pdc,
+                color: '#90a4ae',
+                lineWidth: 1,
+                lineStyle: LightweightCharts.LineStyle.Dotted,
+                axisLabelVisible: true,
+                title: 'PDC'
+            }});
+            candleSeries.createPriceLine({{
+                price: pv.pivot,
+                color: '#b0bec5',
+                lineWidth: 1,
+                lineStyle: LightweightCharts.LineStyle.SparseDotted,
+                axisLabelVisible: true,
+                title: 'PIVOT'
+            }});
+            if (pv.gap_ref) {{
+                candleSeries.createPriceLine({{
+                    price: pv.gap_ref,
+                    color: '#7c4dff',
+                    lineWidth: 1,
+                    lineStyle: LightweightCharts.LineStyle.Dashed,
+                    axisLabelVisible: true,
+                    title: 'GAP PULLBACK REF'
+                }});
+            }}
+        }}
+
+        // Dynamic 3-Column Parallel Table Calculation (Index Spot vs Option LTP)
         const s = {hud_json};
         const table = document.getElementById('strategyBox');
+        let currentOptLTP = {live_option_ltp};
+
+        function updateLivePL() {{
+            const lots = parseInt(document.getElementById('lotCount').value) || 1;
+            const lotSize = 25;
+            const totalQty = lots * lotSize;
+            document.getElementById('totalQty').innerText = totalQty;
+
+            if (!s || s.is_no_trade) return;
+
+            const delta = 0.50; // Standard ATM Option Delta proxy
+            const optEntry = currentOptLTP > 0 ? currentOptLTP : 0.0;
+            
+            // Map corresponding option points based on delta
+            const optRiskPts = Math.round((s.raw_risk_pts * delta) * 10) / 10;
+            const optSLPrice = Math.max(0, Math.round((optEntry - optRiskPts) * 10) / 10);
+            const totalMaxRisk = Math.round(optRiskPts * totalQty);
+
+            const optT1Pts = Math.round((s.raw_target1_pts * delta) * 10) / 10;
+            const optT1Price = Math.round((optEntry + optT1Pts) * 10) / 10;
+            const totalT1Profit = Math.round(optT1Pts * totalQty);
+
+            const optFinalPts = Math.round((s.raw_target_final_pts * delta) * 10) / 10;
+            const optFinalPrice = Math.round((optEntry + optFinalPts) * 10) / 10;
+
+            const optTrailPts = Math.round((s.raw_secured_pts * delta) * 10) / 10;
+            const optTrailPrice = Math.round((optEntry + optTrailPts) * 10) / 10;
+
+            const currentRunningPts = Math.round((s.current_pts * delta) * 10) / 10;
+            const currentTotalProfit = Math.round(currentRunningPts * totalQty);
+            const currentSign = currentTotalProfit >= 0 ? '+' : '';
+            const pnlColor = currentTotalProfit >= 0 ? '#089981' : '#f23645';
+
+            // Populate Option Column Cells
+            const cellOptEntry = document.getElementById('cellOptEntry');
+            if (cellOptEntry) cellOptEntry.innerText = `₹${{optEntry.toFixed(1)}}`;
+
+            const cellOptSL = document.getElementById('cellOptSL');
+            if (cellOptSL) cellOptSL.innerText = `₹${{optSLPrice.toFixed(1)}} (-₹${{totalMaxRisk}})`;
+
+            const cellOptT1 = document.getElementById('cellOptT1');
+            if (cellOptT1) cellOptT1.innerText = `₹${{optT1Price.toFixed(1)}} (+₹${{totalT1Profit}})`;
+
+            const cellOptFinal = document.getElementById('cellOptFinal');
+            if (cellOptFinal) cellOptFinal.innerText = `₹${{optFinalPrice.toFixed(1)}}`;
+
+            const cellOptTrail = document.getElementById('cellOptTrail');
+            if (cellOptTrail) cellOptTrail.innerText = `₹${{optTrailPrice.toFixed(1)}}`;
+
+            const cellOptSecured = document.getElementById('cellOptSecured');
+            if (cellOptSecured) cellOptSecured.innerText = `${{currentSign}}₹${{currentTotalProfit}}`;
+            if (cellOptSecured) cellOptSecured.style.color = pnlColor;
+        }}
+
         if (s) {{
             table.style.display = 'block';
             if (s.is_no_trade) {{
                 table.innerHTML = `
                     <div class="box-drag-handle">::: DRAG TABLE :::</div>
                     <table>
-                        <tr><td class="label-cell">Session Status</td><td class="val-cell"><span class="tag-pill" style="background:#546e7a;">${{s.status}}</span></td></tr>
-                        <tr><td class="label-cell">Reason</td><td class="val-cell" style="font-size:9px; color:#cfd3dc;">${{s.reason}}</td></tr>
-                        <tr><td class="label-cell">Action</td><td class="val-cell text-green">${{s.action}}</td></tr>
+                        <tr><td class="label-cell">Session Status</td><td class="val-cell" colspan="2"><span class="tag-pill" style="background:#546e7a;">${{s.status}}</span></td></tr>
+                        <tr><td class="label-cell">Reason</td><td class="val-cell" colspan="2" style="font-size:9px; color:#cfd3dc;">${{s.reason}}</td></tr>
+                        <tr><td class="label-cell">Action</td><td class="val-cell text-green" colspan="2">${{s.action}}</td></tr>
                     </table>
                 `;
             }} else {{
+                // 3 Parallel Columns: Row items (Original) | Index Points | Option Value
                 table.innerHTML = `
-                    <div class="box-drag-handle">::: DRAG TABLE :::</div>
+                    <div class="box-drag-handle">::: DRAG STRATEGY HUD :::</div>
                     <table>
-                        <tr><td class="label-cell">Call or Put</td><td class="val-cell"><span class="tag-pill" style="background:${{s.theme}}">${{s.call_or_put}}</span></td></tr>
-                        <tr><td class="label-cell">Reason for trade</td><td class="val-cell" style="font-size:9px; color:#cfd3dc;">${{s.reason}}</td></tr>
-                        <tr><td class="label-cell">Entry</td><td class="val-cell"><b>${{s.entry}}</b></td></tr>
-                        <tr><td class="label-cell">SL (risk pts)</td><td class="val-cell text-red">${{s.sl_risk}}</td></tr>
-                        <tr><td class="label-cell">Target 1 (3 ATR)</td><td class="val-cell text-green">${{s.target1}}</td></tr>
-                        <tr><td class="label-cell">Target Final</td><td class="val-cell text-green">${{s.target_final}}</td></tr>
-                        <tr><td class="label-cell">Trailing SL</td><td class="val-cell text-trail">${{s.trailing_sl}}</td></tr>
-                        <tr><td class="label-cell">Trail Mode</td><td class="val-cell text-stage">${{s.trail_stage}}</td></tr>
-                        <tr><td class="label-cell">Secured Points</td><td class="val-cell text-green"><b>${{s.secured_pts}}</b></td></tr>
+                        <thead>
+                            <tr>
+                                <th>Parameter</th>
+                                <th>Index (Spot)</th>
+                                <th>Option ({active_strike_input})</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td class="label-cell">Call or Put</td>
+                                <td class="val-cell"><span class="tag-pill" style="background:${{s.theme}}">${{s.call_or_put}}</span></td>
+                                <td class="opt-cell"><span class="tag-pill" style="background:${{s.theme}}">${{s.call_or_put}}</span></td>
+                            </tr>
+                            <tr>
+                                <td class="label-cell">Reason for trade</td>
+                                <td class="val-cell" colspan="2" style="font-size:8.5px; color:#cfd3dc; text-align:right;">${{s.reason}}</td>
+                            </tr>
+                            <tr>
+                                <td class="label-cell">Entry</td>
+                                <td class="val-cell"><b>${{s.entry}}</b></td>
+                                <td id="cellOptEntry" class="opt-cell">₹{live_option_ltp:.1f}</td>
+                            </tr>
+                            <tr>
+                                <td class="label-cell">SL (risk pts)</td>
+                                <td class="val-cell text-red">${{s.sl_risk}}</td>
+                                <td id="cellOptSL" class="opt-cell text-red">-₹0</td>
+                            </tr>
+                            <tr>
+                                <td class="label-cell">Target 1 (3 ATR)</td>
+                                <td class="val-cell text-green">${{s.target1}}</td>
+                                <td id="cellOptT1" class="opt-cell text-green">+₹0</td>
+                            </tr>
+                            <tr>
+                                <td class="label-cell">Target Final</td>
+                                <td class="val-cell text-green">${{s.target_final}}</td>
+                                <td id="cellOptFinal" class="opt-cell text-green">₹0</td>
+                            </tr>
+                            <tr>
+                                <td class="label-cell">Trailing SL</td>
+                                <td class="val-cell text-trail">${{s.trailing_sl}}</td>
+                                <td id="cellOptTrail" class="opt-cell text-trail">₹0</td>
+                            </tr>
+                            <tr>
+                                <td class="label-cell">Trail Mode</td>
+                                <td class="val-cell text-stage" colspan="2" style="text-align:right;">${{s.trail_stage}}</td>
+                            </tr>
+                            <tr>
+                                <td class="label-cell">Secured / Live P&L</td>
+                                <td class="val-cell text-green"><b>${{s.secured_pts}}</b></td>
+                                <td id="cellOptSecured" class="opt-cell" style="font-weight:800;">₹0</td>
+                            </tr>
+                        </tbody>
                     </table>
                 `;
+                updateLivePL();
             }}
         }}
 
