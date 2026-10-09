@@ -284,10 +284,9 @@ for session_date, day_df in grouped:
 
         # Breakout Entry Window: 09:30 to 10:30 AM
         if datetime.time(9, 30) < t <= datetime.time(10, 30) and not trade_executed_today:
-            # METHOD 1: Breakout Candle Low/High +/- 5 pts (Capped at 30 pts)
+            # PURE STRUCTURAL STOP LOSS: Candle Low/High +/- 5 pts (No arbitrary point cap)
             if c > day_orb_h and c > vwap_val and c > ema:
-                raw_sl = round(l - 5.0, 1)  # Breakout candle Low - 5 pts
-                init_sl = max(raw_sl, round(c - 30.0, 1))  # Max risk capped at 30 pts
+                init_sl = round(l - 5.0, 1)  # Strictly Candle Low - 5 pts
                 risk = round(c - init_sl, 1)
                 tp1 = round(c + (atr_val * 3.0), 1)
                 tp_final = round(c + (risk * 3.0), 1)
@@ -332,8 +331,7 @@ for session_date, day_df in grouped:
                     alarm_signal_triggered = True
 
             elif c < day_orb_l and c < vwap_val and c < ema:
-                raw_sl = round(h + 5.0, 1)  # Breakout candle High + 5 pts
-                init_sl = min(raw_sl, round(c + 30.0, 1))  # Max risk capped at 30 pts
+                init_sl = round(h + 5.0, 1)  # Strictly Candle High + 5 pts
                 risk = round(init_sl - c, 1)
                 tp1 = round(c - (atr_val * 3.0), 1)
                 tp_final = round(c - (risk * 3.0), 1)
