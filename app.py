@@ -8,29 +8,33 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 st.set_page_config(
-    layout="wide", page_title="Nifty 50 Pro Terminal", page_icon="📈"
+    layout="wide",
+    page_title="Nifty 50 Pro Terminal",
+    page_icon="📈",
+    initial_sidebar_state="collapsed",
 )
 
+# Complete Streamlit Chrome Elimination (Pure Fullscreen Styling)
 st.markdown(
     """
 <style>
-    #MainMenu, footer, header {visibility: hidden;}
-    .block-container {padding: 0 !important; max-width: 100% !important;}
-    body {background-color: #0b0e14;}
-    div[data-testid="stRadio"] > div {
-        flex-direction: row;
-        gap: 6px;
-        background: #131722;
-        padding: 6px 10px;
-        border-bottom: 1px solid #2a2e39;
+    #MainMenu, footer, header {display: none !important;}
+    .block-container {
+        padding: 0 !important;
+        margin: 0 !important;
+        max-width: 100vw !important;
+        height: 100vh !important;
+        overflow: hidden !important;
     }
-    div[data-testid="stRadio"] label {
-        color: #787b86 !important;
-        font-weight: 600 !important;
-        font-size: 13px !important;
-        padding: 3px 8px;
-        cursor: pointer;
+    iframe {
+        border: none !important;
+        width: 100vw !important;
+        height: 100vh !important;
+        position: fixed !important;
+        top: 0 !important;
+        left: 0 !important;
     }
+    body {background-color: #0b0e14; margin: 0; overflow: hidden;}
 </style>
 """,
     unsafe_allow_html=True,
@@ -59,44 +63,20 @@ def init_angel_session(api_key, client_code, pin, totp_sec):
 
 api = init_angel_session(API_KEY, CLIENT_CODE, PIN, TOTP_SECRET)
 if not api:
-    st.error("Authentication failed. Please verify Streamlit Secrets.")
+    st.error("Authentication failed. Please check Streamlit Secrets.")
     st.stop()
 
-# --- Timeframe Selector (Max supported lookback per interval) ---
-timeframe_config = {
-    "1m": ("ONE_MINUTE", 7),
-    "3m": ("THREE_MINUTE", 14),
-    "5m": ("FIVE_MINUTE", 30),
-    "15m": ("FIFTEEN_MINUTE", 60),
-    "30m": ("THIRTY_MINUTE", 90),
-    "1h": ("ONE_HOUR", 180),
-    "1D": ("ONE_DAY", 1500),
-    "1W": ("ONE_DAY", 3000),
-    "1M": ("ONE_DAY", 5000),
-}
 
-selected_label = st.radio(
-    "Interval",
-    options=list(timeframe_config.keys()),
-    index=2,  # Default 5m
-    horizontal=True,
-    label_visibility="collapsed",
-)
-api_interval, lookback_days = timeframe_config[selected_label]
-
-
-def fetch_candle_feed(interval_code, days_back):
+def fetch_nifty_market_data():
     now = datetime.datetime.now()
-    from_date = (now - datetime.timedelta(days=days_back)).strftime(
-        "%Y-%m-%d 09:15"
-    )
+    from_date = (now - datetime.timedelta(days=25)).strftime("%Y-%m-%d 09:15")
     to_date = now.strftime("%Y-%m-%d %H:%M")
 
     resp = api.getCandleData(
         {
             "exchange": "NSE",
             "symboltoken": INDEX_TOKEN,
-            "interval": interval_code,
+            "interval": "FIVE_MINUTE",
             "fromdate": from_date,
             "todate": to_date,
         }
@@ -113,22 +93,20 @@ def fetch_candle_feed(interval_code, days_back):
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
 
-    # Filter strictly to official NSE trading hours: 09:15 AM to 03:30 PM
-    if interval_code != "ONE_DAY":
-        df = df[
-            (df["dt"].dt.time >= datetime.time(9, 15))
-            & (df["dt"].dt.time <= datetime.time(15, 30))
-        ].copy()
+    # NSE Trading Hours Only (09:15 - 15:30)
+    df = df[
+        (df["dt"].dt.time >= datetime.time(9, 15))
+        & (df["dt"].dt.time <= datetime.time(15, 30))
+    ].copy()
 
-    # Bulletproof Timestamp Converter (Direct Unix Seconds - No 1970 bug)
+    # Accurate POSIX Seconds (No 1970 bug)
     t_clean = df["dt"].dt.tz_localize(None)
     df["time"] = (
         (t_clean - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
     ).astype(int)
-
     df["date"] = df["dt"].dt.date
 
-    # Session VWAP & 9 EMA
+    # Indicators: Day-Reset VWAP & 9 EMA
     df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
     df["vol_mult"] = df["tp"] * df["volume"].apply(
         lambda v: v if v > 0 else 1000.0
@@ -149,12 +127,12 @@ def fetch_candle_feed(interval_code, days_back):
     return df
 
 
-df = fetch_candle_feed(api_interval, lookback_days)
+df = fetch_nifty_market_data()
 if df is None or len(df) == 0:
-    st.info("Market feed is initializing...")
+    st.info("Connecting to live Angel One feed...")
     st.stop()
 
-# --- Run Strategy Engine Across Complete Historical Dataset ---
+# --- ORB Breakout Engine (1 Trade/Day, Fixed TP1, Dynamic TP2, Tight Trail SL) ---
 markers = []
 latest_trade_for_hud = None
 
@@ -168,7 +146,8 @@ for session_date, day_df in grouped:
     day_orb_h = orb_window["high"].max()
     day_orb_l = orb_window["low"].min()
 
-    session_active_trade = None
+    session_trade = None
+    trade_executed_today = False
 
     for idx in range(len(day_df)):
         row = day_df.iloc[idx]
@@ -177,30 +156,36 @@ for session_date, day_df in grouped:
         ema = row["ema9"]
         vwap_val = row["vwap"]
 
-        if session_active_trade:
-            t_type = session_active_trade["type"]
+        if session_trade and not session_trade["closed"]:
+            t_type = session_trade["type"]
 
             if t_type == "CE":
-                trail_ref = round(ema - 2.5, 1)
-                if trail_ref > session_active_trade["current_sl"]:
-                    session_active_trade["current_sl"] = trail_ref
+                # Dynamic Target 2 extension
+                if h > session_trade["tp2"]:
+                    session_trade["tp2"] = round(h + (session_trade["risk"] * 1.0), 1)
 
-                if (
-                    h >= session_active_trade["tp1"]
-                    and not session_active_trade["tp1_hit"]
-                ):
-                    session_active_trade["tp1_hit"] = True
-                    session_active_trade["current_sl"] = max(
-                        session_active_trade["current_sl"],
-                        session_active_trade["entry"] + 2.0,
+                # Target 1 Reached: Snap Tight Stop Loss
+                if h >= session_trade["tp1"] and not session_trade["tp1_hit"]:
+                    session_trade["tp1_hit"] = True
+                    session_trade["current_sl"] = max(
+                        session_trade["current_sl"],
+                        round(session_trade["entry"] + 3.0, 1),
                     )
 
-                if (
-                    l <= session_active_trade["current_sl"]
-                    or (c < ema and c < o)
-                ):
-                    exit_p = min(c, session_active_trade["current_sl"])
-                    pts = round(exit_p - session_active_trade["entry"], 1)
+                if not session_trade["tp1_hit"]:
+                    trail_candidate = round(ema - 2.5, 1)
+                    if trail_candidate > session_trade["current_sl"]:
+                        session_trade["current_sl"] = trail_candidate
+                else:
+                    tight_ref = max(
+                        round(l - 1.0, 1), round(session_trade["entry"] + 3.0, 1)
+                    )
+                    if tight_ref > session_trade["current_sl"]:
+                        session_trade["current_sl"] = tight_ref
+
+                if l <= session_trade["current_sl"] or (c < ema and c < o):
+                    exit_p = min(c, session_trade["current_sl"])
+                    pts = round(exit_p - session_trade["entry"], 1)
                     markers.append(
                         {
                             "time": int(row["time"]),
@@ -210,50 +195,41 @@ for session_date, day_df in grouped:
                             "text": f"EXIT SL @ {exit_p:.1f} ({pts:+.1f})",
                         }
                     )
-                    session_active_trade["status"] = (
-                        f"STOPPED OUT ({pts:+.1f} pts)"
-                        if pts <= 0
-                        else f"TRAIL HIT (+{pts:.1f} pts)"
+                    session_trade["closed"] = True
+                    session_trade["status"] = (
+                        f"TIGHT SL HIT (+{pts:.1f} pts)"
+                        if pts > 0
+                        else f"STOPPED OUT ({pts:+.1f} pts)"
                     )
-                    session_active_trade["exit_price"] = exit_p
-                    latest_trade_for_hud = session_active_trade.copy()
-                    session_active_trade = None
-
-                elif h >= session_active_trade["tp2"]:
-                    markers.append(
-                        {
-                            "time": int(row["time"]),
-                            "position": "aboveBar",
-                            "color": "#00bfa5",
-                            "shape": "circle",
-                            "text": f"TP2 HIT @ {session_active_trade['tp2']:.1f}",
-                        }
-                    )
-                    session_active_trade["status"] = "TARGET 2 ACHIEVED"
-                    latest_trade_for_hud = session_active_trade.copy()
-                    session_active_trade = None
+                    session_trade["exit_price"] = exit_p
+                    session_trade["exit_pts"] = pts
+                    latest_trade_for_hud = session_trade.copy()
 
             elif t_type == "PE":
-                trail_ref = round(ema + 2.5, 1)
-                if trail_ref < session_active_trade["current_sl"]:
-                    session_active_trade["current_sl"] = trail_ref
+                if l < session_trade["tp2"]:
+                    session_trade["tp2"] = round(l - (session_trade["risk"] * 1.0), 1)
 
-                if (
-                    l <= session_active_trade["tp1"]
-                    and not session_active_trade["tp1_hit"]
-                ):
-                    session_active_trade["tp1_hit"] = True
-                    session_active_trade["current_sl"] = min(
-                        session_active_trade["current_sl"],
-                        session_active_trade["entry"] - 2.0,
+                if l <= session_trade["tp1"] and not session_trade["tp1_hit"]:
+                    session_trade["tp1_hit"] = True
+                    session_trade["current_sl"] = min(
+                        session_trade["current_sl"],
+                        round(session_trade["entry"] - 3.0, 1),
                     )
 
-                if (
-                    h >= session_active_trade["current_sl"]
-                    or (c > ema and c > o)
-                ):
-                    exit_p = max(c, session_active_trade["current_sl"])
-                    pts = round(session_active_trade["entry"] - exit_p, 1)
+                if not session_trade["tp1_hit"]:
+                    trail_candidate = round(ema + 2.5, 1)
+                    if trail_candidate < session_trade["current_sl"]:
+                        session_trade["current_sl"] = trail_candidate
+                else:
+                    tight_ref = min(
+                        round(h + 1.0, 1), round(session_trade["entry"] - 3.0, 1)
+                    )
+                    if tight_ref < session_trade["current_sl"]:
+                        session_trade["current_sl"] = tight_ref
+
+                if h >= session_trade["current_sl"] or (c > ema and c > o):
+                    exit_p = max(c, session_trade["current_sl"])
+                    pts = round(session_trade["entry"] - exit_p, 1)
                     markers.append(
                         {
                             "time": int(row["time"]),
@@ -263,34 +239,22 @@ for session_date, day_df in grouped:
                             "text": f"EXIT SL @ {exit_p:.1f} ({pts:+.1f})",
                         }
                     )
-                    session_active_trade["status"] = (
-                        f"STOPPED OUT ({pts:+.1f} pts)"
-                        if pts <= 0
-                        else f"TRAIL HIT (+{pts:.1f} pts)"
+                    session_trade["closed"] = True
+                    session_trade["status"] = (
+                        f"TIGHT SL HIT (+{pts:.1f} pts)"
+                        if pts > 0
+                        else f"STOPPED OUT ({pts:+.1f} pts)"
                     )
-                    session_active_trade["exit_price"] = exit_p
-                    latest_trade_for_hud = session_active_trade.copy()
-                    session_active_trade = None
+                    session_trade["exit_price"] = exit_p
+                    session_trade["exit_pts"] = pts
+                    latest_trade_for_hud = session_trade.copy()
 
-                elif l <= session_active_trade["tp2"]:
-                    markers.append(
-                        {
-                            "time": int(row["time"]),
-                            "position": "belowBar",
-                            "color": "#00bfa5",
-                            "shape": "circle",
-                            "text": f"TP2 HIT @ {session_active_trade['tp2']:.1f}",
-                        }
-                    )
-                    session_active_trade["status"] = "TARGET 2 ACHIEVED"
-                    latest_trade_for_hud = session_active_trade.copy()
-                    session_active_trade = None
-
-        if t >= datetime.time(9, 30) and not session_active_trade:
+        # Entry Signal (First valid breakout after 09:30)
+        if t >= datetime.time(9, 30) and not trade_executed_today:
             if c > day_orb_h and c > vwap_val and c > ema:
                 init_sl = round(day_orb_h - 5.0, 1)
                 risk = round(c - init_sl, 1)
-                session_active_trade = {
+                session_trade = {
                     "name": "ORB BREAKOUT (CE)",
                     "type": "CE",
                     "entry": round(c, 1),
@@ -300,6 +264,8 @@ for session_date, day_df in grouped:
                     "tp2": round(c + (risk * 2.5), 1),
                     "tp1_hit": False,
                     "risk": risk,
+                    "closed": False,
+                    "reason": "Close > ORB High & VWAP",
                 }
                 markers.append(
                     {
@@ -310,12 +276,13 @@ for session_date, day_df in grouped:
                         "text": f"BUY CE @ {c:.1f}",
                     }
                 )
-                latest_trade_for_hud = session_active_trade.copy()
+                trade_executed_today = True
+                latest_trade_for_hud = session_trade.copy()
 
             elif c < day_orb_l and c < vwap_val and c < ema:
                 init_sl = round(day_orb_l + 5.0, 1)
                 risk = round(init_sl - c, 1)
-                session_active_trade = {
+                session_trade = {
                     "name": "ORB BREAKDOWN (PE)",
                     "type": "PE",
                     "entry": round(c, 1),
@@ -325,6 +292,8 @@ for session_date, day_df in grouped:
                     "tp2": round(c - (risk * 2.5), 1),
                     "tp1_hit": False,
                     "risk": risk,
+                    "closed": False,
+                    "reason": "Close < ORB Low & VWAP",
                 }
                 markers.append(
                     {
@@ -335,7 +304,8 @@ for session_date, day_df in grouped:
                         "text": f"BUY PE @ {c:.1f}",
                     }
                 )
-                latest_trade_for_hud = session_active_trade.copy()
+                trade_executed_today = True
+                latest_trade_for_hud = session_trade.copy()
 
 today_date = df["date"].iloc[-1]
 today_df = df[df["date"] == today_date]
@@ -386,7 +356,7 @@ chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
-# TradingView Native Canvas
+# Fullscreen TradingView Canvas
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -395,9 +365,10 @@ html_code = f"""
     <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{ background-color: #0b0e14; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; overflow: hidden; }}
-        #chartContainer {{ width: 100vw; height: calc(100vh - 44px); position: relative; }}
+        html, body {{ width: 100vw; height: 100vh; background-color: #0b0e14; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; overflow: hidden; }}
+        #chartContainer {{ width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; }}
 
+        /* Top Header Overlay */
         .tv-header {{
             position: absolute; top: 8px; left: 12px; z-index: 20; pointer-events: none;
             display: flex; flex-direction: column; gap: 2px;
@@ -407,26 +378,39 @@ html_code = f"""
         .tv-price {{ font-size: 13px; font-weight: 600; }}
         .tv-ohlc {{ font-size: 11px; color: #787b86; display: flex; gap: 6px; font-family: monospace; }}
 
+        /* Fullscreen Button */
+        .fs-btn {{
+            position: absolute; top: 8px; right: 12px; z-index: 30;
+            background: #1e222d; border: 1px solid #2a2e39; color: #d1d4dc;
+            font-size: 13px; padding: 5px 9px; border-radius: 4px; cursor: pointer;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+        }}
+        .fs-btn:active {{ background: #2962ff; color: #fff; }}
+
+        /* Lower Right Strategy Status Table */
         .strategy-table {{
-            position: absolute; bottom: 25px; right: 55px; z-index: 25;
-            background: rgba(19, 23, 34, 0.95); border: 1px solid #2a2e39;
+            position: absolute; bottom: 25px; right: 65px; z-index: 25;
+            background: rgba(19, 23, 34, 0.96); border: 1px solid #2a2e39;
             border-radius: 6px; font-size: 11px; color: #d1d4dc; overflow: hidden;
-            box-shadow: 0 4px 14px rgba(0,0,0,0.6);
+            box-shadow: 0 4px 14px rgba(0,0,0,0.65);
         }}
         .strategy-table table {{ border-collapse: collapse; }}
-        .strategy-table td {{ padding: 4px 8px; border-bottom: 1px solid #2a2e39; }}
+        .strategy-table td {{ padding: 5px 9px; border-bottom: 1px solid #2a2e39; }}
         .strategy-table tr:last-child td {{ border-bottom: none; }}
         .td-tag {{ color: #fff; font-weight: bold; border-radius: 3px; padding: 2px 6px; text-align: center; }}
         .text-red {{ color: #f23645; }}
         .text-green {{ color: #089981; }}
         .text-trail {{ color: #2962ff; font-weight: bold; }}
+        .text-reason {{ color: #e0e3eb; font-style: italic; max-width: 170px; }}
     </style>
 </head>
 <body>
+    <button class="fs-btn" onclick="toggleFullScreen()">⛶ Fullscreen</button>
+
     <div id="chartContainer">
         <div class="tv-header">
             <div class="tv-title">
-                <span class="badge">50</span> NIFTY 50 ({selected_label})
+                <span class="badge">50</span> NIFTY 50 5m
             </div>
             <div class="tv-price" style="color: {chg_color};">
                 {curr['close']:.2f} <span style="font-size: 11px;">{chg_str}</span>
@@ -445,7 +429,10 @@ html_code = f"""
     </div>
 
     <script>
-        const chart = LightweightCharts.createChart(document.getElementById('chartContainer'), {{
+        const container = document.getElementById('chartContainer');
+        const chart = LightweightCharts.createChart(container, {{
+            width: window.innerWidth,
+            height: window.innerHeight,
             layout: {{
                 background: {{ color: '#0b0e14' }},
                 textColor: '#787b86',
@@ -463,7 +450,7 @@ html_code = f"""
             rightPriceScale: {{
                 borderColor: '#2a2e39',
                 autoScale: true,
-                scaleMargins: {{ top: 0.12, bottom: 0.12 }}
+                scaleMargins: {{ top: 0.08, bottom: 0.08 }}
             }},
             timeScale: {{
                 borderColor: '#2a2e39',
@@ -502,10 +489,9 @@ html_code = f"""
         }});
         emaSeries.setData({ema_json});
 
-        // Set historical & today markers
         candleSeries.setMarkers({markers_json});
 
-        // Current session ORB levels
+        // ORB Level Lines
         candleSeries.createPriceLine({{
             price: {curr_orb_h:.2f},
             color: '#089981',
@@ -524,12 +510,12 @@ html_code = f"""
             title: 'ORB LOW'
         }});
 
-        // Strategy Table HUD
+        // Strategy Status Table
         const tData = {hud_json};
         if (tData) {{
             const isBuy = tData.type === 'CE';
             const theme = isBuy ? '#00bfa5' : '#f23645';
-            const statusText = tData.status ? tData.status : 'IN TRADE (TRAILED)';
+            const statusText = tData.status ? tData.status : (tData.tp1_hit ? 'IN TRADE (TIGHT TRAIL)' : 'IN TRADE (EMA TRAIL)');
             const statusColor = (tData.exit_price !== undefined && tData.exit_price < tData.entry) ? '#f23645' : '#089981';
 
             const table = document.getElementById('strategyTable');
@@ -537,20 +523,18 @@ html_code = f"""
             table.innerHTML = `
                 <table>
                     <tr><td>Signal</td><td class="td-tag" style="background:${{theme}}">${{tData.name}}</td></tr>
+                    <tr><td>Reason</td><td class="text-reason">${{tData.reason}}</td></tr>
                     <tr><td>Status</td><td style="font-weight:bold; color:${{statusColor}}">${{statusText}}</td></tr>
                     <tr><td>Entry</td><td><b>${{tData.entry.toFixed(1)}}</b></td></tr>
                     <tr><td>Initial SL</td><td class="text-red">${{tData.init_sl.toFixed(1)}}</td></tr>
-                    <tr><td>Target 1</td><td class="text-green">${{tData.tp1.toFixed(1)}}</td></tr>
-                    <tr><td>Target 2</td><td class="text-green">${{tData.tp2.toFixed(1)}}</td></tr>
+                    <tr><td>Target 1 (Fixed)</td><td class="text-green">${{tData.tp1.toFixed(1)}}</td></tr>
+                    <tr><td>Target 2 (Dynamic)</td><td class="text-green">${{tData.tp2.toFixed(1)}}</td></tr>
                     <tr><td>Current Trail SL</td><td class="text-trail">${{tData.current_sl.toFixed(1)}}</td></tr>
                 </table>
             `;
         }}
 
-        // Automatically frame the latest candles on screen
-        chart.timeScale().fitContent();
-
-        // Crosshair dynamic OHLC inspector
+        // Dynamic Crosshair Inspector
         chart.subscribeCrosshairMove(param => {{
             if (!param.time || !param.seriesData.get(candleSeries)) return;
             const bar = param.seriesData.get(candleSeries);
@@ -564,17 +548,31 @@ html_code = f"""
             if (eBar) document.getElementById('barEMA').innerText = eBar.value.toFixed(2);
         }});
 
-        window.addEventListener('resize', () => {{
-            chart.applyOptions({{ width: window.innerWidth, height: window.innerHeight - 44 }});
-        }});
+        function resizeChart() {{
+            chart.applyOptions({{
+                width: window.innerWidth,
+                height: window.innerHeight
+            }});
+        }}
+        window.addEventListener('resize', resizeChart);
+
+        function toggleFullScreen() {{
+            if (!document.fullscreenElement) {{
+                document.documentElement.requestFullscreen().catch(() => {{}});
+            }} else {{
+                if (document.exitFullscreen) {{
+                    document.exitFullscreen();
+                }}
+            }}
+        }}
     </script>
 </body>
 </html>
 """
 
-components.html(html_code, height=720, scrolling=False)
+components.html(html_code, height=900, scrolling=False)
 
-# Auto-refresh market feed every 15s
+# Auto-refresh
 st.markdown(
     """
     <script>
