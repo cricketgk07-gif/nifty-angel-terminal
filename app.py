@@ -21,14 +21,14 @@ st.markdown(
         flex-direction: row;
         gap: 6px;
         background: #131722;
-        padding: 4px 8px;
+        padding: 6px 10px;
         border-bottom: 1px solid #2a2e39;
     }
     div[data-testid="stRadio"] label {
         color: #787b86 !important;
         font-weight: 600 !important;
-        font-size: 12px !important;
-        padding: 2px 6px;
+        font-size: 13px !important;
+        padding: 3px 8px;
         cursor: pointer;
     }
 </style>
@@ -59,33 +59,33 @@ def init_angel_session(api_key, client_code, pin, totp_sec):
 
 api = init_angel_session(API_KEY, CLIENT_CODE, PIN, TOTP_SECRET)
 if not api:
-    st.error("Authentication failed. Please check Streamlit Secrets.")
+    st.error("Authentication failed. Please verify Streamlit Secrets.")
     st.stop()
 
-# --- Granular Timeframe Bar ---
-timeframe_dict = {
-    "1m": ("ONE_MINUTE", 5),
-    "3m": ("THREE_MINUTE", 10),
-    "5m": ("FIVE_MINUTE", 20),
-    "15m": ("FIFTEEN_MINUTE", 45),
+# --- Timeframe Selector (Max supported lookback per interval) ---
+timeframe_config = {
+    "1m": ("ONE_MINUTE", 7),
+    "3m": ("THREE_MINUTE", 14),
+    "5m": ("FIVE_MINUTE", 30),
+    "15m": ("FIFTEEN_MINUTE", 60),
     "30m": ("THIRTY_MINUTE", 90),
     "1h": ("ONE_HOUR", 180),
-    "1D": ("ONE_DAY", 365),
-    "1W": ("ONE_DAY", 730),
-    "1M": ("ONE_DAY", 1500),
+    "1D": ("ONE_DAY", 1500),
+    "1W": ("ONE_DAY", 3000),
+    "1M": ("ONE_DAY", 5000),
 }
 
 selected_label = st.radio(
     "Interval",
-    options=list(timeframe_dict.keys()),
+    options=list(timeframe_config.keys()),
     index=2,  # Default 5m
     horizontal=True,
     label_visibility="collapsed",
 )
-api_interval, lookback_days = timeframe_dict[selected_label]
+api_interval, lookback_days = timeframe_config[selected_label]
 
 
-def fetch_nifty_candles(interval_code, days_back):
+def fetch_candle_feed(interval_code, days_back):
     now = datetime.datetime.now()
     from_date = (now - datetime.timedelta(days=days_back)).strftime(
         "%Y-%m-%d 09:15"
@@ -109,25 +109,26 @@ def fetch_nifty_candles(interval_code, days_back):
         resp["data"],
         columns=["timestamp", "open", "high", "low", "close", "volume"],
     )
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df["dt"] = pd.to_datetime(df["timestamp"])
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
 
     # Filter strictly to official NSE trading hours: 09:15 AM to 03:30 PM
     if interval_code != "ONE_DAY":
         df = df[
-            (df["timestamp"].dt.time >= datetime.time(9, 15))
-            & (df["timestamp"].dt.time <= datetime.time(15, 30))
+            (df["dt"].dt.time >= datetime.time(9, 15))
+            & (df["dt"].dt.time <= datetime.time(15, 30))
         ].copy()
 
-    # Timezone fix: Convert directly to UTC POSIX seconds so Lightweight Charts displays exact IST clock time
+    # Bulletproof Timestamp Converter (Direct Unix Seconds - No 1970 bug)
+    t_clean = df["dt"].dt.tz_localize(None)
     df["time"] = (
-        df["timestamp"].astype("int64") // 10**9
-    ) - 19800  # Subtract 5.5 hours (19800s) to neutralize UTC display offset
+        (t_clean - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
+    ).astype(int)
 
-    df["date"] = df["timestamp"].dt.date
+    df["date"] = df["dt"].dt.date
 
-    # Indicators: Session-reset VWAP & 9 EMA
+    # Session VWAP & 9 EMA
     df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
     df["vol_mult"] = df["tp"] * df["volume"].apply(
         lambda v: v if v > 0 else 1000.0
@@ -148,21 +149,19 @@ def fetch_nifty_candles(interval_code, days_back):
     return df
 
 
-df = fetch_nifty_candles(api_interval, lookback_days)
+df = fetch_candle_feed(api_interval, lookback_days)
 if df is None or len(df) == 0:
-    st.info("Market feed is loading...")
+    st.info("Market feed is initializing...")
     st.stop()
 
-# --- Run Strategy Engine Across Entire History ---
+# --- Run Strategy Engine Across Complete Historical Dataset ---
 markers = []
 latest_trade_for_hud = None
 
-# Group by session date so every historical day gets its own independent 09:15-09:30 ORB
 grouped = df.groupby("date")
 
 for session_date, day_df in grouped:
-    # 09:15 to 09:30 ORB calculation for this session
-    orb_window = day_df[day_df["timestamp"].dt.time <= datetime.time(9, 30)]
+    orb_window = day_df[day_df["dt"].dt.time <= datetime.time(9, 30)]
     if len(orb_window) == 0:
         continue
 
@@ -173,22 +172,19 @@ for session_date, day_df in grouped:
 
     for idx in range(len(day_df)):
         row = day_df.iloc[idx]
-        t = row["timestamp"].time()
+        t = row["dt"].time()
         o, h, l, c = row["open"], row["high"], row["low"], row["close"]
         ema = row["ema9"]
         vwap_val = row["vwap"]
 
-        # Trailing SL & Target logic for active position
         if session_active_trade:
             t_type = session_active_trade["type"]
 
             if t_type == "CE":
-                # Ratchet Trailing SL up with 9 EMA
                 trail_ref = round(ema - 2.5, 1)
                 if trail_ref > session_active_trade["current_sl"]:
                     session_active_trade["current_sl"] = trail_ref
 
-                # Target 1: Move SL to Cost
                 if (
                     h >= session_active_trade["tp1"]
                     and not session_active_trade["tp1_hit"]
@@ -199,7 +195,6 @@ for session_date, day_df in grouped:
                         session_active_trade["entry"] + 2.0,
                     )
 
-                # Trailing SL or 9-EMA Failure Hit
                 if (
                     l <= session_active_trade["current_sl"]
                     or (c < ema and c < o)
@@ -224,7 +219,6 @@ for session_date, day_df in grouped:
                     latest_trade_for_hud = session_active_trade.copy()
                     session_active_trade = None
 
-                # Target 2 Hit
                 elif h >= session_active_trade["tp2"]:
                     markers.append(
                         {
@@ -240,12 +234,10 @@ for session_date, day_df in grouped:
                     session_active_trade = None
 
             elif t_type == "PE":
-                # Ratchet Trailing SL down with 9 EMA
                 trail_ref = round(ema + 2.5, 1)
                 if trail_ref < session_active_trade["current_sl"]:
                     session_active_trade["current_sl"] = trail_ref
 
-                # Target 1: Move SL to Cost
                 if (
                     l <= session_active_trade["tp1"]
                     and not session_active_trade["tp1_hit"]
@@ -256,7 +248,6 @@ for session_date, day_df in grouped:
                         session_active_trade["entry"] - 2.0,
                     )
 
-                # Trailing SL or 9-EMA Failure Hit
                 if (
                     h >= session_active_trade["current_sl"]
                     or (c > ema and c > o)
@@ -281,7 +272,6 @@ for session_date, day_df in grouped:
                     latest_trade_for_hud = session_active_trade.copy()
                     session_active_trade = None
 
-                # Target 2 Hit
                 elif l <= session_active_trade["tp2"]:
                     markers.append(
                         {
@@ -296,9 +286,7 @@ for session_date, day_df in grouped:
                     latest_trade_for_hud = session_active_trade.copy()
                     session_active_trade = None
 
-        # Breakout Entry Signal Trigger (after 09:30 AM)
         if t >= datetime.time(9, 30) and not session_active_trade:
-            # Bullish ORB Breakout (CE)
             if c > day_orb_h and c > vwap_val and c > ema:
                 init_sl = round(day_orb_h - 5.0, 1)
                 risk = round(c - init_sl, 1)
@@ -324,7 +312,6 @@ for session_date, day_df in grouped:
                 )
                 latest_trade_for_hud = session_active_trade.copy()
 
-            # Bearish ORB Breakdown (PE)
             elif c < day_orb_l and c < vwap_val and c < ema:
                 init_sl = round(day_orb_l + 5.0, 1)
                 risk = round(init_sl - c, 1)
@@ -350,10 +337,9 @@ for session_date, day_df in grouped:
                 )
                 latest_trade_for_hud = session_active_trade.copy()
 
-# Latest session values for lines & metrics
 today_date = df["date"].iloc[-1]
 today_df = df[df["date"] == today_date]
-today_orb = today_df[today_df["timestamp"].dt.time <= datetime.time(9, 30)]
+today_orb = today_df[today_df["dt"].dt.time <= datetime.time(9, 30)]
 curr_orb_h = (
     today_orb["high"].max()
     if len(today_orb) > 0
@@ -366,7 +352,6 @@ curr_orb_l = (
 )
 curr = df.iloc[-1]
 
-# JSON payloads
 candles_json = json.dumps(
     [
         {
@@ -401,7 +386,7 @@ chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
-# HTML/JS TradingView Canvas
+# TradingView Native Canvas
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -411,7 +396,7 @@ html_code = f"""
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{ background-color: #0b0e14; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; overflow: hidden; }}
-        #chartContainer {{ width: 100vw; height: calc(100vh - 42px); position: relative; }}
+        #chartContainer {{ width: 100vw; height: calc(100vh - 44px); position: relative; }}
 
         .tv-header {{
             position: absolute; top: 8px; left: 12px; z-index: 20; pointer-events: none;
@@ -517,10 +502,10 @@ html_code = f"""
         }});
         emaSeries.setData({ema_json});
 
-        // Historical + Today's Markers
+        // Set historical & today markers
         candleSeries.setMarkers({markers_json});
 
-        // Today's ORB lines
+        // Current session ORB levels
         candleSeries.createPriceLine({{
             price: {curr_orb_h:.2f},
             color: '#089981',
@@ -562,7 +547,10 @@ html_code = f"""
             `;
         }}
 
-        // Dynamic OHLC Crosshair Reader
+        // Automatically frame the latest candles on screen
+        chart.timeScale().fitContent();
+
+        // Crosshair dynamic OHLC inspector
         chart.subscribeCrosshairMove(param => {{
             if (!param.time || !param.seriesData.get(candleSeries)) return;
             const bar = param.seriesData.get(candleSeries);
@@ -577,7 +565,7 @@ html_code = f"""
         }});
 
         window.addEventListener('resize', () => {{
-            chart.applyOptions({{ width: window.innerWidth, height: window.innerHeight - 42 }});
+            chart.applyOptions({{ width: window.innerWidth, height: window.innerHeight - 44 }});
         }});
     </script>
 </body>
@@ -586,7 +574,7 @@ html_code = f"""
 
 components.html(html_code, height=720, scrolling=False)
 
-# 15s auto-refresh
+# Auto-refresh market feed every 15s
 st.markdown(
     """
     <script>
