@@ -49,6 +49,9 @@ PIN = st.secrets.get("PIN", "")
 TOTP_SECRET = st.secrets.get("TOTP_SECRET", "")
 INDEX_TOKEN = "99926000"
 
+# Explicit Indian Standard Time (IST) Offset: UTC + 5:30
+IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+
 
 def get_authenticated_api():
     try:
@@ -68,17 +71,15 @@ if not api:
     st.stop()
 
 
-def fetch_nifty_candles_live_prioritized(total_chunks=4, chunk_days=7):
+def fetch_nifty_candles_live_prioritized(total_chunks=5, chunk_days=6):
     """
-    Pulls data backwards starting STRICTLY from datetime.now() down to history.
-    If any limit or truncation occurs, it only affects older history, 
-    guaranteeing 100% of live candles up to the current minute are preserved.
+    Uses IST clock strictly to ensure 100% of live candles up to 15:30 PM 
+    are fetched without getting truncated by UTC server offsets.
     """
-    now = datetime.datetime.now()
+    now_ist = datetime.datetime.now(IST)
     collected_frames = []
 
-    # Current time anchor
-    current_end = now
+    current_end = now_ist
 
     for _ in range(total_chunks):
         chunk_start = current_end - datetime.timedelta(days=chunk_days)
@@ -104,13 +105,11 @@ def fetch_nifty_candles_live_prioritized(total_chunks=4, chunk_days=7):
         except Exception:
             pass
 
-        # Step back
         current_end = chunk_start
 
     if not collected_frames:
         return None
 
-    # Concatenate and sort
     df = pd.concat(collected_frames, ignore_index=True)
     df["dt"] = pd.to_datetime(df["timestamp"])
     df = df.drop_duplicates(subset=["dt"]).sort_values(by="dt").reset_index(drop=True)
@@ -118,7 +117,6 @@ def fetch_nifty_candles_live_prioritized(total_chunks=4, chunk_days=7):
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
 
-    # Filter bad ticks
     df = df[(df["open"] > 1000) & (df["high"] > 1000) & (df["low"] > 1000) & (df["close"] > 1000)].copy()
 
     # NSE Regular Trading Hours (09:15 - 15:30)
@@ -164,7 +162,7 @@ def fetch_nifty_candles_live_prioritized(total_chunks=4, chunk_days=7):
     return df
 
 
-df = fetch_nifty_candles_live_prioritized(total_chunks=4, chunk_days=7)
+df = fetch_nifty_candles_live_prioritized(total_chunks=5, chunk_days=6)
 if df is None or len(df) == 0:
     st.info("Market feed is initializing...")
     st.stop()
@@ -198,7 +196,7 @@ for session_date, day_df in grouped:
         vwap_val = row["vwap"]
         atr_val = row["atr"]
 
-        # Track active trade throughout the day
+        # Track active trade throughout the full day
         if session_trade and not session_trade["closed"]:
             t_type = session_trade["type"]
             entry = session_trade["entry"]
@@ -288,7 +286,7 @@ for session_date, day_df in grouped:
                     session_trade["trail_stage"] = f"TRADE EXITED ({pts:+.1f} pts)"
                     latest_trade_for_hud = session_trade.copy()
 
-        # Entry window: 09:30 to 10:30 AM
+        # Breakout Entry Window: 09:30 to 10:30 AM
         if datetime.time(9, 30) < t <= datetime.time(10, 30) and not trade_executed_today:
             initial_buf = min(max(round(atr_val * 0.6, 1), 6.0), 9.0)
             if c > day_orb_h and c > vwap_val and c > ema:
@@ -502,6 +500,7 @@ elif latest_trade_for_hud:
 hud_json = json.dumps(hud_payload)
 play_alarm_flag = "true" if alarm_signal_triggered else "false"
 
+now_ist_obj = datetime.datetime.now(IST)
 day_open = today_df.iloc[0]["open"]
 chg = curr["close"] - day_open
 chg_pct = (chg / day_open) * 100
@@ -862,7 +861,7 @@ html_code = f"""
             }}
         }}
 
-        // Dragging Logic
+        // Draggable HUD Logic
         let isDragging = false;
         let startX, startY, initLeft, initTop;
 
@@ -902,7 +901,7 @@ html_code = f"""
         window.addEventListener('touchmove', onDragMove, {{ passive: true }});
         window.addEventListener('touchend', onDragEnd);
 
-        // Historical Hover Card & Crosshair
+        // Historical Trade Card & Crosshair
         const historyCards = {history_cards_json};
         const hTag = document.getElementById('historyTag');
 
