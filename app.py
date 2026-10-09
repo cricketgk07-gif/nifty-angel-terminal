@@ -64,11 +64,15 @@ def get_authenticated_api():
 
 api = get_authenticated_api()
 if not api:
-    st.error("Authentication failed. Please check Streamlit Secrets.")
+    st.error("Authentication failed. Please verify credentials in Secrets.")
     st.stop()
 
+# Fixed 5-minute configuration strictly
+api_interval = "FIVE_MINUTE"
+lookback_days = 30
 
-def fetch_raw_candles(interval_code, days_back):
+
+def fetch_nifty_candles(interval_code, days_back):
     now = datetime.datetime.now()
     from_date = (now - datetime.timedelta(days=days_back)).strftime(
         "%Y-%m-%d 09:15"
@@ -101,7 +105,7 @@ def fetch_raw_candles(interval_code, days_back):
 
     df = df[(df["open"] > 1000) & (df["high"] > 1000) & (df["low"] > 1000) & (df["close"] > 1000)].copy()
 
-    # NSE Trading Hours
+    # NSE Trading Hours strictly
     df = df[
         (df["dt"].dt.time >= datetime.time(9, 15))
         & (df["dt"].dt.time <= datetime.time(15, 30))
@@ -115,57 +119,49 @@ def fetch_raw_candles(interval_code, days_back):
         (t_clean - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
     ).astype(int)
     df["date"] = df["dt"].dt.date
+
+    # Dynamic Volume Proxy for Index
+    candle_spread = (df["high"] - df["low"]) + (df["close"] - df["open"]).abs()
+    raw_vol = df["volume"].apply(lambda v: float(v) if pd.notnull(v) and v > 0 else 0.0)
+    df["calc_vol"] = raw_vol.where(raw_vol > 0, candle_spread * 1250.0 + 500.0)
+
+    # Indicators: Day-Reset VWAP
+    df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
+    df["vol_mult"] = df["tp"] * df["calc_vol"]
+    df["cum_vol"] = df.groupby("date")["calc_vol"].cumsum()
+    df["cum_vp"] = df.groupby("date")["vol_mult"].cumsum()
+    df["vwap"] = df["cum_vp"] / df["cum_vol"]
+    df["vwap"] = df["vwap"].fillna(df["tp"])
+    df.loc[df["vwap"] < 1000, "vwap"] = df["tp"]
+
+    # 9-EMA
+    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
+
+    # 14-period ATR
+    high_low = df["high"] - df["low"]
+    high_cp = (df["high"] - df["close"].shift(1)).abs()
+    low_cp = (df["low"] - df["close"].shift(1)).abs()
+    tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(window=14, min_periods=1).mean()
+    df["atr"] = df["atr"].fillna(15.0)
+
     return df
 
 
-# 1. Fetch 5m candles (Primary Chart & Breakout)
-df_5m = fetch_raw_candles("FIVE_MINUTE", 25)
-# 2. Fetch 1m candles (Micro-Swing Trailing Engine)
-df_1m = fetch_raw_candles("ONE_MINUTE", 5)
-
-if df_5m is None or len(df_5m) == 0:
+df = fetch_nifty_candles(api_interval, lookback_days)
+if df is None or len(df) == 0:
     st.info("Market feed is initializing...")
     st.stop()
 
-# Indicators on 5m
-candle_spread = (df_5m["high"] - df_5m["low"]) + (df_5m["close"] - df_5m["open"]).abs()
-raw_vol = df_5m["volume"].apply(lambda v: float(v) if pd.notnull(v) and v > 0 else 0.0)
-df_5m["calc_vol"] = raw_vol.where(raw_vol > 0, candle_spread * 1250.0 + 500.0)
-
-df_5m["tp"] = (df_5m["high"] + df_5m["low"] + df_5m["close"]) / 3.0
-df_5m["vol_mult"] = df_5m["tp"] * df_5m["calc_vol"]
-df_5m["cum_vol"] = df_5m.groupby("date")["calc_vol"].cumsum()
-df_5m["cum_vp"] = df_5m.groupby("date")["vol_mult"].cumsum()
-df_5m["vwap"] = df_5m["cum_vp"] / df_5m["cum_vol"]
-df_5m["vwap"] = df_5m["vwap"].fillna(df_5m["tp"])
-df_5m.loc[df_5m["vwap"] < 1000, "vwap"] = df_5m["tp"]
-df_5m["ema9"] = df_5m["close"].ewm(span=9, adjust=False).mean()
-
-# 14-period ATR
-h_l = df_5m["high"] - df_5m["low"]
-h_cp = (df_5m["high"] - df_5m["close"].shift(1)).abs()
-l_cp = (df_5m["low"] - df_5m["close"].shift(1)).abs()
-tr = pd.concat([h_l, h_cp, l_cp], axis=1).max(axis=1)
-df_5m["atr"] = tr.rolling(window=14, min_periods=1).mean().fillna(15.0)
-
-# Pre-process 1m Swing Highs / Lows (3-bar fractal pivot)
-if df_1m is not None and len(df_1m) > 0:
-    df_1m["swing_low"] = (
-        (df_1m["low"] < df_1m["low"].shift(1)) & (df_1m["low"] < df_1m["low"].shift(-1))
-    )
-    df_1m["swing_high"] = (
-        (df_1m["high"] > df_1m["high"].shift(1)) & (df_1m["high"] > df_1m["high"].shift(-1))
-    )
-
-# --- Dual-Timeframe Multi-Swing Engine ---
+# --- Adaptive Two-Phase Trailing Engine ---
 markers = []
 historical_trade_cards = {}
 latest_trade_for_hud = None
 
-grouped_5m = df_5m.groupby("date")
+grouped = df.groupby("date")
 
-for session_date, day_5m in grouped_5m:
-    orb_window = day_5m[day_5m["dt"].dt.time <= datetime.time(9, 30)]
+for session_date, day_df in grouped:
+    orb_window = day_df[day_df["dt"].dt.time <= datetime.time(9, 30)]
     if len(orb_window) == 0:
         continue
 
@@ -175,20 +171,10 @@ for session_date, day_5m in grouped_5m:
     session_trade = None
     trade_executed_today = False
 
-    # Get matching 1m session data if available
-    day_1m = (
-        df_1m[df_1m["date"] == session_date]
-        if (df_1m is not None and session_date in df_1m["date"].values)
-        else None
-    )
-
-    for idx in range(len(day_5m)):
-        row = day_5m.iloc[idx]
+    for idx in range(len(day_df)):
+        row = day_df.iloc[idx]
         t = row["dt"].time()
-        c = row["close"]
-        h = row["high"]
-        l = row["low"]
-        o = row["open"]
+        o, h, l, c = row["open"], row["high"], row["low"], row["close"]
         ema = row["ema9"]
         vwap_val = row["vwap"]
         atr_val = row["atr"]
@@ -199,52 +185,38 @@ for session_date, day_5m in grouped_5m:
             base_atr = session_trade["entry_atr"]
             tp1_target = session_trade["tp1"]
 
-            # Query 1m short-term micro-swings up to current 5m bar time
-            curr_bar_dt = row["dt"]
-            m1_data_slice = (
-                day_1m[
-                    (day_1m["dt"] >= session_trade["entry_time"])
-                    & (day_1m["dt"] <= curr_bar_dt)
-                ]
-                if day_1m is not None
-                else None
-            )
-
-            is_nearby_tp1 = (
-                h >= (entry + (2.5 * base_atr))
-                if t_type == "CE"
-                else l <= (entry - (2.5 * base_atr))
-            )
-            has_crossed_tp1 = h >= tp1_target if t_type == "CE" else l <= tp1_target
-
-            if has_crossed_tp1:
-                session_trade["tp1_hit"] = True
-                session_trade["trail_stage"] = "TP1 CROSSED: Tight 1m Bar Trail"
-            elif is_nearby_tp1 and not session_trade["tp1_hit"]:
-                session_trade["trail_stage"] = "NEARBY TP1: 1m Swing Trail Active"
+            # Pullback room (generous before TP1) vs Tight room (nearby/after TP1)
+            wide_buffer = min(max(round(atr_val * 1.0, 1), 7.0), 12.0)
+            tight_buffer = min(max(round(atr_val * 0.35, 1), 3.0), 5.0)
 
             if t_type == "CE":
-                # Find recent 1-minute swing lows
-                if m1_data_slice is not None and len(m1_data_slice) > 0:
-                    swings_1m = m1_data_slice[m1_data_slice["swing_low"]]["low"]
-                    if len(swings_1m) > 0:
-                        recent_1m_low = swings_1m.iloc[-1]
-                        trail_candidate_1m = round(recent_1m_low - 2.5, 1)
+                nearby_threshold = entry + (2.4 * base_atr)
+                is_nearby_tp1 = h >= nearby_threshold
+                has_crossed_tp1 = h >= tp1_target
 
-                        # If crossed or nearby TP1, tighten to last 1m candle low
-                        if session_trade["tp1_hit"] or is_nearby_tp1:
-                            tight_1m = round(m1_data_slice["low"].iloc[-2] - 1.5, 1) if len(m1_data_slice) >= 2 else trail_candidate_1m
-                            target_sl = max(tight_1m, round(entry + (1.8 * base_atr), 1))
-                            if target_sl > session_trade["current_sl"]:
-                                session_trade["current_sl"] = target_sl
-                        else:
-                            # Standard 1m swing low trail
-                            if trail_candidate_1m > session_trade["current_sl"]:
-                                session_trade["current_sl"] = trail_candidate_1m
+                if has_crossed_tp1:
+                    session_trade["tp1_hit"] = True
+                    session_trade["trail_stage"] = "TP1 CROSSED (Tightened Buffer)"
+                elif is_nearby_tp1 and not session_trade["tp1_hit"]:
+                    session_trade["trail_stage"] = "NEARBY TP1 (Tightening Trail)"
+
+                # Breakeven lock once +1.5 ATR is made
+                if h >= (entry + (1.5 * base_atr)) and not session_trade["be_locked"]:
+                    session_trade["be_locked"] = True
+                    session_trade["current_sl"] = max(session_trade["current_sl"], round(entry + 3.0, 1))
+
+                # Adaptive Trailing
+                if session_trade["tp1_hit"] or is_nearby_tp1:
+                    tight_trail = max(round(ema - tight_buffer, 1), round(l - 1.5, 1))
+                    min_locked = round(entry + (1.8 * base_atr), 1) if session_trade["tp1_hit"] else round(entry + 3.0, 1)
+                    target_sl = max(tight_trail, min_locked)
+                    if target_sl > session_trade["current_sl"]:
+                        session_trade["current_sl"] = target_sl
                 else:
-                    # Fallback to 5m EMA if 1m history slice is unavailable
-                    wide_trail = round(ema - (atr_val * 0.9), 1)
-                    if wide_trail > session_trade["current_sl"]:
+                    wide_trail = round(ema - wide_buffer, 1)
+                    if session_trade["be_locked"]:
+                        session_trade["current_sl"] = max(session_trade["current_sl"], wide_trail)
+                    elif wide_trail > session_trade["current_sl"]:
                         session_trade["current_sl"] = wide_trail
 
                 if h > session_trade["tp_final"]:
@@ -259,23 +231,31 @@ for session_date, day_5m in grouped_5m:
                     latest_trade_for_hud = session_trade.copy()
 
             elif t_type == "PE":
-                if m1_data_slice is not None and len(m1_data_slice) > 0:
-                    swings_1m = m1_data_slice[m1_data_slice["swing_high"]]["high"]
-                    if len(swings_1m) > 0:
-                        recent_1m_high = swings_1m.iloc[-1]
-                        trail_candidate_1m = round(recent_1m_high + 2.5, 1)
+                nearby_threshold = entry - (2.4 * base_atr)
+                is_nearby_tp1 = l <= nearby_threshold
+                has_crossed_tp1 = l <= tp1_target
 
-                        if session_trade["tp1_hit"] or is_nearby_tp1:
-                            tight_1m = round(m1_data_slice["high"].iloc[-2] + 1.5, 1) if len(m1_data_slice) >= 2 else trail_candidate_1m
-                            target_sl = min(tight_1m, round(entry - (1.8 * base_atr), 1))
-                            if target_sl < session_trade["current_sl"]:
-                                session_trade["current_sl"] = target_sl
-                        else:
-                            if trail_candidate_1m < session_trade["current_sl"]:
-                                session_trade["current_sl"] = trail_candidate_1m
+                if has_crossed_tp1:
+                    session_trade["tp1_hit"] = True
+                    session_trade["trail_stage"] = "TP1 CROSSED (Tightened Buffer)"
+                elif is_nearby_tp1 and not session_trade["tp1_hit"]:
+                    session_trade["trail_stage"] = "NEARBY TP1 (Tightening Trail)"
+
+                if l <= (entry - (1.5 * base_atr)) and not session_trade["be_locked"]:
+                    session_trade["be_locked"] = True
+                    session_trade["current_sl"] = min(session_trade["current_sl"], round(entry - 3.0, 1))
+
+                if session_trade["tp1_hit"] or is_nearby_tp1:
+                    tight_trail = min(round(ema + tight_buffer, 1), round(h + 1.5, 1))
+                    min_locked = round(entry - (1.8 * base_atr), 1) if session_trade["tp1_hit"] else round(entry - 3.0, 1)
+                    target_sl = min(tight_trail, min_locked)
+                    if target_sl < session_trade["current_sl"]:
+                        session_trade["current_sl"] = target_sl
                 else:
-                    wide_trail = round(ema + (atr_val * 0.9), 1)
-                    if wide_trail < session_trade["current_sl"]:
+                    wide_trail = round(ema + wide_buffer, 1)
+                    if session_trade["be_locked"]:
+                        session_trade["current_sl"] = min(session_trade["current_sl"], wide_trail)
+                    elif wide_trail < session_trade["current_sl"]:
                         session_trade["current_sl"] = wide_trail
 
                 if l < session_trade["tp_final"]:
@@ -289,7 +269,7 @@ for session_date, day_5m in grouped_5m:
                     session_trade["exit_pts"] = pts
                     latest_trade_for_hud = session_trade.copy()
 
-        # 5m Morning Breakout Entry Trigger
+        # Breakout Entry Signal Trigger (Entry Arrows Only)
         if t >= datetime.time(9, 30) and not trade_executed_today:
             initial_buf = min(max(round(atr_val * 0.6, 1), 6.0), 9.0)
             if c > day_orb_h and c > vwap_val and c > ema:
@@ -301,14 +281,14 @@ for session_date, day_5m in grouped_5m:
                     "call_or_put": "CALL (CE)",
                     "type": "CE",
                     "entry": round(c, 1),
-                    "entry_time": row["dt"],
                     "entry_atr": atr_val,
                     "init_sl": init_sl,
                     "current_sl": init_sl,
                     "tp1": tp1,
                     "tp_final": tp_final,
+                    "be_locked": False,
                     "tp1_hit": False,
-                    "trail_stage": "1m SWING TRAIL: Active",
+                    "trail_stage": "PULLBACK ROOM (Wide Trail)",
                     "risk": risk,
                     "closed": False,
                     "reason": "Close > ORB High & VWAP",
@@ -343,14 +323,14 @@ for session_date, day_5m in grouped_5m:
                     "call_or_put": "PUT (PE)",
                     "type": "PE",
                     "entry": round(c, 1),
-                    "entry_time": row["dt"],
                     "entry_atr": atr_val,
                     "init_sl": init_sl,
                     "current_sl": init_sl,
                     "tp1": tp1,
                     "tp_final": tp_final,
+                    "be_locked": False,
                     "tp1_hit": False,
-                    "trail_stage": "1m SWING TRAIL: Active",
+                    "trail_stage": "PULLBACK ROOM (Wide Trail)",
                     "risk": risk,
                     "closed": False,
                     "reason": "Close < ORB Low & VWAP",
@@ -376,8 +356,8 @@ for session_date, day_5m in grouped_5m:
                 trade_executed_today = True
                 latest_trade_for_hud = session_trade.copy()
 
-today_date = df_5m["date"].iloc[-1]
-today_df = df_5m[df_5m["date"] == today_date]
+today_date = df["date"].iloc[-1]
+today_df = df[df["date"] == today_date]
 today_orb = today_df[today_df["dt"].dt.time <= datetime.time(9, 30)]
 curr_orb_h = (
     today_orb["high"].max()
@@ -389,13 +369,13 @@ curr_orb_l = (
     if len(today_orb) > 0
     else today_df.iloc[0:3]["low"].min()
 )
-curr = df_5m.iloc[-1]
+curr = df.iloc[-1]
 
 candles_data = []
 volume_data = []
-vol_max = df_5m["calc_vol"].max() if df_5m["calc_vol"].max() > 0 else 1.0
+vol_max = df["calc_vol"].max() if df["calc_vol"].max() > 0 else 1.0
 
-for _, r in df_5m.iterrows():
+for _, r in df.iterrows():
     candles_data.append(
         {
             "time": int(r["time"]),
@@ -425,20 +405,19 @@ volume_json = json.dumps(volume_data)
 vwap_json = json.dumps(
     [
         {"time": int(r["time"]), "value": round(float(r["vwap"]), 2)}
-        for _, r in df_5m.iterrows()
+        for _, r in df.iterrows()
     ]
 )
 ema_json = json.dumps(
     [
         {"time": int(r["time"]), "value": round(float(r["ema9"]), 2)}
-        for _, r in df_5m.iterrows()
+        for _, r in df.iterrows()
     ]
 )
 markers_json = json.dumps(markers)
 history_cards_json = json.dumps(historical_trade_cards)
 
 hud_payload = None
-dynamic_lines = {}
 if latest_trade_for_hud:
     is_ce = latest_trade_for_hud["type"] == "CE"
     entry_p = latest_trade_for_hud["entry"]
@@ -460,14 +439,8 @@ if latest_trade_for_hud:
         "secured_pts": f"{secured_pts:+.1f} pts",
         "theme": "#089981" if is_ce else "#f23645",
     }
-    dynamic_lines = {
-        "entry": entry_p,
-        "target": latest_trade_for_hud["tp1"],
-        "trailing_sl": trail_p,
-    }
 
 hud_json = json.dumps(hud_payload)
-lines_json = json.dumps(dynamic_lines)
 
 day_open = today_df.iloc[0]["open"]
 chg = curr["close"] - day_open
@@ -683,7 +656,7 @@ html_code = f"""
         // Entry markers only
         candleSeries.setMarkers({markers_json});
 
-        // Static Session ORB Lines
+        // Session ORB High / Low Reference Lines Only
         candleSeries.createPriceLine({{
             price: {curr_orb_h:.2f},
             color: '#089981',
@@ -702,35 +675,6 @@ html_code = f"""
             title: 'ORB LOW'
         }});
 
-        // Dynamic Horizontal Strategy Lines
-        const dLines = {lines_json};
-        if (dLines && dLines.entry) {{
-            candleSeries.createPriceLine({{
-                price: dLines.entry,
-                color: '#2962ff',
-                lineWidth: 2,
-                lineStyle: LightweightCharts.LineStyle.Dotted,
-                axisLabelVisible: true,
-                title: 'ENTRY'
-            }});
-            candleSeries.createPriceLine({{
-                price: dLines.target,
-                color: '#00bfa5',
-                lineWidth: 2,
-                lineStyle: LightweightCharts.LineStyle.Solid,
-                axisLabelVisible: true,
-                title: 'TARGET 1 (3 ATR)'
-            }});
-            candleSeries.createPriceLine({{
-                price: dLines.trailing_sl,
-                color: '#ff9800',
-                lineWidth: 2,
-                lineStyle: LightweightCharts.LineStyle.Solid,
-                axisLabelVisible: true,
-                title: '1m TRAIL SL'
-            }});
-        }}
-
         // Render Strategy Table
         const s = {hud_json};
         const table = document.getElementById('strategyBox');
@@ -745,8 +689,8 @@ html_code = f"""
                     <tr><td class="label-cell">SL (risk pts)</td><td class="val-cell text-red">${{s.sl_risk}}</td></tr>
                     <tr><td class="label-cell">Target 1 (3 ATR)</td><td class="val-cell text-green">${{s.target1}}</td></tr>
                     <tr><td class="label-cell">Target Final</td><td class="val-cell text-green">${{s.target_final}}</td></tr>
-                    <tr><td class="label-cell">Trailing SL (1m)</td><td class="val-cell text-trail">${{s.trailing_sl}}</td></tr>
-                    <tr><td class="label-cell">Trail Source</td><td class="val-cell text-stage">${{s.trail_stage}}</td></tr>
+                    <tr><td class="label-cell">Trailing SL</td><td class="val-cell text-trail">${{s.trailing_sl}}</td></tr>
+                    <tr><td class="label-cell">Trail Mode</td><td class="val-cell text-stage">${{s.trail_stage}}</td></tr>
                     <tr><td class="label-cell">Secured Points</td><td class="val-cell text-green"><b>${{s.secured_pts}}</b></td></tr>
                 </table>
             `;
