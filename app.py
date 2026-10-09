@@ -14,7 +14,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Lock Viewport and Strip Streamlit Margins
 st.markdown(
     """
 <style>
@@ -29,7 +28,7 @@ st.markdown(
     iframe {
         border: none !important;
         width: 100vw !important;
-        height: 100vh !important;
+        height: 75vh !important;
         position: fixed !important;
         top: 0 !important;
         left: 0 !important;
@@ -55,36 +54,35 @@ TOTP_SECRET = st.secrets.get("TOTP_SECRET", "")
 INDEX_TOKEN = "99926000"
 
 
-@st.cache_resource(ttl=28800)
-def init_angel_session(api_key, client_code, pin, totp_sec):
+def get_authenticated_api():
     try:
-        api = SmartConnect(api_key)
-        totp = pyotp.TOTP(totp_sec).now()
-        data = api.generateSession(client_code, pin, totp)
-        if data.get("status"):
+        api = SmartConnect(API_KEY)
+        totp = pyotp.TOTP(TOTP_SECRET).now()
+        sess = api.generateSession(CLIENT_CODE, PIN, totp)
+        if sess and sess.get("status"):
             return api
         return None
     except Exception:
         return None
 
 
-api = init_angel_session(API_KEY, CLIENT_CODE, PIN, TOTP_SECRET)
+api = get_authenticated_api()
 if not api:
-    st.error("Authentication failed. Please verify Streamlit Secrets.")
+    st.error("Authentication failed. Please verify credentials in Secrets.")
     st.stop()
 
-# Query param for URL-driven timeframe selection
+# Query parameters for interval switching
 params = st.query_params
 current_interval = params.get("interval", "5m")
 
 timeframe_config = {
-    "1m": ("ONE_MINUTE", 5),
-    "3m": ("THREE_MINUTE", 10),
-    "5m": ("FIVE_MINUTE", 20),
-    "15m": ("FIFTEEN_MINUTE", 45),
-    "30m": ("THIRTY_MINUTE", 90),
-    "1h": ("ONE_HOUR", 180),
-    "1D": ("ONE_DAY", 1000),
+    "1m": ("ONE_MINUTE", 4),
+    "3m": ("THREE_MINUTE", 7),
+    "5m": ("FIVE_MINUTE", 14),
+    "15m": ("FIFTEEN_MINUTE", 30),
+    "30m": ("THIRTY_MINUTE", 45),
+    "1h": ("ONE_HOUR", 60),
+    "1D": ("ONE_DAY", 365),
 }
 
 if current_interval not in timeframe_config:
@@ -100,17 +98,21 @@ def fetch_nifty_data(interval_code, days_back):
     )
     to_date = now.strftime("%Y-%m-%d %H:%M")
 
-    resp = api.getCandleData(
-        {
-            "exchange": "NSE",
-            "symboltoken": INDEX_TOKEN,
-            "interval": interval_code,
-            "fromdate": from_date,
-            "todate": to_date,
-        }
-    )
+    # Safe call with error fallback to prevent JSONDecodeError crashes
+    try:
+        resp = api.getCandleData(
+            {
+                "exchange": "NSE",
+                "symboltoken": INDEX_TOKEN,
+                "interval": interval_code,
+                "fromdate": from_date,
+                "todate": to_date,
+            }
+        )
+    except Exception:
+        return None
 
-    if not resp.get("status") or not resp.get("data"):
+    if not isinstance(resp, dict) or not resp.get("status") or not resp.get("data"):
         return None
 
     df = pd.DataFrame(
@@ -121,21 +123,24 @@ def fetch_nifty_data(interval_code, days_back):
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
 
-    # NSE Regular Intraday Filter (09:15 - 15:30)
+    # Filter to market hours (09:15 to 15:30)
     if interval_code != "ONE_DAY":
         df = df[
             (df["dt"].dt.time >= datetime.time(9, 15))
             & (df["dt"].dt.time <= datetime.time(15, 30))
         ].copy()
 
-    # POSIX Seconds
+    if len(df) == 0:
+        return None
+
+    # POSIX integer timestamp conversion
     t_clean = df["dt"].dt.tz_localize(None)
     df["time"] = (
         (t_clean - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
     ).astype(int)
     df["date"] = df["dt"].dt.date
 
-    # Indicators: Day-Reset VWAP & 9 EMA
+    # Indicators: Session VWAP & 9-EMA
     df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
     df["vol_mult"] = df["tp"] * df["volume"].apply(
         lambda v: v if v > 0 else 1000.0
@@ -158,10 +163,10 @@ def fetch_nifty_data(interval_code, days_back):
 
 df = fetch_nifty_data(api_interval, lookback_days)
 if df is None or len(df) == 0:
-    st.info("Streaming live candles from Angel One...")
+    st.info("Market feed is refreshing. Reconnecting...")
     st.stop()
 
-# --- Exact Strategy Engine: 1 Trade Per Day with Tight Trailing SL ---
+# --- Exact Strategy Engine: 1 Trade/Day, Fixed TP1, Dynamic TP2, Tight Trail SL ---
 markers = []
 latest_trade_for_hud = None
 
@@ -189,11 +194,9 @@ for session_date, day_df in grouped:
             t_type = session_trade["type"]
 
             if t_type == "CE":
-                # Dynamic Target 2 Extension
                 if h > session_trade["tp2"]:
                     session_trade["tp2"] = round(h + (session_trade["risk"] * 1.0), 1)
 
-                # Target 1 Reached: Snap Tight Stop Loss
                 if h >= session_trade["tp1"] and not session_trade["tp1_hit"]:
                     session_trade["tp1_hit"] = True
                     session_trade["current_sl"] = max(
@@ -278,7 +281,7 @@ for session_date, day_df in grouped:
                     session_trade["exit_pts"] = pts
                     latest_trade_for_hud = session_trade.copy()
 
-        # 1 Trade per Day (First valid Breakout after 09:30 AM)
+        # Breakout Entry Signal Trigger (after 09:30 AM)
         if t >= datetime.time(9, 30) and not trade_executed_today:
             if c > day_orb_h and c > vwap_val and c > ema:
                 init_sl = round(day_orb_h - 5.0, 1)
@@ -351,7 +354,6 @@ curr_orb_l = (
 )
 curr = df.iloc[-1]
 
-# Candlestick and Volume Data Serialization
 candles_data = []
 volume_data = []
 
@@ -402,7 +404,7 @@ chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
-# --- Edge-to-Edge Locked Canvas with Pinned HUD & Controls ---
+# --- 75% Viewport Pinned Canvas Component ---
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -412,7 +414,7 @@ html_code = f"""
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         html, body {{
-            width: 100vw; height: 100vh;
+            width: 100vw; height: 75vh;
             background-color: #0b0e14;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             overflow: hidden;
@@ -421,24 +423,24 @@ html_code = f"""
             user-select: none;
         }}
         #chartContainer {{
-            width: 100vw; height: 100vh;
+            width: 100vw; height: 75vh;
             position: absolute; top: 0; left: 0; z-index: 1;
         }}
 
         /* Pinned Top-Left UI Overlay */
         .pinned-header {{
-            position: fixed; top: 8px; left: 10px; z-index: 50;
-            display: flex; flex-direction: column; gap: 4px; pointer-events: none;
+            position: fixed; top: 6px; left: 8px; z-index: 50;
+            display: flex; flex-direction: column; gap: 3px; pointer-events: none;
         }}
         .top-row {{
             display: flex; align-items: center; gap: 8px; pointer-events: auto;
         }}
         .badge {{
-            background: #2962ff; color: #fff; font-size: 11px; padding: 2px 5px;
+            background: #2962ff; color: #fff; font-size: 10px; padding: 2px 5px;
             border-radius: 3px; font-weight: 700;
         }}
         .symbol-name {{
-            font-size: 14px; font-weight: 700; color: #d1d4dc;
+            font-size: 13px; font-weight: 700; color: #d1d4dc;
         }}
         .symbol-price {{
             font-size: 13px; font-weight: 700;
@@ -446,58 +448,45 @@ html_code = f"""
 
         /* Pinned Timeframe Switcher */
         .tf-bar {{
-            display: flex; gap: 3px; background: rgba(30, 34, 45, 0.9);
+            display: flex; gap: 2px; background: rgba(30, 34, 45, 0.9);
             padding: 2px 4px; border-radius: 4px; border: 1px solid #2a2e39;
         }}
         .tf-btn {{
             background: transparent; border: none; color: #787b86;
-            font-size: 11px; font-weight: 600; padding: 3px 6px;
+            font-size: 10px; font-weight: 600; padding: 2px 5px;
             border-radius: 3px; cursor: pointer;
         }}
         .tf-btn.active {{
             background: #2a2e39; color: #d1d4dc; font-weight: 700;
         }}
 
-        /* Pinned Live OHLC & Indicators Ribbon */
+        /* Pinned Live OHLC Ribbon */
         .ohlc-ribbon {{
-            font-size: 11px; color: #787b86; display: flex; gap: 7px;
-            background: rgba(11, 14, 20, 0.85); padding: 3px 8px;
-            border-radius: 4px; border: 1px solid rgba(42, 46, 57, 0.4);
+            font-size: 10px; color: #787b86; display: flex; gap: 6px;
+            background: rgba(11, 14, 20, 0.85); padding: 2px 6px;
+            border-radius: 3px; border: 1px solid rgba(42, 46, 57, 0.4);
             font-family: monospace; width: fit-content;
         }}
         .ohlc-ribbon b {{ color: #d1d4dc; }}
 
-        /* Pinned Top-Right Controls */
-        .pinned-top-right {{
-            position: fixed; top: 8px; right: 75px; z-index: 50;
-            display: flex; gap: 6px;
-        }}
-        .action-btn {{
-            background: rgba(30, 34, 45, 0.9); border: 1px solid #2a2e39;
-            color: #d1d4dc; font-size: 11px; padding: 4px 8px;
-            border-radius: 4px; cursor: pointer; font-weight: 600;
-        }}
-        .action-btn:active {{ background: #2962ff; color: #fff; }}
-
         /* Pinned Bottom-Right Strategy Table */
         .pinned-strategy-table {{
-            position: fixed; bottom: 35px; right: 75px; z-index: 50;
+            position: fixed; bottom: 25px; right: 65px; z-index: 50;
             background: rgba(19, 23, 34, 0.96); border: 1px solid #2a2e39;
-            border-radius: 6px; font-size: 11px; color: #d1d4dc; overflow: hidden;
-            box-shadow: 0 4px 16px rgba(0,0,0,0.7);
+            border-radius: 6px; font-size: 10px; color: #d1d4dc; overflow: hidden;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.7);
         }}
         .pinned-strategy-table table {{ border-collapse: collapse; }}
-        .pinned-strategy-table td {{ padding: 5px 9px; border-bottom: 1px solid #2a2e39; }}
+        .pinned-strategy-table td {{ padding: 4px 8px; border-bottom: 1px solid #2a2e39; }}
         .pinned-strategy-table tr:last-child td {{ border-bottom: none; }}
-        .td-tag {{ color: #fff; font-weight: bold; border-radius: 3px; padding: 2px 6px; text-align: center; }}
+        .td-tag {{ color: #fff; font-weight: bold; border-radius: 3px; padding: 2px 5px; text-align: center; }}
         .text-red {{ color: #f23645; }}
         .text-green {{ color: #089981; }}
         .text-trail {{ color: #2962ff; font-weight: bold; }}
-        .text-reason {{ color: #e0e3eb; font-style: italic; max-width: 175px; }}
+        .text-reason {{ color: #e0e3eb; font-style: italic; max-width: 160px; }}
     </style>
 </head>
 <body>
-    <!-- Top-Left Fixed Header -->
     <div class="pinned-header">
         <div class="top-row">
             <span class="badge">50</span>
@@ -525,22 +514,16 @@ html_code = f"""
         </div>
     </div>
 
-    <!-- Top-Right Fixed Controls -->
-    <div class="pinned-top-right">
-        <button class="action-btn" onclick="toggleFullScreen()">⛶ Fullscreen</button>
-    </div>
-
-    <!-- Bottom-Right Fixed Strategy Table -->
     <div id="strategyTable" class="pinned-strategy-table" style="display: none;"></div>
 
-    <!-- Main Chart Canvas Container -->
     <div id="chartContainer"></div>
 
     <script>
         const container = document.getElementById('chartContainer');
+        const chartHeight = window.innerHeight * 0.75;
         const chart = LightweightCharts.createChart(container, {{
             width: window.innerWidth,
-            height: window.innerHeight,
+            height: chartHeight,
             layout: {{
                 background: {{ color: '#0b0e14' }},
                 textColor: '#787b86',
@@ -569,11 +552,11 @@ html_code = f"""
                 rightOffset: 8
             }},
             localization: {{
-                priceFormatter: p => p.toFixed(2) // 5-digit index precision: 22485.65
+                priceFormatter: p => p.toFixed(2)
             }}
         }});
 
-        // 1. Candlestick Series
+        // Candlesticks
         const candleSeries = chart.addCandlestickSeries({{
             upColor: '#089981',
             downColor: '#f23645',
@@ -585,10 +568,10 @@ html_code = f"""
         }});
         candleSeries.setData({candles_json});
 
-        // 2. Volume Histogram Series (Bottom Sub-pane)
+        // Volume sub-pane
         const volumeSeries = chart.addHistogramSeries({{
             priceFormat: {{ type: 'volume' }},
-            priceScaleId: '', // Separate scale
+            priceScaleId: '',
             scaleMargins: {{
                 top: 0.82,
                 bottom: 0.0
@@ -596,7 +579,7 @@ html_code = f"""
         }});
         volumeSeries.setData({volume_json});
 
-        // 3. Purple Session VWAP
+        // VWAP
         const vwapSeries = chart.addLineSeries({{
             color: '#ab47bc',
             lineWidth: 2,
@@ -605,7 +588,7 @@ html_code = f"""
         }});
         vwapSeries.setData({vwap_json});
 
-        // 4. Blue 9-EMA
+        // 9-EMA
         const emaSeries = chart.addLineSeries({{
             color: '#2962ff',
             lineWidth: 1,
@@ -614,10 +597,10 @@ html_code = f"""
         }});
         emaSeries.setData({ema_json});
 
-        // 5. Strategy Signal Markers (BUY CE, BUY PE, EXIT SL)
+        // Strategy markers
         candleSeries.setMarkers({markers_json});
 
-        // 6. Current Session 09:15 - 09:30 ORB Boundaries
+        // ORB Level Lines
         candleSeries.createPriceLine({{
             price: {curr_orb_h:.2f},
             color: '#089981',
@@ -636,7 +619,7 @@ html_code = f"""
             title: 'ORB LOW'
         }});
 
-        // 7. Render Pinned Strategy Status Table
+        // Status Table HUD
         const tData = {hud_json};
         if (tData) {{
             const isBuy = tData.type === 'CE';
@@ -660,7 +643,7 @@ html_code = f"""
             `;
         }}
 
-        // 8. Dynamic Floating Crosshair Inspector
+        // Dynamic OHLC Inspector
         chart.subscribeCrosshairMove(param => {{
             if (!param.time || !param.seriesData.get(candleSeries)) return;
             const bar = param.seriesData.get(candleSeries);
@@ -674,39 +657,26 @@ html_code = f"""
             if (eBar) document.getElementById('barEMA').innerText = eBar.value.toFixed(2);
         }});
 
-        // Window resize event handler
         window.addEventListener('resize', () => {{
             chart.applyOptions({{
                 width: window.innerWidth,
-                height: window.innerHeight
+                height: window.innerHeight * 0.75
             }});
         }});
 
-        // Timeframe switch helper
         function changeTF(tf) {{
             const url = new URL(window.parent.location.href);
             url.searchParams.set('interval', tf);
             window.parent.location.href = url.href;
-        }}
-
-        // Fullscreen toggle helper
-        function toggleFullScreen() {{
-            if (!document.fullscreenElement) {{
-                document.documentElement.requestFullscreen().catch(() => {{}});
-            }} else {{
-                if (document.exitFullscreen) {{
-                    document.exitFullscreen();
-                }}
-            }}
         }}
     </script>
 </body>
 </html>
 """
 
-components.html(html_code, height=920, scrolling=False)
+components.html(html_code, height=650, scrolling=False)
 
-# Auto-refresh market feed every 15s
+# Auto-refresh
 st.markdown(
     """
     <script>
