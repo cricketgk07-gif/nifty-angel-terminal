@@ -59,33 +59,33 @@ def init_angel_session(api_key, client_code, pin, totp_sec):
 
 api = init_angel_session(API_KEY, CLIENT_CODE, PIN, TOTP_SECRET)
 if not api:
-    st.error("Authentication failed. Please verify Streamlit Secrets.")
+    st.error("Authentication failed. Please check Streamlit Secrets.")
     st.stop()
 
-# --- Top Navigation Bar: 1m to 1 Month ---
+# --- Granular Timeframe Bar ---
 timeframe_dict = {
-    "1m": ("ONE_MINUTE", 2),
-    "3m": ("THREE_MINUTE", 4),
-    "5m": ("FIVE_MINUTE", 5),
-    "15m": ("FIFTEEN_MINUTE", 15),
-    "30m": ("THIRTY_MINUTE", 30),
-    "1h": ("ONE_HOUR", 60),
+    "1m": ("ONE_MINUTE", 5),
+    "3m": ("THREE_MINUTE", 10),
+    "5m": ("FIVE_MINUTE", 20),
+    "15m": ("FIFTEEN_MINUTE", 45),
+    "30m": ("THIRTY_MINUTE", 90),
+    "1h": ("ONE_HOUR", 180),
     "1D": ("ONE_DAY", 365),
-    "1W": ("ONE_DAY", 730),  # Aggregated from Daily
-    "1M": ("ONE_DAY", 1500),  # Aggregated from Daily
+    "1W": ("ONE_DAY", 730),
+    "1M": ("ONE_DAY", 1500),
 }
 
 selected_label = st.radio(
     "Interval",
     options=list(timeframe_dict.keys()),
-    index=2,  # Default to 5m
+    index=2,  # Default 5m
     horizontal=True,
     label_visibility="collapsed",
 )
 api_interval, lookback_days = timeframe_dict[selected_label]
 
 
-def fetch_nifty_data(interval_code, days_back):
+def fetch_nifty_candles(interval_code, days_back):
     now = datetime.datetime.now()
     from_date = (now - datetime.timedelta(days=days_back)).strftime(
         "%Y-%m-%d 09:15"
@@ -113,26 +113,21 @@ def fetch_nifty_data(interval_code, days_back):
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
 
-    # Convert IST timestamp correctly to integer seconds Unix timestamp
-    # (Angel One gives IST timestamps; we convert to proper UTC seconds for lightweight-charts)
-    df["time"] = (
-        (df["timestamp"] - datetime.timedelta(hours=5, minutes=30)).astype(
-            "int64"
-        )
-        // 10**9
-    )
-
-    # Intraday filter (09:15 - 15:30) for intraday timeframes
-    if interval_code not in ["ONE_DAY"]:
+    # Filter strictly to official NSE trading hours: 09:15 AM to 03:30 PM
+    if interval_code != "ONE_DAY":
         df = df[
             (df["timestamp"].dt.time >= datetime.time(9, 15))
             & (df["timestamp"].dt.time <= datetime.time(15, 30))
         ].copy()
 
-    df["date"] = df["timestamp"].dt.date
-    today = df["date"].iloc[-1]
+    # Timezone fix: Convert directly to UTC POSIX seconds so Lightweight Charts displays exact IST clock time
+    df["time"] = (
+        df["timestamp"].astype("int64") // 10**9
+    ) - 19800  # Subtract 5.5 hours (19800s) to neutralize UTC display offset
 
-    # Session VWAP & 9-EMA
+    df["date"] = df["timestamp"].dt.date
+
+    # Indicators: Session-reset VWAP & 9 EMA
     df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
     df["vol_mult"] = df["tp"] * df["volume"].apply(
         lambda v: v if v > 0 else 1000.0
@@ -150,206 +145,228 @@ def fetch_nifty_data(interval_code, days_back):
     df["vwap"] = df["cum_vp"] / df["cum_vol"]
     df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
 
-    # Calculate Today's 15m ORB (09:15 - 09:30)
-    today_df = df[df["date"] == today]
-    orb_df = today_df[today_df["timestamp"].dt.time <= datetime.time(9, 30)]
-
-    orb_h = (
-        orb_df["high"].max()
-        if len(orb_df) > 0
-        else today_df.iloc[0:3]["high"].max()
-    )
-    orb_l = (
-        orb_df["low"].min() if len(orb_df) > 0 else today_df.iloc[0:3]["low"].min()
-    )
-
-    df["orb_h"] = orb_h
-    df["orb_l"] = orb_l
-
-    return df, today, orb_h, orb_l
+    return df
 
 
-data_tuple = fetch_nifty_data(api_interval, lookback_days)
-if not data_tuple or len(data_tuple[0]) == 0:
-    st.info("Fetching market data...")
+df = fetch_nifty_candles(api_interval, lookback_days)
+if df is None or len(df) == 0:
+    st.info("Market feed is loading...")
     st.stop()
 
-df, today_date, orb_h, orb_l = data_tuple
-today_df = df[df["date"] == today_date].copy()
-curr = df.iloc[-1]
-
-# Strategy Trailing SL & Signal Engine
+# --- Run Strategy Engine Across Entire History ---
 markers = []
-active_trade = None
-completed_trade = None
+latest_trade_for_hud = None
 
-for i in range(len(today_df)):
-    row = today_df.iloc[i]
-    t = row["timestamp"].time()
-    o, h, l, c = row["open"], row["high"], row["low"], row["close"]
-    ema = row["ema9"]
-    vwap_val = row["vwap"]
+# Group by session date so every historical day gets its own independent 09:15-09:30 ORB
+grouped = df.groupby("date")
 
-    if active_trade:
-        trade_type = active_trade["type"]
+for session_date, day_df in grouped:
+    # 09:15 to 09:30 ORB calculation for this session
+    orb_window = day_df[day_df["timestamp"].dt.time <= datetime.time(9, 30)]
+    if len(orb_window) == 0:
+        continue
 
-        if trade_type == "CE":
-            trail_ref = round(ema - 2.5, 1)
-            if trail_ref > active_trade["current_sl"]:
-                active_trade["current_sl"] = trail_ref
+    day_orb_h = orb_window["high"].max()
+    day_orb_l = orb_window["low"].min()
 
-            if h >= active_trade["tp1"] and not active_trade["tp1_hit"]:
-                active_trade["tp1_hit"] = True
-                active_trade["current_sl"] = max(
-                    active_trade["current_sl"], active_trade["entry"] + 2.0
-                )
+    session_active_trade = None
 
-            if l <= active_trade["current_sl"] or (c < ema and c < o):
-                exit_price = min(c, active_trade["current_sl"])
-                pts = round(exit_price - active_trade["entry"], 1)
-                markers.append(
-                    {
-                        "time": int(row["time"]),
-                        "position": "aboveBar",
-                        "color": "#f23645",
-                        "shape": "arrowDown",
-                        "text": f"EXIT SL @ {exit_price:.1f} ({pts:+.1f} pts)",
-                    }
-                )
-                completed_trade = active_trade.copy()
-                completed_trade["status"] = (
-                    f"STOPPED OUT ({pts:+.1f} pts)"
-                    if pts <= 0
-                    else f"TRAIL HIT (+{pts:.1f} pts)"
-                )
-                completed_trade["exit_price"] = exit_price
-                completed_trade["exit_pts"] = pts
-                active_trade = None
+    for idx in range(len(day_df)):
+        row = day_df.iloc[idx]
+        t = row["timestamp"].time()
+        o, h, l, c = row["open"], row["high"], row["low"], row["close"]
+        ema = row["ema9"]
+        vwap_val = row["vwap"]
 
-            elif h >= active_trade["tp2"]:
-                markers.append(
-                    {
-                        "time": int(row["time"]),
-                        "position": "aboveBar",
-                        "color": "#00bfa5",
-                        "shape": "circle",
-                        "text": f"TARGET 2 HIT @ {active_trade['tp2']:.1f}",
-                    }
-                )
-                completed_trade = active_trade.copy()
-                completed_trade["status"] = "TARGET 2 ACHIEVED"
-                completed_trade["exit_price"] = active_trade["tp2"]
-                completed_trade["exit_pts"] = round(
-                    active_trade["tp2"] - active_trade["entry"], 1
-                )
-                active_trade = None
+        # Trailing SL & Target logic for active position
+        if session_active_trade:
+            t_type = session_active_trade["type"]
 
-        elif trade_type == "PE":
-            trail_ref = round(ema + 2.5, 1)
-            if trail_ref < active_trade["current_sl"]:
-                active_trade["current_sl"] = trail_ref
+            if t_type == "CE":
+                # Ratchet Trailing SL up with 9 EMA
+                trail_ref = round(ema - 2.5, 1)
+                if trail_ref > session_active_trade["current_sl"]:
+                    session_active_trade["current_sl"] = trail_ref
 
-            if l <= active_trade["tp1"] and not active_trade["tp1_hit"]:
-                active_trade["tp1_hit"] = True
-                active_trade["current_sl"] = min(
-                    active_trade["current_sl"], active_trade["entry"] - 2.0
-                )
+                # Target 1: Move SL to Cost
+                if (
+                    h >= session_active_trade["tp1"]
+                    and not session_active_trade["tp1_hit"]
+                ):
+                    session_active_trade["tp1_hit"] = True
+                    session_active_trade["current_sl"] = max(
+                        session_active_trade["current_sl"],
+                        session_active_trade["entry"] + 2.0,
+                    )
 
-            if h >= active_trade["current_sl"] or (c > ema and c > o):
-                exit_price = max(c, active_trade["current_sl"])
-                pts = round(active_trade["entry"] - exit_price, 1)
+                # Trailing SL or 9-EMA Failure Hit
+                if (
+                    l <= session_active_trade["current_sl"]
+                    or (c < ema and c < o)
+                ):
+                    exit_p = min(c, session_active_trade["current_sl"])
+                    pts = round(exit_p - session_active_trade["entry"], 1)
+                    markers.append(
+                        {
+                            "time": int(row["time"]),
+                            "position": "aboveBar",
+                            "color": "#f23645",
+                            "shape": "arrowDown",
+                            "text": f"EXIT SL @ {exit_p:.1f} ({pts:+.1f})",
+                        }
+                    )
+                    session_active_trade["status"] = (
+                        f"STOPPED OUT ({pts:+.1f} pts)"
+                        if pts <= 0
+                        else f"TRAIL HIT (+{pts:.1f} pts)"
+                    )
+                    session_active_trade["exit_price"] = exit_p
+                    latest_trade_for_hud = session_active_trade.copy()
+                    session_active_trade = None
+
+                # Target 2 Hit
+                elif h >= session_active_trade["tp2"]:
+                    markers.append(
+                        {
+                            "time": int(row["time"]),
+                            "position": "aboveBar",
+                            "color": "#00bfa5",
+                            "shape": "circle",
+                            "text": f"TP2 HIT @ {session_active_trade['tp2']:.1f}",
+                        }
+                    )
+                    session_active_trade["status"] = "TARGET 2 ACHIEVED"
+                    latest_trade_for_hud = session_active_trade.copy()
+                    session_active_trade = None
+
+            elif t_type == "PE":
+                # Ratchet Trailing SL down with 9 EMA
+                trail_ref = round(ema + 2.5, 1)
+                if trail_ref < session_active_trade["current_sl"]:
+                    session_active_trade["current_sl"] = trail_ref
+
+                # Target 1: Move SL to Cost
+                if (
+                    l <= session_active_trade["tp1"]
+                    and not session_active_trade["tp1_hit"]
+                ):
+                    session_active_trade["tp1_hit"] = True
+                    session_active_trade["current_sl"] = min(
+                        session_active_trade["current_sl"],
+                        session_active_trade["entry"] - 2.0,
+                    )
+
+                # Trailing SL or 9-EMA Failure Hit
+                if (
+                    h >= session_active_trade["current_sl"]
+                    or (c > ema and c > o)
+                ):
+                    exit_p = max(c, session_active_trade["current_sl"])
+                    pts = round(session_active_trade["entry"] - exit_p, 1)
+                    markers.append(
+                        {
+                            "time": int(row["time"]),
+                            "position": "belowBar",
+                            "color": "#00bfa5",
+                            "shape": "arrowUp",
+                            "text": f"EXIT SL @ {exit_p:.1f} ({pts:+.1f})",
+                        }
+                    )
+                    session_active_trade["status"] = (
+                        f"STOPPED OUT ({pts:+.1f} pts)"
+                        if pts <= 0
+                        else f"TRAIL HIT (+{pts:.1f} pts)"
+                    )
+                    session_active_trade["exit_price"] = exit_p
+                    latest_trade_for_hud = session_active_trade.copy()
+                    session_active_trade = None
+
+                # Target 2 Hit
+                elif l <= session_active_trade["tp2"]:
+                    markers.append(
+                        {
+                            "time": int(row["time"]),
+                            "position": "belowBar",
+                            "color": "#00bfa5",
+                            "shape": "circle",
+                            "text": f"TP2 HIT @ {session_active_trade['tp2']:.1f}",
+                        }
+                    )
+                    session_active_trade["status"] = "TARGET 2 ACHIEVED"
+                    latest_trade_for_hud = session_active_trade.copy()
+                    session_active_trade = None
+
+        # Breakout Entry Signal Trigger (after 09:30 AM)
+        if t >= datetime.time(9, 30) and not session_active_trade:
+            # Bullish ORB Breakout (CE)
+            if c > day_orb_h and c > vwap_val and c > ema:
+                init_sl = round(day_orb_h - 5.0, 1)
+                risk = round(c - init_sl, 1)
+                session_active_trade = {
+                    "name": "ORB BREAKOUT (CE)",
+                    "type": "CE",
+                    "entry": round(c, 1),
+                    "init_sl": init_sl,
+                    "current_sl": init_sl,
+                    "tp1": round(c + (risk * 1.5), 1),
+                    "tp2": round(c + (risk * 2.5), 1),
+                    "tp1_hit": False,
+                    "risk": risk,
+                }
                 markers.append(
                     {
                         "time": int(row["time"]),
                         "position": "belowBar",
                         "color": "#00bfa5",
                         "shape": "arrowUp",
-                        "text": f"EXIT SL @ {exit_price:.1f} ({pts:+.1f} pts)",
+                        "text": f"BUY CE @ {c:.1f}",
                     }
                 )
-                completed_trade = active_trade.copy()
-                completed_trade["status"] = (
-                    f"STOPPED OUT ({pts:+.1f} pts)"
-                    if pts <= 0
-                    else f"TRAIL HIT (+{pts:.1f} pts)"
-                )
-                completed_trade["exit_price"] = exit_price
-                completed_trade["exit_pts"] = pts
-                active_trade = None
+                latest_trade_for_hud = session_active_trade.copy()
 
-            elif l <= active_trade["tp2"]:
+            # Bearish ORB Breakdown (PE)
+            elif c < day_orb_l and c < vwap_val and c < ema:
+                init_sl = round(day_orb_l + 5.0, 1)
+                risk = round(init_sl - c, 1)
+                session_active_trade = {
+                    "name": "ORB BREAKDOWN (PE)",
+                    "type": "PE",
+                    "entry": round(c, 1),
+                    "init_sl": init_sl,
+                    "current_sl": init_sl,
+                    "tp1": round(c - (risk * 1.5), 1),
+                    "tp2": round(c - (risk * 2.5), 1),
+                    "tp1_hit": False,
+                    "risk": risk,
+                }
                 markers.append(
                     {
                         "time": int(row["time"]),
-                        "position": "belowBar",
-                        "color": "#00bfa5",
-                        "shape": "circle",
-                        "text": f"TARGET 2 HIT @ {active_trade['tp2']:.1f}",
+                        "position": "aboveBar",
+                        "color": "#f23645",
+                        "shape": "arrowDown",
+                        "text": f"BUY PE @ {c:.1f}",
                     }
                 )
-                completed_trade = active_trade.copy()
-                completed_trade["status"] = "TARGET 2 ACHIEVED"
-                completed_trade["exit_price"] = active_trade["tp2"]
-                completed_trade["exit_pts"] = round(
-                    active_trade["entry"] - active_trade["tp2"], 1
-                )
-                active_trade = None
+                latest_trade_for_hud = session_active_trade.copy()
 
-    if t >= datetime.time(9, 30) and not active_trade and not completed_trade:
-        if c > orb_h and c > vwap_val and c > ema:
-            init_sl = round(orb_h - 5.0, 1)
-            risk = round(c - init_sl, 1)
-            tp1 = round(c + (risk * 1.5), 1)
-            tp2 = round(c + (risk * 2.5), 1)
-            active_trade = {
-                "name": "ORB BREAKOUT (CE)",
-                "type": "CE",
-                "entry": round(c, 1),
-                "init_sl": init_sl,
-                "current_sl": init_sl,
-                "tp1": tp1,
-                "tp2": tp2,
-                "tp1_hit": False,
-                "risk": risk,
-            }
-            markers.append(
-                {
-                    "time": int(row["time"]),
-                    "position": "belowBar",
-                    "color": "#00bfa5",
-                    "shape": "arrowUp",
-                    "text": f"BUY CE @ {c:.1f}",
-                }
-            )
+# Latest session values for lines & metrics
+today_date = df["date"].iloc[-1]
+today_df = df[df["date"] == today_date]
+today_orb = today_df[today_df["timestamp"].dt.time <= datetime.time(9, 30)]
+curr_orb_h = (
+    today_orb["high"].max()
+    if len(today_orb) > 0
+    else today_df.iloc[0:3]["high"].max()
+)
+curr_orb_l = (
+    today_orb["low"].min()
+    if len(today_orb) > 0
+    else today_df.iloc[0:3]["low"].min()
+)
+curr = df.iloc[-1]
 
-        elif c < orb_l and c < vwap_val and c < ema:
-            init_sl = round(orb_l + 5.0, 1)
-            risk = round(init_sl - c, 1)
-            tp1 = round(c - (risk * 1.5), 1)
-            tp2 = round(c - (risk * 2.5), 1)
-            active_trade = {
-                "name": "ORB BREAKDOWN (PE)",
-                "type": "PE",
-                "entry": round(c, 1),
-                "init_sl": init_sl,
-                "current_sl": init_sl,
-                "tp1": tp1,
-                "tp2": tp2,
-                "tp1_hit": False,
-                "risk": risk,
-            }
-            markers.append(
-                {
-                    "time": int(row["time"]),
-                    "position": "aboveBar",
-                    "color": "#f23645",
-                    "shape": "arrowDown",
-                    "text": f"BUY PE @ {c:.1f}",
-                }
-            )
-
-trade_for_hud = active_trade if active_trade else completed_trade
-
+# JSON payloads
 candles_json = json.dumps(
     [
         {
@@ -376,7 +393,7 @@ ema_json = json.dumps(
     ]
 )
 markers_json = json.dumps(markers)
-hud_json = json.dumps(trade_for_hud)
+hud_json = json.dumps(latest_trade_for_hud)
 
 day_open = today_df.iloc[0]["open"]
 chg = curr["close"] - day_open
@@ -384,7 +401,7 @@ chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
-# TradingView lightweight canvas
+# HTML/JS TradingView Canvas
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -394,7 +411,7 @@ html_code = f"""
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{ background-color: #0b0e14; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; overflow: hidden; }}
-        #chartContainer {{ width: 100vw; height: calc(100vh - 40px); position: relative; }}
+        #chartContainer {{ width: 100vw; height: calc(100vh - 42px); position: relative; }}
 
         .tv-header {{
             position: absolute; top: 8px; left: 12px; z-index: 20; pointer-events: none;
@@ -500,11 +517,12 @@ html_code = f"""
         }});
         emaSeries.setData({ema_json});
 
-        // Set markers on the candles
+        // Historical + Today's Markers
         candleSeries.setMarkers({markers_json});
 
+        // Today's ORB lines
         candleSeries.createPriceLine({{
-            price: {orb_h:.2f},
+            price: {curr_orb_h:.2f},
             color: '#089981',
             lineWidth: 2,
             lineStyle: LightweightCharts.LineStyle.Dashed,
@@ -513,7 +531,7 @@ html_code = f"""
         }});
 
         candleSeries.createPriceLine({{
-            price: {orb_l:.2f},
+            price: {curr_orb_l:.2f},
             color: '#f23645',
             lineWidth: 2,
             lineStyle: LightweightCharts.LineStyle.Dashed,
@@ -521,13 +539,13 @@ html_code = f"""
             title: 'ORB LOW'
         }});
 
-        // Render Strategy HUD Table
+        // Strategy Table HUD
         const tData = {hud_json};
         if (tData) {{
             const isBuy = tData.type === 'CE';
             const theme = isBuy ? '#00bfa5' : '#f23645';
             const statusText = tData.status ? tData.status : 'IN TRADE (TRAILED)';
-            const statusColor = (tData.exit_pts !== undefined && tData.exit_pts < 0) ? '#f23645' : '#089981';
+            const statusColor = (tData.exit_price !== undefined && tData.exit_price < tData.entry) ? '#f23645' : '#089981';
 
             const table = document.getElementById('strategyTable');
             table.style.display = 'block';
@@ -544,10 +562,7 @@ html_code = f"""
             `;
         }}
 
-        // Make chart automatically focus and fit the latest candles on screen
-        chart.timeScale().fitContent();
-
-        // Crosshair dynamic OHLC inspector
+        // Dynamic OHLC Crosshair Reader
         chart.subscribeCrosshairMove(param => {{
             if (!param.time || !param.seriesData.get(candleSeries)) return;
             const bar = param.seriesData.get(candleSeries);
@@ -562,7 +577,7 @@ html_code = f"""
         }});
 
         window.addEventListener('resize', () => {{
-            chart.applyOptions({{ width: window.innerWidth, height: window.innerHeight - 40 }});
+            chart.applyOptions({{ width: window.innerWidth, height: window.innerHeight - 42 }});
         }});
     </script>
 </body>
@@ -571,7 +586,7 @@ html_code = f"""
 
 components.html(html_code, height=720, scrolling=False)
 
-# Auto-refresh
+# 15s auto-refresh
 st.markdown(
     """
     <script>
