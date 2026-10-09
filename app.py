@@ -72,10 +72,6 @@ if not api:
 
 
 def fetch_nifty_candles_live_prioritized(total_chunks=5, chunk_days=6):
-    """
-    Uses IST clock strictly to ensure 100% of live candles up to 15:30 PM 
-    are fetched without getting truncated by UTC server offsets.
-    """
     now_ist = datetime.datetime.now(IST)
     collected_frames = []
 
@@ -196,7 +192,7 @@ for session_date, day_df in grouped:
         vwap_val = row["vwap"]
         atr_val = row["atr"]
 
-        # Track active trade throughout the full day
+        # Track active trade throughout the full session
         if session_trade and not session_trade["closed"]:
             t_type = session_trade["type"]
             entry = session_trade["entry"]
@@ -288,9 +284,10 @@ for session_date, day_df in grouped:
 
         # Breakout Entry Window: 09:30 to 10:30 AM
         if datetime.time(9, 30) < t <= datetime.time(10, 30) and not trade_executed_today:
-            initial_buf = min(max(round(atr_val * 0.6, 1), 6.0), 9.0)
+            # METHOD 1: Breakout Candle Low/High +/- 5 pts (Capped at 30 pts)
             if c > day_orb_h and c > vwap_val and c > ema:
-                init_sl = round(day_orb_h - initial_buf, 1)
+                raw_sl = round(l - 5.0, 1)  # Breakout candle Low - 5 pts
+                init_sl = max(raw_sl, round(c - 30.0, 1))  # Max risk capped at 30 pts
                 risk = round(c - init_sl, 1)
                 tp1 = round(c + (atr_val * 3.0), 1)
                 tp_final = round(c + (risk * 3.0), 1)
@@ -335,7 +332,8 @@ for session_date, day_df in grouped:
                     alarm_signal_triggered = True
 
             elif c < day_orb_l and c < vwap_val and c < ema:
-                init_sl = round(day_orb_l + initial_buf, 1)
+                raw_sl = round(h + 5.0, 1)  # Breakout candle High + 5 pts
+                init_sl = min(raw_sl, round(c + 30.0, 1))  # Max risk capped at 30 pts
                 risk = round(init_sl - c, 1)
                 tp1 = round(c - (atr_val * 3.0), 1)
                 tp_final = round(c - (risk * 3.0), 1)
@@ -500,7 +498,6 @@ elif latest_trade_for_hud:
 hud_json = json.dumps(hud_payload)
 play_alarm_flag = "true" if alarm_signal_triggered else "false"
 
-now_ist_obj = datetime.datetime.now(IST)
 day_open = today_df.iloc[0]["open"]
 chg = curr["close"] - day_open
 chg_pct = (chg / day_open) * 100
