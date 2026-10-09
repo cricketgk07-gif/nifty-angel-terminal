@@ -125,7 +125,7 @@ def fetch_nifty_candles(interval_code, days_back):
     # Clean Bad Data: Drop invalid zero/negative ticks
     df = df[(df["open"] > 1000) & (df["high"] > 1000) & (df["low"] > 1000) & (df["close"] > 1000)].copy()
 
-    # NSE Regular Trading Hours Strictly (09:15 - 15:30)
+    # NSE Regular Trading Hours (09:15 - 15:30)
     if interval_code != "ONE_DAY":
         df = df[
             (df["dt"].dt.time >= datetime.time(9, 15))
@@ -144,13 +144,11 @@ def fetch_nifty_candles(interval_code, days_back):
 
     # Indicators: Day-Reset VWAP (Guaranteed non-zero)
     df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
-    # Safe volume fallback so VWAP never divides by 0 or plunges to 0
-    safe_vol = df["volume"].apply(lambda v: v if (pd.notnull(v) and v > 0) else 1000.0)
-    df["vol_mult"] = df["tp"] * safe_vol
-    df["cum_vol"] = df.groupby("date")[safe_vol.name].cumsum() if hasattr(safe_vol, 'name') else safe_vol.cumsum()
+    df["safe_vol"] = df["volume"].apply(lambda v: float(v) if (pd.notnull(v) and v > 0) else 1000.0)
+    df["vol_mult"] = df["tp"] * df["safe_vol"]
+    df["cum_vol"] = df.groupby("date")["safe_vol"].cumsum()
     df["cum_vp"] = df.groupby("date")["vol_mult"].cumsum()
     
-    # Fill VWAP cleanly with typical price if cum_vol is zero
     df["vwap"] = df["cum_vp"] / df["cum_vol"]
     df["vwap"] = df["vwap"].fillna(df["tp"])
     df.loc[df["vwap"] < 1000, "vwap"] = df["tp"]
@@ -357,8 +355,7 @@ curr = df.iloc[-1]
 candles_data = []
 volume_data = []
 
-# Normalizing volume strictly for bottom 12% sub-pane
-max_vol = df["volume"].max() if df["volume"].max() > 0 else 1.0
+max_vol = df["safe_vol"].max() if df["safe_vol"].max() > 0 else 1.0
 
 for _, r in df.iterrows():
     candles_data.append(
@@ -370,7 +367,7 @@ for _, r in df.iterrows():
             "close": float(r["close"]),
         }
     )
-    v_norm = (float(r["volume"]) / max_vol) * 100.0 if max_vol > 0 else 20.0
+    v_norm = (float(r["safe_vol"]) / max_vol) * 100.0 if max_vol > 0 else 20.0
     vol_color = (
         "rgba(8, 153, 129, 0.4)"
         if r["close"] >= r["open"]
@@ -401,7 +398,7 @@ ema_json = json.dumps(
 )
 markers_json = json.dumps(markers)
 
-# Exact Table Format Requested in Your Yellow Box Drawing
+# Exact Table Format Requested in Your Annotation
 hud_payload = None
 if latest_trade_for_hud:
     is_ce = latest_trade_for_hud["type"] == "CE"
@@ -454,7 +451,7 @@ html_code = f"""
             position: absolute; top: 0; left: 0; z-index: 1;
         }}
 
-        /* 1. TOP YELLOW BOX: Fixed Header Ribbon (Symbol, Price, Timeframes, Dynamic OHLC) */
+        /* 1. TOP BOX: Fixed Header Ribbon (Symbol, Price, Timeframes, Dynamic OHLC) */
         .fixed-top-box {{
             position: fixed; top: 4px; left: 6px; right: 6px; z-index: 50;
             display: flex; flex-direction: column; gap: 3px; pointer-events: none;
@@ -514,7 +511,6 @@ html_code = f"""
     </style>
 </head>
 <body>
-    <!-- Top Box: Header, Timeframes, and OHLC -->
     <div class="fixed-top-box">
         <div class="top-ctrl-row">
             <div class="sym-group">
@@ -525,4 +521,183 @@ html_code = f"""
 
             <div class="tf-bar">
                 <button class="tf-btn {'active' if current_interval=='1m' else ''}" onclick="changeTF('1m')">1m</button>
-                <button class="tf-btn {'active' if current_interval=='3m' else ''}" onclick="
+                <button class="tf-btn {'active' if current_interval=='3m' else ''}" onclick="changeTF('3m')">3m</button>
+                <button class="tf-btn {'active' if current_interval=='5m' else ''}" onclick="changeTF('5m')">5m</button>
+                <button class="tf-btn {'active' if current_interval=='15m' else ''}" onclick="changeTF('15m')">15m</button>
+                <button class="tf-btn {'active' if current_interval=='30m' else ''}" onclick="changeTF('30m')">30m</button>
+                <button class="tf-btn {'active' if current_interval=='1h' else ''}" onclick="changeTF('1h')">1h</button>
+                <button class="tf-btn {'active' if current_interval=='1D' else ''}" onclick="changeTF('1D')">1D</button>
+            </div>
+        </div>
+
+        <div id="ohlcRow" class="dynamic-ohlc-row">
+            <span>O: <b id="barO">{curr['open']:.2f}</b></span>
+            <span>H: <b id="barH">{curr['high']:.2f}</b></span>
+            <span>L: <b id="barL">{curr['low']:.2f}</b></span>
+            <span>C: <b id="barC">{curr['close']:.2f}</b></span>
+            <span>VWAP: <b id="barVWAP" style="color:#ab47bc;">{curr['vwap']:.2f}</b></span>
+            <span>9-EMA: <b id="barEMA" style="color:#2962ff;">{curr['ema9']:.2f}</b></span>
+        </div>
+    </div>
+
+    <div id="strategyBox" class="fixed-strategy-box" style="display: none;"></div>
+
+    <div id="chartArea"></div>
+
+    <script>
+        const container = document.getElementById('chartArea');
+        const chart = LightweightCharts.createChart(container, {{
+            width: window.innerWidth,
+            height: window.innerHeight,
+            layout: {{
+                background: {{ color: '#0b0e14' }},
+                textColor: '#787b86',
+                fontSize: 11,
+            }},
+            grid: {{
+                vertLines: {{ color: '#161a25' }},
+                horzLines: {{ color: '#161a25' }}
+            }},
+            crosshair: {{
+                mode: LightweightCharts.CrosshairMode.Normal,
+                vertLine: {{ color: '#758696', width: 1, style: 3 }},
+                horzLine: {{ color: '#758696', width: 1, style: 3 }}
+            }},
+            rightPriceScale: {{
+                borderColor: '#2a2e39',
+                autoScale: true,
+                scaleMargins: {{ top: 0.12, bottom: 0.16 }},
+                alignLabels: true,
+                entireTextOnly: true
+            }},
+            timeScale: {{
+                borderColor: '#2a2e39',
+                timeVisible: true,
+                secondsVisible: false,
+                rightOffset: 6
+            }},
+            localization: {{
+                priceFormatter: p => p.toFixed(2)
+            }}
+        }});
+
+        const candleSeries = chart.addCandlestickSeries({{
+            upColor: '#089981',
+            downColor: '#f23645',
+            borderUpColor: '#089981',
+            borderDownColor: '#f23645',
+            wickUpColor: '#089981',
+            wickDownColor: '#f23645',
+            priceFormat: {{ type: 'price', precision: 2, minMove: 0.05 }}
+        }});
+        candleSeries.setData({candles_json});
+
+        const volumeSeries = chart.addHistogramSeries({{
+            priceFormat: {{ type: 'volume' }},
+            priceScaleId: 'vol_scale',
+            scaleMargins: {{
+                top: 0.88,
+                bottom: 0.0
+            }}
+        }});
+        chart.priceScale('vol_scale').applyOptions({{
+            scaleMargins: {{ top: 0.88, bottom: 0.0 }}
+        }});
+        volumeSeries.setData({volume_json});
+
+        const vwapSeries = chart.addLineSeries({{
+            color: '#ab47bc',
+            lineWidth: 2,
+            title: 'VWAP',
+            priceFormat: {{ type: 'price', precision: 2, minMove: 0.05 }}
+        }});
+        vwapSeries.setData({vwap_json});
+
+        const emaSeries = chart.addLineSeries({{
+            color: '#2962ff',
+            lineWidth: 1,
+            title: '9-EMA',
+            priceFormat: {{ type: 'price', precision: 2, minMove: 0.05 }}
+        }});
+        emaSeries.setData({ema_json});
+
+        candleSeries.setMarkers({markers_json});
+
+        candleSeries.createPriceLine({{
+            price: {curr_orb_h:.2f},
+            color: '#089981',
+            lineWidth: 2,
+            lineStyle: LightweightCharts.LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: 'ORB HIGH'
+        }});
+
+        candleSeries.createPriceLine({{
+            price: {curr_orb_l:.2f},
+            color: '#f23645',
+            lineWidth: 2,
+            lineStyle: LightweightCharts.LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: 'ORB LOW'
+        }});
+
+        const s = {hud_json};
+        if (s) {{
+            const table = document.getElementById('strategyBox');
+            table.style.display = 'block';
+            table.innerHTML = `
+                <table>
+                    <tr><td class="label-cell">Call or Put</td><td class="val-cell"><span class="tag-pill" style="background:${{s.theme}}">${{s.call_or_put}}</span></td></tr>
+                    <tr><td class="label-cell">Reason for trade</td><td class="val-cell" style="font-size:9px; color:#cfd3dc;">${{s.reason}}</td></tr>
+                    <tr><td class="label-cell">Entry</td><td class="val-cell"><b>${{s.entry}}</b></td></tr>
+                    <tr><td class="label-cell">SL (total risk points)</td><td class="val-cell text-red">${{s.sl_risk}}</td></tr>
+                    <tr><td class="label-cell">Target (total target points)</td><td class="val-cell text-green">${{s.target_total}}</td></tr>
+                    <tr><td class="label-cell">Trailing SL (risk points)</td><td class="val-cell text-trail">${{s.trailing_sl}}</td></tr>
+                    <tr><td class="label-cell">Target 1 (target points)</td><td class="val-cell text-green">${{s.target1}}</td></tr>
+                    <tr><td class="label-cell">Secured points based on trailing SL</td><td class="val-cell text-green"><b>${{s.secured_pts}}</b></td></tr>
+                </table>
+            `;
+        }}
+
+        chart.subscribeCrosshairMove(param => {{
+            if (!param.time || !param.seriesData.get(candleSeries)) return;
+            const bar = param.seriesData.get(candleSeries);
+            document.getElementById('barO').innerText = bar.open.toFixed(2);
+            document.getElementById('barH').innerText = bar.high.toFixed(2);
+            document.getElementById('barL').innerText = bar.low.toFixed(2);
+            document.getElementById('barC').innerText = bar.close.toFixed(2);
+            const vBar = param.seriesData.get(vwapSeries);
+            if (vBar) document.getElementById('barVWAP').innerText = vBar.value.toFixed(2);
+            const eBar = param.seriesData.get(emaSeries);
+            if (eBar) document.getElementById('barEMA').innerText = eBar.value.toFixed(2);
+        }});
+
+        window.addEventListener('resize', () => {{
+            chart.applyOptions({{
+                width: window.innerWidth,
+                height: window.innerHeight
+            }});
+        }});
+
+        function changeTF(tf) {{
+            const url = new URL(window.parent.location.href);
+            url.searchParams.set('interval', tf);
+            window.parent.location.href = url.href;
+        }}
+    </script>
+</body>
+</html>
+"""
+
+components.html(html_code, height=940, scrolling=False)
+
+st.markdown(
+    """
+    <script>
+        setTimeout(function(){
+            window.location.reload();
+        }, 15000);
+    </script>
+""",
+    unsafe_allow_html=True,
+)
