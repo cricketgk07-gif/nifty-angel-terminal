@@ -29,24 +29,19 @@ st.markdown(
         border: none !important;
         width: 100vw !important;
         height: 100vh !important;
-        position: fixed !important;
-        top: 0 !important;
-        left: 0 !important;
+        display: block !important;
     }
     body {
         background-color: #0b0e14;
         margin: 0;
         overflow: hidden;
-        touch-action: none;
-        -webkit-user-select: none;
-        user-select: none;
     }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-# Secrets
+# Credentials
 API_KEY = st.secrets.get("API_KEY", "")
 CLIENT_CODE = st.secrets.get("CLIENT_CODE", "")
 PIN = st.secrets.get("PIN", "")
@@ -71,7 +66,7 @@ if not api:
     st.error("Authentication failed. Please verify credentials in Secrets.")
     st.stop()
 
-# Timeframe Query Parameter
+# Timeframe Switcher via query param
 params = st.query_params
 current_interval = params.get("interval", "5m")
 
@@ -122,10 +117,9 @@ def fetch_nifty_candles(interval_code, days_back):
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
 
-    # Clean Bad Data: Drop invalid zero/negative ticks
     df = df[(df["open"] > 1000) & (df["high"] > 1000) & (df["low"] > 1000) & (df["close"] > 1000)].copy()
 
-    # NSE Regular Trading Hours (09:15 - 15:30)
+    # NSE Trading Hours
     if interval_code != "ONE_DAY":
         df = df[
             (df["dt"].dt.time >= datetime.time(9, 15))
@@ -135,25 +129,22 @@ def fetch_nifty_candles(interval_code, days_back):
     if len(df) == 0:
         return None
 
-    # POSIX Integer Seconds (UTC Aligned)
     t_clean = df["dt"].dt.tz_localize(None)
     df["time"] = (
         (t_clean - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
     ).astype(int)
     df["date"] = df["dt"].dt.date
 
-    # Indicators: Day-Reset VWAP (Guaranteed non-zero)
+    # Indicators: VWAP & 9-EMA
     df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
     df["safe_vol"] = df["volume"].apply(lambda v: float(v) if (pd.notnull(v) and v > 0) else 1000.0)
     df["vol_mult"] = df["tp"] * df["safe_vol"]
     df["cum_vol"] = df.groupby("date")["safe_vol"].cumsum()
     df["cum_vp"] = df.groupby("date")["vol_mult"].cumsum()
-    
     df["vwap"] = df["cum_vp"] / df["cum_vol"]
     df["vwap"] = df["vwap"].fillna(df["tp"])
     df.loc[df["vwap"] < 1000, "vwap"] = df["tp"]
 
-    # 9-EMA
     df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
 
     return df
@@ -161,7 +152,7 @@ def fetch_nifty_candles(interval_code, days_back):
 
 df = fetch_nifty_candles(api_interval, lookback_days)
 if df is None or len(df) == 0:
-    st.info("Market feed is loading...")
+    st.info("Awaiting live market ticks...")
     st.stop()
 
 # --- Morning ORB Strategy Engine ---
@@ -226,11 +217,6 @@ for session_date, day_df in grouped:
                         }
                     )
                     session_trade["closed"] = True
-                    session_trade["status"] = (
-                        f"TIGHT SL HIT (+{pts:.1f} pts)"
-                        if pts > 0
-                        else f"STOPPED OUT ({pts:+.1f} pts)"
-                    )
                     session_trade["exit_price"] = exit_p
                     session_trade["exit_pts"] = pts
                     latest_trade_for_hud = session_trade.copy()
@@ -270,11 +256,6 @@ for session_date, day_df in grouped:
                         }
                     )
                     session_trade["closed"] = True
-                    session_trade["status"] = (
-                        f"TIGHT SL HIT (+{pts:.1f} pts)"
-                        if pts > 0
-                        else f"STOPPED OUT ({pts:+.1f} pts)"
-                    )
                     session_trade["exit_price"] = exit_p
                     session_trade["exit_pts"] = pts
                     latest_trade_for_hud = session_trade.copy()
@@ -354,7 +335,6 @@ curr = df.iloc[-1]
 
 candles_data = []
 volume_data = []
-
 max_vol = df["safe_vol"].max() if df["safe_vol"].max() > 0 else 1.0
 
 for _, r in df.iterrows():
@@ -369,9 +349,9 @@ for _, r in df.iterrows():
     )
     v_norm = (float(r["safe_vol"]) / max_vol) * 100.0 if max_vol > 0 else 20.0
     vol_color = (
-        "rgba(8, 153, 129, 0.4)"
+        "rgba(8, 153, 129, 0.45)"
         if r["close"] >= r["open"]
-        else "rgba(242, 54, 69, 0.4)"
+        else "rgba(242, 54, 69, 0.45)"
     )
     volume_data.append(
         {
@@ -398,7 +378,7 @@ ema_json = json.dumps(
 )
 markers_json = json.dumps(markers)
 
-# Exact Table Format Requested in Your Annotation
+# Strategy Table Payload
 hud_payload = None
 if latest_trade_for_hud:
     is_ce = latest_trade_for_hud["type"] == "CE"
@@ -443,68 +423,66 @@ html_code = f"""
             background-color: #0b0e14;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             overflow: hidden;
-            touch-action: none;
-            user-select: none;
         }}
         #chartArea {{
             width: 100vw; height: 100vh;
-            position: absolute; top: 0; left: 0; z-index: 1;
+            position: absolute; top: 0; left: 0;
         }}
 
-        /* 1. TOP BOX: Fixed Header Ribbon (Symbol, Price, Timeframes, Dynamic OHLC) */
+        /* TOP BOX: Stacked 2 Rows to Prevent Horizontal Overflow on Mobile */
         .fixed-top-box {{
-            position: fixed; top: 4px; left: 6px; right: 6px; z-index: 50;
-            display: flex; flex-direction: column; gap: 3px; pointer-events: none;
+            position: absolute; top: 4px; left: 6px; right: 65px; z-index: 50;
+            display: flex; flex-direction: column; gap: 2px; pointer-events: none;
         }}
-        .top-ctrl-row {{
+        .top-row-1 {{
             display: flex; align-items: center; justify-content: space-between; pointer-events: auto;
         }}
         .sym-group {{
-            display: flex; align-items: center; gap: 5px;
+            display: flex; align-items: center; gap: 4px;
         }}
         .badge {{
-            background: #2962ff; color: #fff; font-size: 10px; padding: 2px 4px;
+            background: #2962ff; color: #fff; font-size: 10px; padding: 1px 4px;
             border-radius: 3px; font-weight: 700;
         }}
-        .sym-title {{ font-size: 13px; font-weight: 700; color: #d1d4dc; }}
-        .sym-price {{ font-size: 12px; font-weight: 700; }}
+        .sym-title {{ font-size: 12px; font-weight: 700; color: #d1d4dc; }}
+        .sym-price {{ font-size: 11px; font-weight: 700; }}
 
         /* Timeframe Switcher */
         .tf-bar {{
             display: flex; gap: 2px; background: rgba(30, 34, 45, 0.95);
-            padding: 2px 3px; border-radius: 4px; border: 1px solid #2a2e39;
+            padding: 1px 3px; border-radius: 4px; border: 1px solid #2a2e39;
         }}
         .tf-btn {{
             background: transparent; border: none; color: #787b86;
-            font-size: 10px; font-weight: 600; padding: 2px 4px;
-            border-radius: 3px; cursor: pointer;
+            font-size: 9.5px; font-weight: 600; padding: 2px 4px;
+            border-radius: 2px; cursor: pointer;
         }}
         .tf-btn.active {{
             background: #2a2e39; color: #d1d4dc; font-weight: 700;
         }}
 
-        /* Dynamic Live OHLC Ribbon */
+        /* Dynamic Live OHLC Ribbon - Compact Row 2 */
         .dynamic-ohlc-row {{
-            font-size: 10px; color: #787b86; display: flex; gap: 6px;
-            background: rgba(11, 14, 20, 0.9); padding: 2px 6px;
-            border-radius: 3px; border: 1px solid rgba(42, 46, 57, 0.5);
+            font-size: 9.5px; color: #787b86; display: flex; gap: 5px;
+            background: rgba(11, 14, 20, 0.92); padding: 1px 5px;
+            border-radius: 3px; border: 1px solid rgba(42, 46, 57, 0.4);
             font-family: monospace; width: fit-content;
         }}
         .dynamic-ohlc-row b {{ color: #d1d4dc; }}
 
-        /* 2. STRATEGY TABLE BOX: Fixed Bottom-Right Above Volume */
+        /* FIXED STRATEGY TABLE: Positioned neatly above the bottom volume/time bar */
         .fixed-strategy-box {{
-            position: fixed; bottom: 56px; right: 65px; z-index: 50;
-            background: rgba(19, 23, 34, 0.98); border: 1px solid #2a2e39;
-            border-radius: 5px; font-size: 9.5px; color: #d1d4dc; overflow: hidden;
-            box-shadow: 0 4px 16px rgba(0,0,0,0.85);
+            position: absolute; bottom: 38px; right: 65px; z-index: 50;
+            background: rgba(19, 23, 34, 0.96); border: 1px solid #2a2e39;
+            border-radius: 5px; font-size: 9px; color: #d1d4dc; overflow: hidden;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.85);
         }}
         .fixed-strategy-box table {{ border-collapse: collapse; }}
-        .fixed-strategy-box td {{ padding: 3px 7px; border-bottom: 1px solid #222631; white-space: nowrap; }}
+        .fixed-strategy-box td {{ padding: 2px 6px; border-bottom: 1px solid #222631; white-space: nowrap; }}
         .fixed-strategy-box tr:last-child td {{ border-bottom: none; }}
         .label-cell {{ color: #787b86; font-weight: 500; }}
         .val-cell {{ font-weight: 700; color: #ffffff; text-align: right; }}
-        .tag-pill {{ color: #fff; font-weight: bold; border-radius: 3px; padding: 1px 5px; text-align: center; }}
+        .tag-pill {{ color: #fff; font-weight: bold; border-radius: 2px; padding: 1px 4px; text-align: center; font-size: 8.5px; }}
         .text-red {{ color: #f23645; }}
         .text-green {{ color: #089981; }}
         .text-trail {{ color: #2962ff; font-weight: bold; }}
@@ -512,11 +490,11 @@ html_code = f"""
 </head>
 <body>
     <div class="fixed-top-box">
-        <div class="top-ctrl-row">
+        <div class="top-row-1">
             <div class="sym-group">
                 <span class="badge">50</span>
                 <span class="sym-title">NIFTY</span>
-                <span class="sym-price" style="color: {chg_color};">{curr['close']:.2f} <span style="font-size: 10px;">{chg_str}</span></span>
+                <span class="sym-price" style="color: {chg_color};">{curr['close']:.2f} <span style="font-size: 9px;">{chg_str}</span></span>
             </div>
 
             <div class="tf-bar">
@@ -536,12 +514,14 @@ html_code = f"""
             <span>L: <b id="barL">{curr['low']:.2f}</b></span>
             <span>C: <b id="barC">{curr['close']:.2f}</b></span>
             <span>VWAP: <b id="barVWAP" style="color:#ab47bc;">{curr['vwap']:.2f}</b></span>
-            <span>9-EMA: <b id="barEMA" style="color:#2962ff;">{curr['ema9']:.2f}</b></span>
+            <span>EMA: <b id="barEMA" style="color:#2962ff;">{curr['ema9']:.2f}</b></span>
         </div>
     </div>
 
+    <!-- Strategy Table Box -->
     <div id="strategyBox" class="fixed-strategy-box" style="display: none;"></div>
 
+    <!-- Chart Canvas Area -->
     <div id="chartArea"></div>
 
     <script>
@@ -552,7 +532,7 @@ html_code = f"""
             layout: {{
                 background: {{ color: '#0b0e14' }},
                 textColor: '#787b86',
-                fontSize: 11,
+                fontSize: 10,
             }},
             grid: {{
                 vertLines: {{ color: '#161a25' }},
@@ -566,7 +546,7 @@ html_code = f"""
             rightPriceScale: {{
                 borderColor: '#2a2e39',
                 autoScale: true,
-                scaleMargins: {{ top: 0.12, bottom: 0.16 }},
+                scaleMargins: {{ top: 0.10, bottom: 0.18 }},
                 alignLabels: true,
                 entireTextOnly: true
             }},
@@ -581,6 +561,7 @@ html_code = f"""
             }}
         }});
 
+        // Candlesticks Series
         const candleSeries = chart.addCandlestickSeries({{
             upColor: '#089981',
             downColor: '#f23645',
@@ -592,6 +573,7 @@ html_code = f"""
         }});
         candleSeries.setData({candles_json});
 
+        // Volume Bar: Strictly in the lower 12% margin
         const volumeSeries = chart.addHistogramSeries({{
             priceFormat: {{ type: 'volume' }},
             priceScaleId: 'vol_scale',
@@ -605,6 +587,7 @@ html_code = f"""
         }});
         volumeSeries.setData({volume_json});
 
+        // Purple Session VWAP
         const vwapSeries = chart.addLineSeries({{
             color: '#ab47bc',
             lineWidth: 2,
@@ -613,6 +596,7 @@ html_code = f"""
         }});
         vwapSeries.setData({vwap_json});
 
+        // Blue 9-EMA
         const emaSeries = chart.addLineSeries({{
             color: '#2962ff',
             lineWidth: 1,
@@ -621,8 +605,10 @@ html_code = f"""
         }});
         emaSeries.setData({ema_json});
 
+        // Signal Markers (BUY CE, BUY PE, EXIT SL)
         candleSeries.setMarkers({markers_json});
 
+        // ORB Level Lines
         candleSeries.createPriceLine({{
             price: {curr_orb_h:.2f},
             color: '#089981',
@@ -641,6 +627,7 @@ html_code = f"""
             title: 'ORB LOW'
         }});
 
+        // Render Strategy Table
         const s = {hud_json};
         if (s) {{
             const table = document.getElementById('strategyBox');
@@ -648,17 +635,18 @@ html_code = f"""
             table.innerHTML = `
                 <table>
                     <tr><td class="label-cell">Call or Put</td><td class="val-cell"><span class="tag-pill" style="background:${{s.theme}}">${{s.call_or_put}}</span></td></tr>
-                    <tr><td class="label-cell">Reason for trade</td><td class="val-cell" style="font-size:9px; color:#cfd3dc;">${{s.reason}}</td></tr>
+                    <tr><td class="label-cell">Reason for trade</td><td class="val-cell" style="font-size:8.5px; color:#cfd3dc;">${{s.reason}}</td></tr>
                     <tr><td class="label-cell">Entry</td><td class="val-cell"><b>${{s.entry}}</b></td></tr>
-                    <tr><td class="label-cell">SL (total risk points)</td><td class="val-cell text-red">${{s.sl_risk}}</td></tr>
-                    <tr><td class="label-cell">Target (total target points)</td><td class="val-cell text-green">${{s.target_total}}</td></tr>
-                    <tr><td class="label-cell">Trailing SL (risk points)</td><td class="val-cell text-trail">${{s.trailing_sl}}</td></tr>
-                    <tr><td class="label-cell">Target 1 (target points)</td><td class="val-cell text-green">${{s.target1}}</td></tr>
-                    <tr><td class="label-cell">Secured points based on trailing SL</td><td class="val-cell text-green"><b>${{s.secured_pts}}</b></td></tr>
+                    <tr><td class="label-cell">SL (risk pts)</td><td class="val-cell text-red">${{s.sl_risk}}</td></tr>
+                    <tr><td class="label-cell">Target (total pts)</td><td class="val-cell text-green">${{s.target_total}}</td></tr>
+                    <tr><td class="label-cell">Trailing SL</td><td class="val-cell text-trail">${{s.trailing_sl}}</td></tr>
+                    <tr><td class="label-cell">Target 1</td><td class="val-cell text-green">${{s.target1}}</td></tr>
+                    <tr><td class="label-cell">Secured Points</td><td class="val-cell text-green"><b>${{s.secured_pts}}</b></td></tr>
                 </table>
             `;
         }}
 
+        // Dynamic Crosshair Inspector
         chart.subscribeCrosshairMove(param => {{
             if (!param.time || !param.seriesData.get(candleSeries)) return;
             const bar = param.seriesData.get(candleSeries);
@@ -689,8 +677,9 @@ html_code = f"""
 </html>
 """
 
-components.html(html_code, height=940, scrolling=False)
+components.html(html_code, height=720, scrolling=False)
 
+# Auto-refresh
 st.markdown(
     """
     <script>
