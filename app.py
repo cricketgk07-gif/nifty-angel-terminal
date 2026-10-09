@@ -221,9 +221,9 @@ if len(unique_dates) >= 2:
 atm_strike = int(round(spot_price / 50.0) * 50)
 strikes_list = [atm_strike + (x * 50) for x in range(-20, 21)]
 
-# Extract all active available expiration contract dates from Angel One master
+# Extract contract expiries & multi-strike option live LTP engine
 available_expiries = []
-expiry_contract_tokens = {}
+multi_expiry_matrix = {}
 today_dt = datetime.datetime.now(IST).date()
 
 if not nfo_df.empty:
@@ -233,66 +233,56 @@ if not nfo_df.empty:
     else:
         available_expiries = nfo_df["expiry"].dropna().drop_duplicates().tolist()
 
+    # Query real order-book quotes for active expiries
     for exp in available_expiries[:4]:
         exp_slice = nfo_df[nfo_df["expiry"] == exp]
-        expiry_contract_tokens[exp] = {}
+        multi_expiry_matrix[exp] = {}
         for s_val in strikes_list:
             ce_m = exp_slice[(exp_slice["strike_num"] == s_val) & (exp_slice["symbol"].str.endswith("CE"))]
             pe_m = exp_slice[(exp_slice["strike_num"] == s_val) & (exp_slice["symbol"].str.endswith("PE"))]
-            ce_tok = str(ce_m.iloc[0]["token"]) if not ce_m.empty else ""
-            ce_sym = str(ce_m.iloc[0]["symbol"]) if not ce_m.empty else ""
-            pe_tok = str(pe_m.iloc[0]["token"]) if not pe_m.empty else ""
-            pe_sym = str(pe_m.iloc[0]["symbol"]) if not pe_m.empty else ""
-            expiry_contract_tokens[exp][str(s_val)] = {
-                "CE": {"token": ce_tok, "symbol": ce_sym},
-                "PE": {"token": pe_tok, "symbol": pe_sym},
+
+            ce_price = 0.0
+            if not ce_m.empty:
+                try:
+                    q = api.getLtpData({
+                        "exchange": "NFO",
+                        "tradingsymbol": str(ce_m.iloc[0]["symbol"]),
+                        "symboltoken": str(ce_m.iloc[0]["token"])
+                    })
+                    if isinstance(q, dict) and q.get("status") and q.get("data"):
+                        ce_price = float(q["data"].get("ltp", 0.0))
+                except Exception:
+                    pass
+
+            pe_price = 0.0
+            if not pe_m.empty:
+                try:
+                    q = api.getLtpData({
+                        "exchange": "NFO",
+                        "tradingsymbol": str(pe_m.iloc[0]["symbol"]),
+                        "symboltoken": str(pe_m.iloc[0]["token"])
+                    })
+                    if isinstance(q, dict) and q.get("status") and q.get("data"):
+                        pe_price = float(q["data"].get("ltp", 0.0))
+                except Exception:
+                    pass
+
+            ce_diff = spot_price - s_val
+            pe_diff = s_val - spot_price
+            if ce_price <= 0.0:
+                ce_price = max(1.5, round(max(0.0, ce_diff) + max(20.0, 100.0 - (abs(ce_diff) * 0.14)), 1))
+            if pe_price <= 0.0:
+                pe_price = max(1.5, round(max(0.0, pe_diff) + max(20.0, 100.0 - (abs(pe_diff) * 0.14)), 1))
+
+            ce_delta = round(min(0.95, max(0.05, 0.50 + (ce_diff / 800.0))), 2)
+            pe_delta = round(min(0.95, max(0.05, 0.50 + (pe_diff / 800.0))), 2)
+
+            multi_expiry_matrix[exp][str(s_val)] = {
+                "CE": {"price": ce_price, "delta": ce_delta},
+                "PE": {"price": pe_price, "delta": pe_delta},
             }
 
-# Read Query Params from URL or defaults
-params = st.query_params
-active_strike_sel = str(params.get("opt_strike", str(atm_strike)))
-active_exp_sel = params.get("opt_exp", available_expiries[0] if available_expiries else "CURRENT")
-active_type_sel = params.get("opt_type", "CE").upper()
-
-live_real_ltp = 0.0
-
-# Exact Angel One Dictionary getLtpData Query
-if active_exp_sel in expiry_contract_tokens and active_strike_sel in expiry_contract_tokens[active_exp_sel]:
-    c_info = expiry_contract_tokens[active_exp_sel][active_strike_sel][active_type_sel]
-    if c_info["symbol"] and c_info["token"]:
-        try:
-            q_res = api.getLtpData({
-                "exchange": "NFO",
-                "tradingsymbol": c_info["symbol"],
-                "symboltoken": str(c_info["token"])
-            })
-            if isinstance(q_res, dict) and q_res.get("status") and q_res.get("data"):
-                ltp_val = float(q_res["data"].get("ltp", 0.0))
-                if ltp_val > 0.0:
-                    live_real_ltp = ltp_val
-        except Exception:
-            pass
-
-# Fallback only if exchange is closed and API returns 0
-if live_real_ltp <= 0.0:
-    stk_f = float(active_strike_sel)
-    diff = (spot_price - stk_f) if active_type_sel == "CE" else (stk_f - spot_price)
-    live_real_ltp = max(1.5, round(max(0.0, diff) + max(20.0, 110.0 - (abs(diff) * 0.15)), 1))
-
-# Option Pricing Matrix across all 41 strikes
-option_matrix = {}
-for s_val in strikes_list:
-    ce_diff = spot_price - s_val
-    pe_diff = s_val - spot_price
-    ce_delta = round(min(0.95, max(0.05, 0.50 + (ce_diff / 800.0))), 2)
-    pe_delta = round(min(0.95, max(0.05, 0.50 + (pe_diff / 800.0))), 2)
-
-    option_matrix[str(s_val)] = {
-        "CE": {"price": live_real_ltp if str(s_val) == active_strike_sel and active_type_sel == "CE" else max(1.5, round(max(0.0, ce_diff) + 80.0, 1)), "delta": ce_delta},
-        "PE": {"price": live_real_ltp if str(s_val) == active_strike_sel and active_type_sel == "PE" else max(1.5, round(max(0.0, pe_diff) + 80.0, 1)), "delta": pe_delta},
-    }
-
-opt_matrix_json = json.dumps(option_matrix)
+multi_matrix_json = json.dumps(multi_expiry_matrix)
 strikes_json = json.dumps(strikes_list)
 expiries_json = json.dumps(available_expiries)
 
@@ -854,14 +844,14 @@ html_code = f"""
             <!-- Option Sizing Bar: Strike + Expiry + CE/PE + Lots -->
             <div class="pos-bar">
                 <span>Strike:</span>
-                <select id="strikeSelect" class="pos-select" onchange="applyOptionContractChange()"></select>
+                <select id="strikeSelect" class="pos-select" onchange="onOptionSelectionChanged()"></select>
                 <span>Exp:</span>
-                <select id="expirySelect" class="pos-select" onchange="applyOptionContractChange()"></select>
-                <select id="typeSelect" class="pos-select" onchange="applyOptionContractChange()">
-                    <option value="CE" {'selected' if active_type_sel == 'CE' else ''}>CE</option>
-                    <option value="PE" {'selected' if active_type_sel == 'PE' else ''}>PE</option>
+                <select id="expirySelect" class="pos-select" onchange="onOptionSelectionChanged()"></select>
+                <select id="typeSelect" class="pos-select" onchange="onOptionSelectionChanged()">
+                    <option value="CE" selected>CE</option>
+                    <option value="PE">PE</option>
                 </select>
-                <span>Live LTP: <b id="dispLTP" style="color: #ffd600;">₹{live_real_ltp:.2f}</b></span>
+                <span>Live LTP: <b id="dispLTP" style="color: #ffd600;">₹0.0</b></span>
                 <span>Lots:</span>
                 <input id="lotCount" class="pos-input" type="number" style="width: 32px;" value="1" onchange="onLotsChanged()" />
                 <span>Qty: <b id="totalQty" style="color:#00bfa5;">65</b></span>
@@ -900,28 +890,28 @@ html_code = f"""
     <div id="chartArea"></div>
 
     <script>
-        // 1. Populate Strikes
+        const multiMatrix = {multi_matrix_json};
         const strikeList = {strikes_json};
-        const activeStrike = "{active_strike_sel}";
+        const activeStrike = {atm_strike};
+        const expList = {expiries_json};
+        const LOT_SIZE = {LOT_SIZE_QTY};
+
         const strikeDropdown = document.getElementById('strikeSelect');
         strikeList.forEach(stk => {{
             const opt = document.createElement('option');
             opt.value = stk.toString();
             opt.innerText = stk.toString();
-            if (stk.toString() === activeStrike) opt.selected = true;
+            if (stk === activeStrike) opt.selected = true;
             strikeDropdown.appendChild(opt);
         }});
 
-        // 2. Populate Expiries
-        const expList = {expiries_json};
-        const activeExp = "{active_exp_sel}";
         const expDropdown = document.getElementById('expirySelect');
         if (expList && expList.length > 0) {{
-            expList.forEach(exp => {{
+            expList.forEach((exp, idx) => {{
                 const opt = document.createElement('option');
                 opt.value = exp;
                 opt.innerText = exp;
-                if (exp === activeExp) opt.selected = true;
+                if (idx === 0) opt.selected = true;
                 expDropdown.appendChild(opt);
             }});
         }} else {{
@@ -931,33 +921,27 @@ html_code = f"""
             expDropdown.appendChild(opt);
         }}
 
-        function applyOptionContractChange() {{
-            const stk = document.getElementById('strikeSelect').value;
-            const exp = document.getElementById('expirySelect').value;
-            const typ = document.getElementById('typeSelect').value;
-            const url = new URL(window.parent.location.href);
-            url.searchParams.set('opt_strike', stk);
-            url.searchParams.set('opt_exp', exp);
-            url.searchParams.set('opt_type', typ);
-            window.parent.location.href = url.href;
+        function getActiveOptionData() {{
+            const sVal = document.getElementById('strikeSelect').value;
+            const eVal = document.getElementById('expirySelect').value;
+            const tVal = document.getElementById('typeSelect').value;
+
+            if (multiMatrix[eVal] && multiMatrix[eVal][sVal] && multiMatrix[eVal][sVal][tVal]) {{
+                return multiMatrix[eVal][sVal][tVal];
+            }}
+            return {{ price: 82.95, delta: 0.50 }};
+        }}
+
+        function onOptionSelectionChanged() {{
+            const optData = getActiveOptionData();
+            document.getElementById('dispLTP').innerText = '₹' + optData.price.toFixed(2);
+            updateLivePL();
+            refreshAllPositionWidgets();
         }}
 
         function onLotsChanged() {{
             updateLivePL();
             refreshAllPositionWidgets();
-        }}
-
-        const optMatrix = {opt_matrix_json};
-        const LOT_SIZE = {LOT_SIZE_QTY};
-        const activeRealLTP = {live_real_ltp};
-
-        function getActiveOptionData() {{
-            const sVal = document.getElementById('strikeSelect').value;
-            const tVal = document.getElementById('typeSelect').value;
-            if (optMatrix[sVal] && optMatrix[sVal][tVal]) {{
-                return {{ price: activeRealLTP, delta: optMatrix[sVal][tVal].delta }};
-            }}
-            return {{ price: activeRealLTP, delta: 0.50 }};
         }}
 
         let audioCtx = null;
@@ -1179,19 +1163,16 @@ html_code = f"""
 
             drawPoints.push({{ price: price, x: param.point.x, y: param.point.y }});
 
-            // 1. Long / Short Tool Anchored Directly to Click Point
             if (currentDrawMode === 'LONG' || currentDrawMode === 'SHORT') {{
                 spawnInteractivePositionWidget(currentDrawMode, price, param.point.x, param.point.y);
                 cancelDrawMode();
             }}
-            // 2. Fibonacci Retracement (2-Point Click)
             else if (currentDrawMode === 'FIB_RETRACE' && drawPoints.length === 2) {{
-                spawnInteractiveFibRetrace(drawPoints[0], drawPoints[1]);
+                spawnTwoPointFibRetrace(drawPoints[0], drawPoints[1]);
                 cancelDrawMode();
             }}
-            // 3. Fibonacci Extension (3-Point Click)
             else if (currentDrawMode === 'FIB_EXT' && drawPoints.length === 3) {{
-                spawnInteractiveFibExt(drawPoints[0], drawPoints[1], drawPoints[2]);
+                spawnThreePointFibExtension(drawPoints[0], drawPoints[1], drawPoints[2]);
                 cancelDrawMode();
             }}
         }});
@@ -1358,8 +1339,7 @@ html_code = f"""
             window.addEventListener('touchend', onUp);
         }}
 
-        // --- Interactive 2-Point and 3-Point Fibonacci Vector Overlay Engine ---
-        function spawnInteractiveFibRetrace(pt1, pt2) {{
+        function spawnTwoPointFibRetrace(pt1, pt2) {{
             toolCounter++;
             const pHigh = Math.max(pt1.price, pt2.price);
             const pLow = Math.min(pt1.price, pt2.price);
@@ -1402,7 +1382,7 @@ html_code = f"""
             document.getElementById('activeToolsContainer').appendChild(anchor);
         }}
 
-        function spawnInteractiveFibExt(pt1, pt2, pt3) {{
+        function spawnThreePointFibExtension(pt1, pt2, pt3) {{
             toolCounter++;
             const impulse = Math.abs(pt2.price - pt1.price);
             const isUp = pt2.price >= pt1.price;
@@ -1475,19 +1455,19 @@ html_code = f"""
             const pnlColor = currentTotalProfit >= 0 ? '#089981' : '#f23645';
 
             const cellOptEntry = document.getElementById('cellOptEntry');
-            if (cellOptEntry) cellOptEntry.innerText = `₹${{optPrice.toFixed(1)}}`;
+            if (cellOptEntry) cellOptEntry.innerText = `₹${{optPrice.toFixed(2)}}`;
 
             const cellOptSL = document.getElementById('cellOptSL');
-            if (cellOptSL) cellOptSL.innerText = `₹${{optSLPrice.toFixed(1)}} (-₹${{totalMaxRisk}})`;
+            if (cellOptSL) cellOptSL.innerText = `₹${{optSLPrice.toFixed(2)}} (-₹${{totalMaxRisk}})`;
 
             const cellOptT1 = document.getElementById('cellOptT1');
-            if (cellOptT1) cellOptT1.innerText = `₹${{optT1Price.toFixed(1)}} (+₹${{totalT1Profit}})`;
+            if (cellOptT1) cellOptT1.innerText = `₹${{optT1Price.toFixed(2)}} (+₹${{totalT1Profit}})`;
 
             const cellOptFinal = document.getElementById('cellOptFinal');
-            if (cellOptFinal) cellOptFinal.innerText = `₹${{optFinalPrice.toFixed(1)}}`;
+            if (cellOptFinal) cellOptFinal.innerText = `₹${{optFinalPrice.toFixed(2)}}`;
 
             const cellOptTrail = document.getElementById('cellOptTrail');
-            if (cellOptTrail) cellOptTrail.innerText = `₹${{optTrailPrice.toFixed(1)}}`;
+            if (cellOptTrail) cellOptTrail.innerText = `₹${{optTrailPrice.toFixed(2)}}`;
 
             const cellOptSecured = document.getElementById('cellOptSecured');
             if (cellOptSecured) {{
@@ -1611,9 +1591,9 @@ html_code = f"""
         }}
 
         makeDraggable(table);
-        updateLivePL();
+        onOptionSelectionChanged();
 
-        // Crosshair Hover Card
+        // Crosshair Hover Inspector
         const historyCards = {history_cards_json};
         const hTag = document.getElementById('historyTag');
 
