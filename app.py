@@ -8,7 +8,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 st.set_page_config(
-    layout="wide", page_title="Nifty 50 ORB Trailing Engine", page_icon="📈"
+    layout="wide", page_title="Nifty 50 Pro Terminal", page_icon="📈"
 )
 
 st.markdown(
@@ -17,6 +17,20 @@ st.markdown(
     #MainMenu, footer, header {visibility: hidden;}
     .block-container {padding: 0 !important; max-width: 100% !important;}
     body {background-color: #0b0e14;}
+    div[data-testid="stRadio"] > div {
+        flex-direction: row;
+        gap: 6px;
+        background: #131722;
+        padding: 4px 8px;
+        border-bottom: 1px solid #2a2e39;
+    }
+    div[data-testid="stRadio"] label {
+        color: #787b86 !important;
+        font-weight: 600 !important;
+        font-size: 12px !important;
+        padding: 2px 6px;
+        cursor: pointer;
+    }
 </style>
 """,
     unsafe_allow_html=True,
@@ -48,17 +62,41 @@ if not api:
     st.error("Authentication failed. Please verify Streamlit Secrets.")
     st.stop()
 
+# --- Top Navigation Bar: 1m to 1 Month ---
+timeframe_dict = {
+    "1m": ("ONE_MINUTE", 2),
+    "3m": ("THREE_MINUTE", 4),
+    "5m": ("FIVE_MINUTE", 5),
+    "15m": ("FIFTEEN_MINUTE", 15),
+    "30m": ("THIRTY_MINUTE", 30),
+    "1h": ("ONE_HOUR", 60),
+    "1D": ("ONE_DAY", 365),
+    "1W": ("ONE_DAY", 730),  # Aggregated from Daily
+    "1M": ("ONE_DAY", 1500),  # Aggregated from Daily
+}
 
-def fetch_nifty_candles():
+selected_label = st.radio(
+    "Interval",
+    options=list(timeframe_dict.keys()),
+    index=2,  # Default to 5m
+    horizontal=True,
+    label_visibility="collapsed",
+)
+api_interval, lookback_days = timeframe_dict[selected_label]
+
+
+def fetch_nifty_data(interval_code, days_back):
     now = datetime.datetime.now()
-    from_date = (now - datetime.timedelta(days=4)).strftime("%Y-%m-%d 09:15")
+    from_date = (now - datetime.timedelta(days=days_back)).strftime(
+        "%Y-%m-%d 09:15"
+    )
     to_date = now.strftime("%Y-%m-%d %H:%M")
 
     resp = api.getCandleData(
         {
             "exchange": "NSE",
             "symboltoken": INDEX_TOKEN,
-            "interval": "FIVE_MINUTE",
+            "interval": interval_code,
             "fromdate": from_date,
             "todate": to_date,
         }
@@ -75,14 +113,26 @@ def fetch_nifty_candles():
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
 
-    # Intraday 09:15 - 15:30
-    df = df[
-        (df["timestamp"].dt.time >= datetime.time(9, 15))
-        & (df["timestamp"].dt.time <= datetime.time(15, 30))
-    ].copy()
+    # Convert IST timestamp correctly to integer seconds Unix timestamp
+    # (Angel One gives IST timestamps; we convert to proper UTC seconds for lightweight-charts)
+    df["time"] = (
+        (df["timestamp"] - datetime.timedelta(hours=5, minutes=30)).astype(
+            "int64"
+        )
+        // 10**9
+    )
+
+    # Intraday filter (09:15 - 15:30) for intraday timeframes
+    if interval_code not in ["ONE_DAY"]:
+        df = df[
+            (df["timestamp"].dt.time >= datetime.time(9, 15))
+            & (df["timestamp"].dt.time <= datetime.time(15, 30))
+        ].copy()
+
+    df["date"] = df["timestamp"].dt.date
+    today = df["date"].iloc[-1]
 
     # Session VWAP & 9-EMA
-    df["date"] = df["timestamp"].dt.date
     df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
     df["vol_mult"] = df["tp"] * df["volume"].apply(
         lambda v: v if v > 0 else 1000.0
@@ -100,8 +150,7 @@ def fetch_nifty_candles():
     df["vwap"] = df["cum_vp"] / df["cum_vol"]
     df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
 
-    # 15m ORB
-    today = df["date"].iloc[-1]
+    # Calculate Today's 15m ORB (09:15 - 09:30)
     today_df = df[df["date"] == today]
     orb_df = today_df[today_df["timestamp"].dt.time <= datetime.time(9, 30)]
 
@@ -116,21 +165,20 @@ def fetch_nifty_candles():
 
     df["orb_h"] = orb_h
     df["orb_l"] = orb_l
-    df["time"] = df["timestamp"].astype("int64") // 10**9
 
     return df, today, orb_h, orb_l
 
 
-data_tuple = fetch_nifty_candles()
+data_tuple = fetch_nifty_data(api_interval, lookback_days)
 if not data_tuple or len(data_tuple[0]) == 0:
-    st.info("Awaiting live market ticks...")
+    st.info("Fetching market data...")
     st.stop()
 
 df, today_date, orb_h, orb_l = data_tuple
 today_df = df[df["date"] == today_date].copy()
 curr = df.iloc[-1]
 
-# Execution Engine with Trailing SL
+# Strategy Trailing SL & Signal Engine
 markers = []
 active_trade = None
 completed_trade = None
@@ -336,6 +384,7 @@ chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
+# TradingView lightweight canvas
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -345,25 +394,25 @@ html_code = f"""
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{ background-color: #0b0e14; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; overflow: hidden; }}
-        #chartContainer {{ width: 100vw; height: 100vh; position: relative; }}
+        #chartContainer {{ width: 100vw; height: calc(100vh - 40px); position: relative; }}
 
         .tv-header {{
-            position: absolute; top: 10px; left: 15px; z-index: 20; pointer-events: none;
-            display: flex; flex-direction: column; gap: 3px;
+            position: absolute; top: 8px; left: 12px; z-index: 20; pointer-events: none;
+            display: flex; flex-direction: column; gap: 2px;
         }}
-        .tv-title {{ font-size: 15px; font-weight: 700; color: #d1d4dc; display: flex; align-items: center; gap: 6px; }}
-        .badge {{ background: #2962ff; color: #fff; font-size: 10px; padding: 2px 5px; border-radius: 3px; font-weight: 600; }}
-        .tv-price {{ font-size: 14px; font-weight: 600; }}
-        .tv-ohlc {{ font-size: 11px; color: #787b86; display: flex; gap: 8px; font-family: monospace; }}
+        .tv-title {{ font-size: 14px; font-weight: 700; color: #d1d4dc; display: flex; align-items: center; gap: 6px; }}
+        .badge {{ background: #2962ff; color: #fff; font-size: 10px; padding: 1px 5px; border-radius: 3px; font-weight: 600; }}
+        .tv-price {{ font-size: 13px; font-weight: 600; }}
+        .tv-ohlc {{ font-size: 11px; color: #787b86; display: flex; gap: 6px; font-family: monospace; }}
 
         .strategy-table {{
-            position: absolute; bottom: 35px; right: 65px; z-index: 25;
+            position: absolute; bottom: 25px; right: 55px; z-index: 25;
             background: rgba(19, 23, 34, 0.95); border: 1px solid #2a2e39;
             border-radius: 6px; font-size: 11px; color: #d1d4dc; overflow: hidden;
             box-shadow: 0 4px 14px rgba(0,0,0,0.6);
         }}
         .strategy-table table {{ border-collapse: collapse; }}
-        .strategy-table td {{ padding: 5px 10px; border-bottom: 1px solid #2a2e39; }}
+        .strategy-table td {{ padding: 4px 8px; border-bottom: 1px solid #2a2e39; }}
         .strategy-table tr:last-child td {{ border-bottom: none; }}
         .td-tag {{ color: #fff; font-weight: bold; border-radius: 3px; padding: 2px 6px; text-align: center; }}
         .text-red {{ color: #f23645; }}
@@ -375,10 +424,10 @@ html_code = f"""
     <div id="chartContainer">
         <div class="tv-header">
             <div class="tv-title">
-                <span class="badge">50</span> NIFTY 50 (ORB + Trailing SL Engine)
+                <span class="badge">50</span> NIFTY 50 ({selected_label})
             </div>
             <div class="tv-price" style="color: {chg_color};">
-                {curr['close']:.2f} <span style="font-size: 12px;">{chg_str}</span>
+                {curr['close']:.2f} <span style="font-size: 11px;">{chg_str}</span>
             </div>
             <div id="ohlcRow" class="tv-ohlc">
                 <span>O: <b id="barO">{curr['open']:.2f}</b></span>
@@ -418,8 +467,6 @@ html_code = f"""
                 borderColor: '#2a2e39',
                 timeVisible: true,
                 secondsVisible: false,
-                fixLeftEdge: true,
-                fixRightEdge: true
             }},
             localization: {{
                 priceFormatter: p => p.toFixed(2)
@@ -453,6 +500,7 @@ html_code = f"""
         }});
         emaSeries.setData({ema_json});
 
+        // Set markers on the candles
         candleSeries.setMarkers({markers_json});
 
         candleSeries.createPriceLine({{
@@ -473,6 +521,7 @@ html_code = f"""
             title: 'ORB LOW'
         }});
 
+        // Render Strategy HUD Table
         const tData = {hud_json};
         if (tData) {{
             const isBuy = tData.type === 'CE';
@@ -495,6 +544,10 @@ html_code = f"""
             `;
         }}
 
+        // Make chart automatically focus and fit the latest candles on screen
+        chart.timeScale().fitContent();
+
+        // Crosshair dynamic OHLC inspector
         chart.subscribeCrosshairMove(param => {{
             if (!param.time || !param.seriesData.get(candleSeries)) return;
             const bar = param.seriesData.get(candleSeries);
@@ -509,9 +562,8 @@ html_code = f"""
         }});
 
         window.addEventListener('resize', () => {{
-            chart.applyOptions({{ width: window.innerWidth, height: window.innerHeight }});
+            chart.applyOptions({{ width: window.innerWidth, height: window.innerHeight - 40 }});
         }});
-        chart.applyOptions({{ width: window.innerWidth, height: window.innerHeight }});
     </script>
 </body>
 </html>
@@ -519,6 +571,7 @@ html_code = f"""
 
 components.html(html_code, height=720, scrolling=False)
 
+# Auto-refresh
 st.markdown(
     """
     <script>
