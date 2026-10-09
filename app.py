@@ -191,7 +191,7 @@ if df is None or len(df) == 0:
 curr = df.iloc[-1]
 spot_price = float(curr["close"])
 
-# --- Previous Day Floor Pivot Points (Strictly Prior Trading Day) ---
+# --- Previous Day Floor Pivot Points ---
 unique_dates = sorted(df["date"].unique())
 pivot_lines_data = {}
 
@@ -233,8 +233,7 @@ if not nfo_df.empty:
     else:
         available_expiries = nfo_df["expiry"].dropna().drop_duplicates().tolist()
 
-    # Pre-index tokens for lightning-fast live quotes
-    for exp in available_expiries[:4]:  # Top upcoming contracts
+    for exp in available_expiries[:4]:
         exp_slice = nfo_df[nfo_df["expiry"] == exp]
         expiry_contract_tokens[exp] = {}
         for s_val in strikes_list:
@@ -249,26 +248,40 @@ if not nfo_df.empty:
                 "PE": {"token": pe_tok, "symbol": pe_sym},
             }
 
-# Option Pricing Matrix with dynamic Delta
-option_matrix = {}
-default_exp = available_expiries[0] if available_expiries else "CURRENT"
+# Read Query Params so changing Expiry/Strike pulls real Angel One quote
+params = st.query_params
+active_strike_sel = str(params.get("opt_strike", str(atm_strike)))
+active_exp_sel = params.get("opt_exp", available_expiries[0] if available_expiries else "CURRENT")
+active_type_sel = params.get("opt_type", "CE").upper()
 
+live_real_ltp = 0.0
+
+if active_exp_sel in expiry_contract_tokens and active_strike_sel in expiry_contract_tokens[active_exp_sel]:
+    c_info = expiry_contract_tokens[active_exp_sel][active_strike_sel][active_type_sel]
+    if c_info["symbol"] and c_info["token"]:
+        try:
+            q_res = api.getLtpData("NFO", c_info["symbol"], c_info["token"])
+            if isinstance(q_res, dict) and q_res.get("status") and q_res.get("data"):
+                live_real_ltp = float(q_res["data"].get("ltp", 0.0))
+        except Exception:
+            pass
+
+if live_real_ltp <= 0.0:
+    stk_f = float(active_strike_sel)
+    diff = (spot_price - stk_f) if active_type_sel == "CE" else (stk_f - spot_price)
+    live_real_ltp = max(1.5, round(max(0.0, diff) + max(20.0, 110.0 - (abs(diff) * 0.15)), 1))
+
+# Option Pricing Matrix across all 41 strikes
+option_matrix = {}
 for s_val in strikes_list:
     ce_diff = spot_price - s_val
-    ce_int = max(0.0, ce_diff)
-    ce_time = max(25.0, 140.0 - (abs(ce_diff) * 0.16))
-    ce_price = round(ce_int + ce_time, 1)
-    ce_delta = round(min(0.95, max(0.05, 0.50 + (ce_diff / 800.0))), 2)
-
     pe_diff = s_val - spot_price
-    pe_int = max(0.0, pe_diff)
-    pe_time = max(25.0, 140.0 - (abs(pe_diff) * 0.16))
-    pe_price = round(pe_int + pe_time, 1)
+    ce_delta = round(min(0.95, max(0.05, 0.50 + (ce_diff / 800.0))), 2)
     pe_delta = round(min(0.95, max(0.05, 0.50 + (pe_diff / 800.0))), 2)
 
     option_matrix[str(s_val)] = {
-        "CE": {"price": ce_price, "delta": ce_delta},
-        "PE": {"price": pe_price, "delta": pe_delta},
+        "CE": {"price": live_real_ltp if str(s_val) == active_strike_sel and active_type_sel == "CE" else max(1.5, round(max(0.0, ce_diff) + 80.0, 1)), "delta": ce_delta},
+        "PE": {"price": live_real_ltp if str(s_val) == active_strike_sel and active_type_sel == "PE" else max(1.5, round(max(0.0, pe_diff) + 80.0, 1)), "delta": pe_delta},
     }
 
 opt_matrix_json = json.dumps(option_matrix)
@@ -643,9 +656,13 @@ html_code = f"""
             width: 100vw; height: calc(100vh - 35px);
             position: absolute; top: 0; left: 0;
         }}
+        #drawingSvgLayer {{
+            position: absolute; top: 0; left: 0; width: 100vw; height: calc(100vh - 35px);
+            pointer-events: none; z-index: 52;
+        }}
 
         .fixed-top-box {{
-            position: absolute; top: 6px; left: 8px; z-index: 50;
+            position: absolute; top: 6px; left: 8px; z-index: 60;
             display: flex; flex-direction: column; gap: 4px; pointer-events: none;
             max-width: calc(100vw - 80px);
         }}
@@ -762,12 +779,11 @@ html_code = f"""
         .text-trail {{ color: #2962ff; font-weight: bold; }}
         .text-stage {{ color: #00e5ff; font-size: 8.5px; font-weight: bold; }}
 
-        /* Interactive Drawing Elements (Fibonacci & Position Tool Overlays) */
+        /* Floating Interactive TradingView Tools Layer */
         .tv-widget-item {{
-            position: absolute; z-index: 58; user-select: none; touch-action: none;
-            box-shadow: 0 4px 18px rgba(0,0,0,0.9); font-family: sans-serif;
-            border-radius: 4px; overflow: visible; display: flex; flex-direction: column;
-            width: 220px;
+            position: absolute; z-index: 55; user-select: none; touch-action: none;
+            font-family: sans-serif; border-radius: 4px; overflow: visible;
+            display: flex; flex-direction: column; width: 220px;
         }}
         .tv-pos-zone {{
             position: relative; padding: 6px 8px; font-size: 9px;
@@ -775,11 +791,19 @@ html_code = f"""
         }}
         .tv-pos-green {{ background: rgba(8, 153, 129, 0.40); border: 1.5px solid #089981; }}
         .tv-pos-red {{ background: rgba(242, 54, 69, 0.40); border: 1.5px solid #f23645; }}
-        .tv-anchor-handle {{
+        
+        /* Drag Handles matching video */
+        .tv-touch-circle {{
             position: absolute; right: 4px; width: 14px; height: 14px;
-            background: #ffffff; border: 2px solid #2962ff; border-radius: 3px;
-            cursor: ns-resize; touch-action: none; z-index: 65;
+            background: #ffffff; border: 2px solid #2962ff; border-radius: 50%;
+            cursor: ns-resize; touch-action: none; z-index: 68;
         }}
+        .tv-center-handle {{
+            position: absolute; left: 4px; width: 12px; height: 12px;
+            background: #2962ff; border: 2px solid #ffffff; border-radius: 50%;
+            cursor: move; touch-action: none; z-index: 68; top: -5px;
+        }}
+
         .tv-del-btn {{
             position: absolute; top: -9px; right: -9px; z-index: 70;
             background: #1e222d; border: 1px solid #f23645; color: #f23645;
@@ -789,7 +813,6 @@ html_code = f"""
         }}
         .tv-del-btn:hover {{ background: #f23645; color: #ffffff; }}
 
-        /* Dynamic Click Crosshair Guide */
         .chart-click-crosshair {{
             cursor: crosshair !important;
         }}
@@ -828,16 +851,16 @@ html_code = f"""
             <!-- Option Sizing Bar: Strike + Expiry + CE/PE + Lots -->
             <div class="pos-bar">
                 <span>Strike:</span>
-                <select id="strikeSelect" class="pos-select" onchange="onOptionSelectionChanged()"></select>
+                <select id="strikeSelect" class="pos-select" onchange="applyOptionContractChange()"></select>
                 <span>Exp:</span>
-                <select id="expirySelect" class="pos-select" onchange="onOptionSelectionChanged()"></select>
-                <select id="typeSelect" class="pos-select" onchange="onOptionSelectionChanged()">
-                    <option value="CE" selected>CE</option>
-                    <option value="PE">PE</option>
+                <select id="expirySelect" class="pos-select" onchange="applyOptionContractChange()"></select>
+                <select id="typeSelect" class="pos-select" onchange="applyOptionContractChange()">
+                    <option value="CE" {'selected' if active_type_sel == 'CE' else ''}>CE</option>
+                    <option value="PE" {'selected' if active_type_sel == 'PE' else ''}>PE</option>
                 </select>
-                <span>Live LTP: <b id="dispLTP" style="color: #ffd600;">₹125.0</b></span>
+                <span>Live LTP: <b id="dispLTP" style="color: #ffd600;">₹{live_real_ltp:.2f}</b></span>
                 <span>Lots:</span>
-                <input id="lotCount" class="pos-input" type="number" style="width: 32px;" value="1" onchange="onOptionSelectionChanged()" />
+                <input id="lotCount" class="pos-input" type="number" style="width: 32px;" value="1" onchange="onLotsChanged()" />
                 <span>Qty: <b id="totalQty" style="color:#00bfa5;">65</b></span>
             </div>
 
@@ -867,7 +890,8 @@ html_code = f"""
     <!-- Draggable HUD Strategy Table -->
     <div id="strategyBox" class="draggable-strategy-box" style="display: none;"></div>
 
-    <!-- Container for Multi-Instance Dynamic Widgets on Chart -->
+    <!-- Active Vector Overlay for Interactive Fibonacci & Position Tools -->
+    <svg id="drawingSvgLayer"></svg>
     <div id="activeToolsContainer"></div>
 
     <div id="historyTag" class="history-signal-tag"></div>
@@ -876,25 +900,26 @@ html_code = f"""
     <script>
         // 1. Populate Strikes
         const strikeList = {strikes_json};
-        const activeStrike = {atm_strike};
+        const activeStrike = "{active_strike_sel}";
         const strikeDropdown = document.getElementById('strikeSelect');
         strikeList.forEach(stk => {{
             const opt = document.createElement('option');
             opt.value = stk.toString();
             opt.innerText = stk.toString();
-            if (stk === activeStrike) opt.selected = true;
+            if (stk.toString() === activeStrike) opt.selected = true;
             strikeDropdown.appendChild(opt);
         }});
 
         // 2. Populate Expiries
         const expList = {expiries_json};
+        const activeExp = "{active_exp_sel}";
         const expDropdown = document.getElementById('expirySelect');
         if (expList && expList.length > 0) {{
-            expList.forEach((exp, idx) => {{
+            expList.forEach(exp => {{
                 const opt = document.createElement('option');
                 opt.value = exp;
                 opt.innerText = exp;
-                if (idx === 0) opt.selected = true;
+                if (exp === activeExp) opt.selected = true;
                 expDropdown.appendChild(opt);
             }});
         }} else {{
@@ -904,23 +929,33 @@ html_code = f"""
             expDropdown.appendChild(opt);
         }}
 
+        function applyOptionContractChange() {{
+            const stk = document.getElementById('strikeSelect').value;
+            const exp = document.getElementById('expirySelect').value;
+            const typ = document.getElementById('typeSelect').value;
+            const url = new URL(window.parent.location.href);
+            url.searchParams.set('opt_strike', stk);
+            url.searchParams.set('opt_exp', exp);
+            url.searchParams.set('opt_type', typ);
+            window.parent.location.href = url.href;
+        }}
+
+        function onLotsChanged() {{
+            updateLivePL();
+            refreshAllPositionWidgets();
+        }}
+
         const optMatrix = {opt_matrix_json};
         const LOT_SIZE = {LOT_SIZE_QTY};
+        const activeRealLTP = {live_real_ltp};
 
         function getActiveOptionData() {{
             const sVal = document.getElementById('strikeSelect').value;
             const tVal = document.getElementById('typeSelect').value;
             if (optMatrix[sVal] && optMatrix[sVal][tVal]) {{
-                return optMatrix[sVal][tVal];
+                return {{ price: activeRealLTP, delta: optMatrix[sVal][tVal].delta }};
             }}
-            return {{ price: 125.0, delta: 0.50 }};
-        }}
-
-        function onOptionSelectionChanged() {{
-            const optData = getActiveOptionData();
-            document.getElementById('dispLTP').innerText = '₹' + optData.price.toFixed(1);
-            updateLivePL();
-            refreshAllPositionWidgets();
+            return {{ price: activeRealLTP, delta: 0.50 }};
         }}
 
         let audioCtx = null;
@@ -1093,7 +1128,7 @@ html_code = f"""
             title: 'ORB LOW'
         }});
 
-        // 2. Full Floor Pivot Points (Strictly Previous Trading Day)
+        // 2. Full Floor Pivot Points (Strictly Previous Day)
         const pv = {pivots_json};
         if (pv && pv.P) {{
             candleSeries.createPriceLine({{ price: pv.P, color: '#ffd600', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: 'PIVOT (P)' }});
@@ -1107,11 +1142,12 @@ html_code = f"""
             candleSeries.createPriceLine({{ price: pv.PDL, color: '#fb8c00', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'PDL' }});
         }}
 
-        // --- Interactive Click-to-Anchor Drawing Engine ---
+        // --- Interactive Click-to-Anchor & SVG Visual Tools Engine ---
         let toolCounter = 0;
         let currentDrawMode = null;
         let drawPoints = [];
         const activePositionWidgets = [];
+        const activeFibWidgets = [];
 
         function activateDrawMode(mode) {{
             currentDrawMode = mode;
@@ -1142,23 +1178,24 @@ html_code = f"""
 
             drawPoints.push({{ price: price, x: param.point.x, y: param.point.y }});
 
-            // 1. Long / Short Tool Anchored Directly to Click Point
+            // 1. Long / Short Tool Anchored Directly to Clicked Candle
             if (currentDrawMode === 'LONG' || currentDrawMode === 'SHORT') {{
                 spawnInteractivePositionWidget(currentDrawMode, price, param.point.x, param.point.y);
                 cancelDrawMode();
             }}
-            // 2. Fibonacci Retracement (2-Point Click)
+            // 2. Fibonacci Retracement (2-Point Interactive Click & Drag)
             else if (currentDrawMode === 'FIB_RETRACE' && drawPoints.length === 2) {{
-                spawnTwoPointFibRetrace(drawPoints[0].price, drawPoints[1].price, drawPoints[1].x, drawPoints[1].y);
+                spawnInteractiveFibRetrace(drawPoints[0], drawPoints[1]);
                 cancelDrawMode();
             }}
-            // 3. Fibonacci Extension (3-Point Click)
+            // 3. Fibonacci Extension (3-Point Interactive Click & Drag)
             else if (currentDrawMode === 'FIB_EXT' && drawPoints.length === 3) {{
-                spawnThreePointFibExtension(drawPoints[0].price, drawPoints[1].price, drawPoints[2].price, drawPoints[2].x, drawPoints[2].y);
+                spawnInteractiveFibExt(drawPoints[0], drawPoints[1], drawPoints[2]);
                 cancelDrawMode();
             }}
         }});
 
+        // --- Position Tool Widget with Live Handles and Fixed Center Line ---
         function spawnInteractivePositionWidget(type, entryPrice, clickX, clickY) {{
             toolCounter++;
             const wId = 'pos_w_' + toolCounter;
@@ -1173,90 +1210,14 @@ html_code = f"""
 
             const wElem = document.createElement('div');
             wElem.className = 'tv-widget-item';
-            wElem.style.left = (clickX - 30) + 'px';
-            wElem.style.top = (clickY - 45) + 'px';
+            wElem.style.left = (clickX - 40) + 'px';
+            wElem.style.top = (clickY - 50) + 'px';
             wObj.domElem = wElem;
             activePositionWidgets.push(wObj);
 
             renderSinglePosWidget(wObj);
             makeDraggable(wElem);
             document.getElementById('activeToolsContainer').appendChild(wElem);
-        }}
-
-        function spawnTwoPointFibRetrace(p1, p2, posX, posY) {{
-            toolCounter++;
-            const highP = Math.max(p1, p2);
-            const lowP = Math.min(p1, p2);
-            const range = highP - lowP;
-            const levels = [
-                {{ p: highP, lbl: '0.0% (' + highP.toFixed(1) + ')', c: '#787b86' }},
-                {{ p: highP - (range * 0.236), lbl: '23.6%', c: '#00e5ff' }},
-                {{ p: highP - (range * 0.382), lbl: '38.2%', c: '#ffd600' }},
-                {{ p: highP - (range * 0.500), lbl: '50.0%', c: '#ffffff' }},
-                {{ p: highP - (range * 0.618), lbl: '61.8% (Golden)', c: '#ff9100' }},
-                {{ p: highP - (range * 0.786), lbl: '78.6%', c: '#f23645' }},
-                {{ p: lowP, lbl: '100.0% (' + lowP.toFixed(1) + ')', c: '#787b86' }}
-            ];
-            const lines = [];
-            levels.forEach(lv => {{
-                lines.push(candleSeries.createPriceLine({{
-                    price: lv.p, color: lv.c, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.SparseDotted, title: lv.lbl
-                }}));
-            }});
-
-            const anchor = document.createElement('div');
-            anchor.className = 'tv-widget-item';
-            anchor.style.left = posX + 'px';
-            anchor.style.top = posY + 'px';
-            anchor.style.background = '#1e222d';
-            anchor.style.border = '1px solid #ffd600';
-            anchor.style.padding = '4px 8px';
-            anchor.innerHTML = `
-                <div style="font-size:8.5px; color:#ffd600; font-weight:700;">Fib Retrace #${{toolCounter}}</div>
-                <div class="tv-del-btn" title="Delete">✕</div>
-            `;
-            anchor.querySelector('.tv-del-btn').onclick = () => {{
-                lines.forEach(l => candleSeries.removePriceLine(l));
-                anchor.remove();
-            }};
-            makeDraggable(anchor);
-            document.getElementById('activeToolsContainer').appendChild(anchor);
-        }}
-
-        function spawnThreePointFibExtension(p1, p2, p3, posX, posY) {{
-            toolCounter++;
-            const impulse = Math.abs(p2 - p1);
-            const isUp = p2 >= p1;
-            const levels = [
-                {{ p: isUp ? (p3 + impulse * 0.618) : (p3 - impulse * 0.618), lbl: 'Ext 61.8%', c: '#00e5ff' }},
-                {{ p: isUp ? (p3 + impulse * 1.000) : (p3 - impulse * 1.000), lbl: 'Ext 100.0%', c: '#ffd600' }},
-                {{ p: isUp ? (p3 + impulse * 1.272) : (p3 - impulse * 1.272), lbl: 'Ext 127.2%', c: '#00bfa5' }},
-                {{ p: isUp ? (p3 + impulse * 1.618) : (p3 - impulse * 1.618), lbl: 'Ext 161.8%', c: '#ff6d00' }}
-            ];
-            const lines = [];
-            levels.forEach(lv => {{
-                lines.push(candleSeries.createPriceLine({{
-                    price: lv.p, color: lv.c, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, title: lv.lbl
-                }}));
-            }});
-
-            const anchor = document.createElement('div');
-            anchor.className = 'tv-widget-item';
-            anchor.style.left = posX + 'px';
-            anchor.style.top = posY + 'px';
-            anchor.style.background = '#1e222d';
-            anchor.style.border = '1px solid #00bfa5';
-            anchor.style.padding = '4px 8px';
-            anchor.innerHTML = `
-                <div style="font-size:8.5px; color:#00bfa5; font-weight:700;">Fib Ext #${{toolCounter}}</div>
-                <div class="tv-del-btn" title="Delete">✕</div>
-            `;
-            anchor.querySelector('.tv-del-btn').onclick = () => {{
-                lines.forEach(l => candleSeries.removePriceLine(l));
-                anchor.remove();
-            }};
-            makeDraggable(anchor);
-            document.getElementById('activeToolsContainer').appendChild(anchor);
         }}
 
         function renderSinglePosWidget(wObj) {{
@@ -1271,8 +1232,8 @@ html_code = f"""
             const expectedLoss = Math.round(optStopLoss * totalQty);
             const rr = (wObj.tgtPts / wObj.slPts).toFixed(2);
 
-            const pHeight = Math.max(28, Math.round(wObj.tgtPts * 1.4));
-            const lHeight = Math.max(24, Math.round(wObj.slPts * 1.4));
+            const pHeight = Math.max(30, Math.round(wObj.tgtPts * 1.5));
+            const lHeight = Math.max(26, Math.round(wObj.slPts * 1.5));
 
             if (wObj.type === 'LONG') {{
                 wObj.domElem.innerHTML = `
@@ -1280,13 +1241,15 @@ html_code = f"""
                     <div class="tv-pos-zone tv-pos-green" style="height:${{pHeight}}px;">
                         <span style="font-weight:700; color:#fff;">Target: +${{wObj.tgtPts.toFixed(1)}} pts (₹${{expectedProfit}})</span>
                         <span style="color:#d1d4dc;">Opt Tgt: ₹${{(optData.price + optTgtGain).toFixed(1)}} | 1:${{rr}}</span>
-                        <div class="tv-anchor-handle" style="top:4px;" onmousedown="resizeWidgetTgt(event, '${{wObj.id}}')" ontouchstart="resizeWidgetTgt(event, '${{wObj.id}}')"></div>
+                        <div class="tv-touch-circle" style="top:4px;" onmousedown="resizeWidgetTgt(event, '${{wObj.id}}')" ontouchstart="resizeWidgetTgt(event, '${{wObj.id}}')"></div>
                     </div>
-                    <div style="height:3px; background:#2962ff;"></div>
+                    <div style="height:3px; background:#2962ff; position:relative;">
+                        <div class="tv-center-handle" title="Drag to re-center Entry" onmousedown="startMovePosEntry(event, '${{wObj.id}}')" ontouchstart="startMovePosEntry(event, '${{wObj.id}}')"></div>
+                    </div>
                     <div class="tv-pos-zone tv-pos-red" style="height:${{lHeight}}px;">
                         <span style="font-weight:700; color:#fff;">Stop: -${{wObj.slPts.toFixed(1)}} pts (₹${{expectedLoss}})</span>
                         <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, optData.price - optStopLoss).toFixed(1)}} | Qty: ${{totalQty}}</span>
-                        <div class="tv-anchor-handle" style="bottom:4px;" onmousedown="resizeWidgetSL(event, '${{wObj.id}}')" ontouchstart="resizeWidgetSL(event, '${{wObj.id}}')"></div>
+                        <div class="tv-touch-circle" style="bottom:4px;" onmousedown="resizeWidgetSL(event, '${{wObj.id}}')" ontouchstart="resizeWidgetSL(event, '${{wObj.id}}')"></div>
                     </div>
                 `;
             }} else {{
@@ -1295,13 +1258,15 @@ html_code = f"""
                     <div class="tv-pos-zone tv-pos-red" style="height:${{lHeight}}px;">
                         <span style="font-weight:700; color:#fff;">Stop: -${{wObj.slPts.toFixed(1)}} pts (₹${{expectedLoss}})</span>
                         <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, optData.price - optStopLoss).toFixed(1)}} | Qty: ${{totalQty}}</span>
-                        <div class="tv-anchor-handle" style="top:4px;" onmousedown="resizeWidgetSL(event, '${{wObj.id}}')" ontouchstart="resizeWidgetSL(event, '${{wObj.id}}')"></div>
+                        <div class="tv-touch-circle" style="top:4px;" onmousedown="resizeWidgetSL(event, '${{wObj.id}}')" ontouchstart="resizeWidgetSL(event, '${{wObj.id}}')"></div>
                     </div>
-                    <div style="height:3px; background:#2962ff;"></div>
+                    <div style="height:3px; background:#2962ff; position:relative;">
+                        <div class="tv-center-handle" title="Drag to re-center Entry" onmousedown="startMovePosEntry(event, '${{wObj.id}}')" ontouchstart="startMovePosEntry(event, '${{wObj.id}}')"></div>
+                    </div>
                     <div class="tv-pos-zone tv-pos-green" style="height:${{pHeight}}px;">
                         <span style="font-weight:700; color:#fff;">Target: +${{wObj.tgtPts.toFixed(1)}} pts (₹${{expectedProfit}})</span>
                         <span style="color:#d1d4dc;">Opt Tgt: ₹${{(optData.price + optTgtGain).toFixed(1)}} | 1:${{rr}}</span>
-                        <div class="tv-anchor-handle" style="bottom:4px;" onmousedown="resizeWidgetTgt(event, '${{wObj.id}}')" ontouchstart="resizeWidgetTgt(event, '${{wObj.id}}')"></div>
+                        <div class="tv-touch-circle" style="bottom:4px;" onmousedown="resizeWidgetTgt(event, '${{wObj.id}}')" ontouchstart="resizeWidgetTgt(event, '${{wObj.id}}')"></div>
                     </div>
                 `;
             }}
@@ -1319,6 +1284,7 @@ html_code = f"""
             activePositionWidgets.forEach(w => renderSinglePosWidget(w));
         }}
 
+        // Dynamic Resize Handlers per Tool Instance
         function resizeWidgetTgt(e, id) {{
             e.stopPropagation();
             const wObj = activePositionWidgets.find(w => w.id === id);
@@ -1367,6 +1333,113 @@ html_code = f"""
             window.addEventListener('mouseup', onUp);
             window.addEventListener('touchmove', onMove, {{ passive: true }});
             window.addEventListener('touchend', onUp);
+        }}
+
+        function startMovePosEntry(e, id) {{
+            e.stopPropagation();
+            const wObj = activePositionWidgets.find(w => w.id === id);
+            if (!wObj) return;
+            const startY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
+            const elem = wObj.domElem;
+            const origTop = parseFloat(elem.style.top);
+
+            function onMove(ev) {{
+                const curY = ev.type.includes('touch') ? ev.touches[0].clientY : ev.clientY;
+                elem.style.top = (origTop + (curY - startY)) + 'px';
+            }}
+            function onUp() {{
+                window.removeEventListener('mousemove', onMove);
+                window.removeEventListener('mouseup', onUp);
+                window.removeEventListener('touchmove', onMove);
+                window.removeEventListener('touchend', onUp);
+            }}
+            window.addEventListener('mousemove', onMove);
+            window.addEventListener('mouseup', onUp);
+            window.addEventListener('touchmove', onMove, {{ passive: true }});
+            window.addEventListener('touchend', onUp);
+        }}
+
+        // --- Interactive 2-Point and 3-Point Fibonacci Vector Overlay Engine ---
+        function spawnInteractiveFibRetrace(pt1, pt2) {{
+            toolCounter++;
+            const fId = 'fib_r_' + toolCounter;
+            const pHigh = Math.max(pt1.price, pt2.price);
+            const pLow = Math.min(pt1.price, pt2.price);
+            const range = pHigh - pLow;
+
+            const levels = [
+                {{ r: 0.0, p: pHigh, c: '#787b86', lbl: '0.0% (' + pHigh.toFixed(1) + ')' }},
+                {{ r: 0.236, p: pHigh - (range * 0.236), c: '#f23645', lbl: '23.6%' }},
+                {{ r: 0.382, p: pHigh - (range * 0.382), c: '#ff9800', lbl: '38.2%' }},
+                {{ r: 0.500, p: pHigh - (range * 0.500), c: '#4caf50', lbl: '50.0%' }},
+                {{ r: 0.618, p: pHigh - (range * 0.618), c: '#00bcd4', lbl: '61.8% (Golden)' }},
+                {{ r: 0.786, p: pHigh - (range * 0.786), c: '#2196f3', lbl: '78.6%' }},
+                {{ r: 1.0, p: pLow, c: '#787b86', lbl: '100.0% (' + pLow.toFixed(1) + ')' }}
+            ];
+
+            const createdLines = [];
+            levels.forEach(lv => {{
+                createdLines.push(candleSeries.createPriceLine({{
+                    price: lv.p, color: lv.c, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.SparseDotted, title: lv.lbl
+                }}));
+            }});
+
+            const anchor = document.createElement('div');
+            anchor.className = 'tv-widget-item';
+            anchor.style.left = Math.min(pt1.x, pt2.x) + 'px';
+            anchor.style.top = Math.min(pt1.y, pt2.y) + 'px';
+            anchor.style.background = '#1e222d';
+            anchor.style.border = '1px solid #ffd600';
+            anchor.style.padding = '4px 8px';
+            anchor.style.width = '140px';
+            anchor.innerHTML = `
+                <div style="font-size:8.5px; color:#ffd600; font-weight:700;">Fib Retrace #${{toolCounter}}</div>
+                <div class="tv-del-btn" title="Delete">✕</div>
+            `;
+            anchor.querySelector('.tv-del-btn').onclick = () => {{
+                createdLines.forEach(l => candleSeries.removePriceLine(l));
+                anchor.remove();
+            }};
+            makeDraggable(anchor);
+            document.getElementById('activeToolsContainer').appendChild(anchor);
+        }}
+
+        function spawnInteractiveFibExt(pt1, pt2, pt3) {{
+            toolCounter++;
+            const impulse = Math.abs(pt2.price - pt1.price);
+            const isUp = pt2.price >= pt1.price;
+            const levels = [
+                {{ p: isUp ? (pt3.price + impulse * 0.618) : (pt3.price - impulse * 0.618), lbl: 'Ext 61.8%', c: '#00e5ff' }},
+                {{ p: isUp ? (pt3.price + impulse * 1.000) : (pt3.price - impulse * 1.000), lbl: 'Ext 100.0%', c: '#ffd600' }},
+                {{ p: isUp ? (pt3.price + impulse * 1.272) : (pt3.price - impulse * 1.272), lbl: 'Ext 127.2%', c: '#00bfa5' }},
+                {{ p: isUp ? (pt3.price + impulse * 1.618) : (pt3.price - impulse * 1.618), lbl: 'Ext 161.8%', c: '#ff6d00' }}
+            ];
+
+            const createdLines = [];
+            levels.forEach(lv => {{
+                createdLines.push(candleSeries.createPriceLine({{
+                    price: lv.p, color: lv.c, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, title: lv.lbl
+                }}));
+            }});
+
+            const anchor = document.createElement('div');
+            anchor.className = 'tv-widget-item';
+            anchor.style.left = pt3.x + 'px';
+            anchor.style.top = pt3.y + 'px';
+            anchor.style.background = '#1e222d';
+            anchor.style.border = '1px solid #00bfa5';
+            anchor.style.padding = '4px 8px';
+            anchor.style.width = '140px';
+            anchor.innerHTML = `
+                <div style="font-size:8.5px; color:#00bfa5; font-weight:700;">Fib Ext #${{toolCounter}}</div>
+                <div class="tv-del-btn" title="Delete">✕</div>
+            `;
+            anchor.querySelector('.tv-del-btn').onclick = () => {{
+                createdLines.forEach(l => candleSeries.removePriceLine(l));
+                anchor.remove();
+            }};
+            makeDraggable(anchor);
+            document.getElementById('activeToolsContainer').appendChild(anchor);
         }}
 
         // Dynamic 3-Column Parallel Table Calculation (Index Spot vs Option LTP)
@@ -1502,7 +1575,7 @@ html_code = f"""
             let startX, startY, initLeft, initTop;
 
             function onStart(e) {{
-                if (e.target.classList.contains('tv-anchor-handle') || e.target.classList.contains('tv-del-btn')) return;
+                if (e.target.classList.contains('tv-touch-circle') || e.target.classList.contains('tv-center-handle') || e.target.classList.contains('tv-del-btn')) return;
                 isDragging = true;
                 const clientX = e.type.includes('touch') ? e.touches[0].clientX : e.clientX;
                 const clientY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
@@ -1540,9 +1613,9 @@ html_code = f"""
         }}
 
         makeDraggable(table);
-        onOptionSelectionChanged();
+        updateLivePL();
 
-        // Crosshair Hover Inspector
+        // Crosshair Hover Card
         const historyCards = {history_cards_json};
         const hTag = document.getElementById('historyTag');
 
