@@ -68,7 +68,7 @@ def get_authenticated_api():
 
 api = get_authenticated_api()
 if not api:
-    st.error("Authentication failed. Please check Streamlit Secrets.")
+    st.error("Authentication failed. Please verify credentials in Secrets.")
     st.stop()
 
 # Timeframe Query Parameter
@@ -76,11 +76,11 @@ params = st.query_params
 current_interval = params.get("interval", "5m")
 
 timeframe_config = {
-    "1m": ("ONE_MINUTE", 4),
-    "3m": ("THREE_MINUTE", 7),
-    "5m": ("FIVE_MINUTE", 14),
-    "15m": ("FIFTEEN_MINUTE", 30),
-    "30m": ("THIRTY_MINUTE", 45),
+    "1m": ("ONE_MINUTE", 3),
+    "3m": ("THREE_MINUTE", 6),
+    "5m": ("FIVE_MINUTE", 10),
+    "15m": ("FIFTEEN_MINUTE", 25),
+    "30m": ("THIRTY_MINUTE", 40),
     "1h": ("ONE_HOUR", 60),
     "1D": ("ONE_DAY", 365),
 }
@@ -122,7 +122,10 @@ def fetch_nifty_candles(interval_code, days_back):
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
 
-    # NSE Regular Trading Hours (09:15 - 15:30)
+    # Clean Bad Data: Drop invalid zero/negative ticks
+    df = df[(df["open"] > 1000) & (df["high"] > 1000) & (df["low"] > 1000) & (df["close"] > 1000)].copy()
+
+    # NSE Regular Trading Hours Strictly (09:15 - 15:30)
     if interval_code != "ONE_DAY":
         df = df[
             (df["dt"].dt.time >= datetime.time(9, 15))
@@ -139,22 +142,20 @@ def fetch_nifty_candles(interval_code, days_back):
     ).astype(int)
     df["date"] = df["dt"].dt.date
 
-    # Indicators: Day-Reset VWAP & 9-EMA
+    # Indicators: Day-Reset VWAP (Guaranteed non-zero)
     df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
-    df["vol_mult"] = df["tp"] * df["volume"].apply(
-        lambda v: v if v > 0 else 1000.0
-    )
-    df["cum_vol"] = (
-        df.groupby("date")["volume"]
-        .apply(lambda s: s.replace(0, 1000).cumsum())
-        .reset_index(level=0, drop=True)
-    )
-    df["cum_vp"] = (
-        df.groupby("date")["vol_mult"]
-        .cumsum()
-        .reset_index(level=0, drop=True)
-    )
+    # Safe volume fallback so VWAP never divides by 0 or plunges to 0
+    safe_vol = df["volume"].apply(lambda v: v if (pd.notnull(v) and v > 0) else 1000.0)
+    df["vol_mult"] = df["tp"] * safe_vol
+    df["cum_vol"] = df.groupby("date")[safe_vol.name].cumsum() if hasattr(safe_vol, 'name') else safe_vol.cumsum()
+    df["cum_vp"] = df.groupby("date")["vol_mult"].cumsum()
+    
+    # Fill VWAP cleanly with typical price if cum_vol is zero
     df["vwap"] = df["cum_vp"] / df["cum_vol"]
+    df["vwap"] = df["vwap"].fillna(df["tp"])
+    df.loc[df["vwap"] < 1000, "vwap"] = df["tp"]
+
+    # 9-EMA
     df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
 
     return df
@@ -193,11 +194,9 @@ for session_date, day_df in grouped:
             t_type = session_trade["type"]
 
             if t_type == "CE":
-                # Dynamic Target 2 update
                 if h > session_trade["tp2"]:
                     session_trade["tp2"] = round(h + (session_trade["risk"] * 1.0), 1)
 
-                # Target 1 Reached: Snap Tight Stop Loss
                 if h >= session_trade["tp1"] and not session_trade["tp1_hit"]:
                     session_trade["tp1_hit"] = True
                     session_trade["current_sl"] = max(
@@ -216,7 +215,6 @@ for session_date, day_df in grouped:
                     if tight_ref > session_trade["current_sl"]:
                         session_trade["current_sl"] = tight_ref
 
-                # Exit Breach Check
                 if l <= session_trade["current_sl"] or (c < ema and c < o):
                     exit_p = min(c, session_trade["current_sl"])
                     pts = round(exit_p - session_trade["entry"], 1)
@@ -359,7 +357,7 @@ curr = df.iloc[-1]
 candles_data = []
 volume_data = []
 
-# Volume normalization strictly inside lower 14% sub-pane
+# Normalizing volume strictly for bottom 12% sub-pane
 max_vol = df["volume"].max() if df["volume"].max() > 0 else 1.0
 
 for _, r in df.iterrows():
@@ -374,9 +372,9 @@ for _, r in df.iterrows():
     )
     v_norm = (float(r["volume"]) / max_vol) * 100.0 if max_vol > 0 else 20.0
     vol_color = (
-        "rgba(8, 153, 129, 0.35)"
+        "rgba(8, 153, 129, 0.4)"
         if r["close"] >= r["open"]
-        else "rgba(242, 54, 69, 0.35)"
+        else "rgba(242, 54, 69, 0.4)"
     )
     volume_data.append(
         {
@@ -403,14 +401,12 @@ ema_json = json.dumps(
 )
 markers_json = json.dumps(markers)
 
-# Prepare HUD Table Payload Matching All User Drawing Requirements
+# Exact Table Format Requested in Your Yellow Box Drawing
 hud_payload = None
 if latest_trade_for_hud:
     is_ce = latest_trade_for_hud["type"] == "CE"
     entry_p = latest_trade_for_hud["entry"]
     trail_p = latest_trade_for_hud["current_sl"]
-    
-    # Calculate Secured Points based on Trailing SL
     secured_pts = round(trail_p - entry_p, 1) if is_ce else round(entry_p - trail_p, 1)
     risk_pts = latest_trade_for_hud["risk"]
     target1_pts = round(abs(latest_trade_for_hud["tp1"] - entry_p), 1)
@@ -426,7 +422,6 @@ if latest_trade_for_hud:
         "target1": f"{latest_trade_for_hud['tp1']:.1f} (+{target1_pts:.1f} pts)",
         "secured_pts": f"{secured_pts:+.1f} pts",
         "theme": "#089981" if is_ce else "#f23645",
-        "status": latest_trade_for_hud.get("status", "IN TRADE (TRAILED)"),
     }
 
 hud_json = json.dumps(hud_payload)
@@ -437,7 +432,7 @@ chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
-# --- HTML/JS Canvas Component ---
+# --- Complete Fixed Layout HTML/JS Component ---
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -459,42 +454,42 @@ html_code = f"""
             position: absolute; top: 0; left: 0; z-index: 1;
         }}
 
-        /* 1. TOP YELLOW BOX: Fixed Header Ribbon */
+        /* 1. TOP YELLOW BOX: Fixed Header Ribbon (Symbol, Price, Timeframes, Dynamic OHLC) */
         .fixed-top-box {{
-            position: fixed; top: 4px; left: 8px; right: 8px; z-index: 50;
+            position: fixed; top: 4px; left: 6px; right: 6px; z-index: 50;
             display: flex; flex-direction: column; gap: 3px; pointer-events: none;
         }}
         .top-ctrl-row {{
             display: flex; align-items: center; justify-content: space-between; pointer-events: auto;
         }}
         .sym-group {{
-            display: flex; align-items: center; gap: 6px;
+            display: flex; align-items: center; gap: 5px;
         }}
         .badge {{
-            background: #2962ff; color: #fff; font-size: 11px; padding: 2px 5px;
+            background: #2962ff; color: #fff; font-size: 10px; padding: 2px 4px;
             border-radius: 3px; font-weight: 700;
         }}
-        .sym-title {{ font-size: 14px; font-weight: 700; color: #d1d4dc; }}
-        .sym-price {{ font-size: 13px; font-weight: 700; }}
+        .sym-title {{ font-size: 13px; font-weight: 700; color: #d1d4dc; }}
+        .sym-price {{ font-size: 12px; font-weight: 700; }}
 
-        /* Fixed Timeframe Selector Buttons */
+        /* Timeframe Switcher */
         .tf-bar {{
-            display: flex; gap: 3px; background: rgba(30, 34, 45, 0.95);
-            padding: 2px 4px; border-radius: 4px; border: 1px solid #2a2e39;
+            display: flex; gap: 2px; background: rgba(30, 34, 45, 0.95);
+            padding: 2px 3px; border-radius: 4px; border: 1px solid #2a2e39;
         }}
         .tf-btn {{
             background: transparent; border: none; color: #787b86;
-            font-size: 11px; font-weight: 600; padding: 2px 6px;
+            font-size: 10px; font-weight: 600; padding: 2px 4px;
             border-radius: 3px; cursor: pointer;
         }}
         .tf-btn.active {{
             background: #2a2e39; color: #d1d4dc; font-weight: 700;
         }}
 
-        /* Fixed Live Dynamic OHLC Row */
+        /* Dynamic Live OHLC Ribbon */
         .dynamic-ohlc-row {{
-            font-size: 10.5px; color: #787b86; display: flex; gap: 7px;
-            background: rgba(11, 14, 20, 0.88); padding: 2px 8px;
+            font-size: 10px; color: #787b86; display: flex; gap: 6px;
+            background: rgba(11, 14, 20, 0.9); padding: 2px 6px;
             border-radius: 3px; border: 1px solid rgba(42, 46, 57, 0.5);
             font-family: monospace; width: fit-content;
         }}
@@ -502,24 +497,24 @@ html_code = f"""
 
         /* 2. STRATEGY TABLE BOX: Fixed Bottom-Right Above Volume */
         .fixed-strategy-box {{
-            position: fixed; bottom: 58px; right: 65px; z-index: 50;
+            position: fixed; bottom: 56px; right: 65px; z-index: 50;
             background: rgba(19, 23, 34, 0.98); border: 1px solid #2a2e39;
-            border-radius: 6px; font-size: 10px; color: #d1d4dc; overflow: hidden;
-            box-shadow: 0 4px 16px rgba(0,0,0,0.8);
+            border-radius: 5px; font-size: 9.5px; color: #d1d4dc; overflow: hidden;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.85);
         }}
         .fixed-strategy-box table {{ border-collapse: collapse; }}
-        .fixed-strategy-box td {{ padding: 3px 8px; border-bottom: 1px solid #222631; white-space: nowrap; }}
+        .fixed-strategy-box td {{ padding: 3px 7px; border-bottom: 1px solid #222631; white-space: nowrap; }}
         .fixed-strategy-box tr:last-child td {{ border-bottom: none; }}
         .label-cell {{ color: #787b86; font-weight: 500; }}
         .val-cell {{ font-weight: 700; color: #ffffff; text-align: right; }}
-        .tag-pill {{ color: #fff; font-weight: bold; border-radius: 3px; padding: 1px 6px; text-align: center; }}
+        .tag-pill {{ color: #fff; font-weight: bold; border-radius: 3px; padding: 1px 5px; text-align: center; }}
         .text-red {{ color: #f23645; }}
         .text-green {{ color: #089981; }}
         .text-trail {{ color: #2962ff; font-weight: bold; }}
     </style>
 </head>
 <body>
-    <!-- Top Fixed Yellow Box Area -->
+    <!-- Top Box: Header, Timeframes, and OHLC -->
     <div class="fixed-top-box">
         <div class="top-ctrl-row">
             <div class="sym-group">
@@ -530,196 +525,4 @@ html_code = f"""
 
             <div class="tf-bar">
                 <button class="tf-btn {'active' if current_interval=='1m' else ''}" onclick="changeTF('1m')">1m</button>
-                <button class="tf-btn {'active' if current_interval=='3m' else ''}" onclick="changeTF('3m')">3m</button>
-                <button class="tf-btn {'active' if current_interval=='5m' else ''}" onclick="changeTF('5m')">5m</button>
-                <button class="tf-btn {'active' if current_interval=='15m' else ''}" onclick="changeTF('15m')">15m</button>
-                <button class="tf-btn {'active' if current_interval=='30m' else ''}" onclick="changeTF('30m')">30m</button>
-                <button class="tf-btn {'active' if current_interval=='1h' else ''}" onclick="changeTF('1h')">1h</button>
-                <button class="tf-btn {'active' if current_interval=='1D' else ''}" onclick="changeTF('1D')">1D</button>
-            </div>
-        </div>
-
-        <div id="ohlcRow" class="dynamic-ohlc-row">
-            <span>O: <b id="barO">{curr['open']:.2f}</b></span>
-            <span>H: <b id="barH">{curr['high']:.2f}</b></span>
-            <span>L: <b id="barL">{curr['low']:.2f}</b></span>
-            <span>C: <b id="barC">{curr['close']:.2f}</b></span>
-            <span>VWAP: <b id="barVWAP" style="color:#ab47bc;">{curr['vwap']:.2f}</b></span>
-            <span>9-EMA: <b id="barEMA" style="color:#2962ff;">{curr['ema9']:.2f}</b></span>
-        </div>
-    </div>
-
-    <!-- Fixed Strategy Table Box -->
-    <div id="strategyBox" class="fixed-strategy-box" style="display: none;"></div>
-
-    <!-- Main Chart Canvas Area -->
-    <div id="chartArea"></div>
-
-    <script>
-        const container = document.getElementById('chartArea');
-        const chart = LightweightCharts.createChart(container, {{
-            width: window.innerWidth,
-            height: window.innerHeight,
-            layout: {{
-                background: {{ color: '#0b0e14' }},
-                textColor: '#787b86',
-                fontSize: 11,
-            }},
-            grid: {{
-                vertLines: {{ color: '#161a25' }},
-                horzLines: {{ color: '#161a25' }}
-            }},
-            crosshair: {{
-                mode: LightweightCharts.CrosshairMode.Normal,
-                vertLine: {{ color: '#758696', width: 1, style: 3 }},
-                horzLine: {{ color: '#758696', width: 1, style: 3 }}
-            }},
-            // 3. RIGHT YELLOW BOX: Expandable and Shrinkable Price Scale
-            rightPriceScale: {{
-                borderColor: '#2a2e39',
-                autoScale: true,
-                scaleMargins: {{ top: 0.14, bottom: 0.18 }},
-                alignLabels: true,
-                entireTextOnly: true
-            }},
-            // 4. BOTTOM YELLOW BOX: Expandable and Shrinkable Time Scale
-            timeScale: {{
-                borderColor: '#2a2e39',
-                timeVisible: true,
-                secondsVisible: false,
-                rightOffset: 8
-            }},
-            localization: {{
-                priceFormatter: p => p.toFixed(2)
-            }}
-        }});
-
-        // Candlestick Series (Main Chart)
-        const candleSeries = chart.addCandlestickSeries({{
-            upColor: '#089981',
-            downColor: '#f23645',
-            borderUpColor: '#089981',
-            borderDownColor: '#f23645',
-            wickUpColor: '#089981',
-            wickDownColor: '#f23645',
-            priceFormat: {{ type: 'price', precision: 2, minMove: 0.05 }}
-        }});
-        candleSeries.setData({candles_json});
-
-        // 5. VOLUME BAR BOX: Fixed to bottom 14% height sub-pane
-        const volumeSeries = chart.addHistogramSeries({{
-            priceFormat: {{ type: 'volume' }},
-            priceScaleId: 'vol_scale',
-            scaleMargins: {{
-                top: 0.86,
-                bottom: 0.0
-            }}
-        }});
-        chart.priceScale('vol_scale').applyOptions({{
-            scaleMargins: {{ top: 0.86, bottom: 0.0 }}
-        }});
-        volumeSeries.setData({volume_json});
-
-        // Purple Session VWAP
-        const vwapSeries = chart.addLineSeries({{
-            color: '#ab47bc',
-            lineWidth: 2,
-            title: 'VWAP',
-            priceFormat: {{ type: 'price', precision: 2, minMove: 0.05 }}
-        }});
-        vwapSeries.setData({vwap_json});
-
-        // Blue 9-EMA
-        const emaSeries = chart.addLineSeries({{
-            color: '#2962ff',
-            lineWidth: 1,
-            title: '9-EMA',
-            priceFormat: {{ type: 'price', precision: 2, minMove: 0.05 }}
-        }});
-        emaSeries.setData({ema_json});
-
-        // Signal Markers (BUY CE, BUY PE, EXIT SL)
-        candleSeries.setMarkers({markers_json});
-
-        // ORB Level Lines
-        candleSeries.createPriceLine({{
-            price: {curr_orb_h:.2f},
-            color: '#089981',
-            lineWidth: 2,
-            lineStyle: LightweightCharts.LineStyle.Dashed,
-            axisLabelVisible: true,
-            title: 'ORB HIGH'
-        }});
-
-        candleSeries.createPriceLine({{
-            price: {curr_orb_l:.2f},
-            color: '#f23645',
-            lineWidth: 2,
-            lineStyle: LightweightCharts.LineStyle.Dashed,
-            axisLabelVisible: true,
-            title: 'ORB LOW'
-        }});
-
-        // Render Fixed Strategy Table Matching Every Item in Your Drawing
-        const s = {hud_json};
-        if (s) {{
-            const table = document.getElementById('strategyBox');
-            table.style.display = 'block';
-            table.innerHTML = `
-                <table>
-                    <tr><td class="label-cell">Call or Put</td><td class="val-cell"><span class="tag-pill" style="background:${{s.theme}}">${{s.call_or_put}}</span></td></tr>
-                    <tr><td class="label-cell">Reason for trade</td><td class="val-cell" style="font-size:9.5px; color:#cfd3dc;">${{s.reason}}</td></tr>
-                    <tr><td class="label-cell">Entry</td><td class="val-cell"><b>${{s.entry}}</b></td></tr>
-                    <tr><td class="label-cell">SL (total risk points)</td><td class="val-cell text-red">${{s.sl_risk}}</td></tr>
-                    <tr><td class="label-cell">Target (total target points)</td><td class="val-cell text-green">${{s.target_total}}</td></tr>
-                    <tr><td class="label-cell">Trailing SL (risk points)</td><td class="val-cell text-trail">${{s.trailing_sl}}</td></tr>
-                    <tr><td class="label-cell">Target 1 (target points)</td><td class="val-cell text-green">${{s.target1}}</td></tr>
-                    <tr><td class="label-cell">Secured points based on trailing SL</td><td class="val-cell text-green"><b>${{s.secured_pts}}</b></td></tr>
-                </table>
-            `;
-        }}
-
-        // Live Dynamic Crosshair Inspector
-        chart.subscribeCrosshairMove(param => {{
-            if (!param.time || !param.seriesData.get(candleSeries)) return;
-            const bar = param.seriesData.get(candleSeries);
-            document.getElementById('barO').innerText = bar.open.toFixed(2);
-            document.getElementById('barH').innerText = bar.high.toFixed(2);
-            document.getElementById('barL').innerText = bar.low.toFixed(2);
-            document.getElementById('barC').innerText = bar.close.toFixed(2);
-            const vBar = param.seriesData.get(vwapSeries);
-            if (vBar) document.getElementById('barVWAP').innerText = vBar.value.toFixed(2);
-            const eBar = param.seriesData.get(emaSeries);
-            if (eBar) document.getElementById('barEMA').innerText = eBar.value.toFixed(2);
-        }});
-
-        window.addEventListener('resize', () => {{
-            chart.applyOptions({{
-                width: window.innerWidth,
-                height: window.innerHeight
-            }});
-        }});
-
-        function changeTF(tf) {{
-            const url = new URL(window.parent.location.href);
-            url.searchParams.set('interval', tf);
-            window.parent.location.href = url.href;
-        }}
-    </script>
-</body>
-</html>
-"""
-
-components.html(html_code, height=940, scrolling=False)
-
-# Auto-refresh
-st.markdown(
-    """
-    <script>
-        setTimeout(function(){
-            window.location.reload();
-        }, 15000);
-    </script>
-""",
-    unsafe_allow_html=True,
-)
+                <button class="tf-btn {'active' if current_interval=='3m' else ''}" onclick="
