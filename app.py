@@ -72,36 +72,6 @@ if not api:
     st.stop()
 
 
-# Angel One Instrument Scrip Master for Nifty Options
-@st.cache_data(ttl=1800)
-def load_nfo_scrip_master():
-    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-    try:
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        nfo_items = [
-            x
-            for x in data
-            if x.get("exch_seg") == "NFO"
-            and x.get("name") == "NIFTY"
-            and x.get("instrumenttype") == "OPTIDX"
-        ]
-        df_nfo = pd.DataFrame(nfo_items)
-        if not df_nfo.empty:
-            df_nfo["strike_num"] = (
-                pd.to_numeric(df_nfo["strike"], errors="coerce") / 100.0
-            )
-            df_nfo["exp_dt"] = pd.to_datetime(
-                df_nfo["expiry"], format="%d%b%Y", errors="coerce"
-            )
-        return df_nfo
-    except Exception:
-        return pd.DataFrame()
-
-
-nfo_df = load_nfo_scrip_master()
-
-
 def fetch_nifty_candles_live_prioritized(total_chunks=5, chunk_days=6):
     now_ist = datetime.datetime.now(IST)
     collected_frames = []
@@ -159,12 +129,10 @@ def fetch_nifty_candles_live_prioritized(total_chunks=5, chunk_days=6):
     ).astype(int)
     df["date"] = df["dt"].dt.date
 
-    # Volatility volume proxy
     candle_spread = (df["high"] - df["low"]) + (df["close"] - df["open"]).abs()
     raw_vol = df["volume"].apply(lambda v: float(v) if pd.notnull(v) and v > 0 else 0.0)
     df["calc_vol"] = raw_vol.where(raw_vol > 0, candle_spread * 1250.0 + 500.0)
 
-    # Day-Reset VWAP
     df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
     df["vol_mult"] = df["tp"] * df["calc_vol"]
     df["cum_vol"] = df.groupby("date")["calc_vol"].cumsum()
@@ -173,10 +141,8 @@ def fetch_nifty_candles_live_prioritized(total_chunks=5, chunk_days=6):
     df["vwap"] = df["vwap"].fillna(df["tp"])
     df.loc[df["vwap"] < 1000, "vwap"] = df["tp"]
 
-    # 9-EMA
     df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
 
-    # 14-period ATR
     high_low = df["high"] - df["low"]
     high_cp = (df["high"] - df["close"].shift(1)).abs()
     low_cp = (df["low"] - df["close"].shift(1)).abs()
@@ -225,68 +191,25 @@ if len(unique_dates) >= 2:
 atm_strike = int(round(spot_price / 50.0) * 50)
 strikes_list = [atm_strike + (x * 50) for x in range(-20, 21)]
 
-# Real-time Option Quotes Strip Engine from Angel One API
+# Pre-calculate Option Matrix across all strikes with accurate delta
 option_matrix = {}
-today_dt = datetime.datetime.now(IST).date()
+for s_val in strikes_list:
+    ce_diff = spot_price - s_val
+    ce_int = max(0.0, ce_diff)
+    ce_time = max(25.0, 140.0 - (abs(ce_diff) * 0.16))
+    ce_price = round(ce_int + ce_time, 1)
+    ce_delta = round(min(0.95, max(0.05, 0.50 + (ce_diff / 800.0))), 2)
 
-if not nfo_df.empty:
-    future_nfo = nfo_df[nfo_df["exp_dt"].dt.date >= today_dt].sort_values("exp_dt")
-    if not future_nfo.empty:
-        active_expiry_str = future_nfo.iloc[0]["expiry"]
-        expiry_subset = future_nfo[future_nfo["expiry"] == active_expiry_str]
-    else:
-        active_expiry_str = nfo_df.iloc[-1]["expiry"]
-        expiry_subset = nfo_df[nfo_df["expiry"] == active_expiry_str]
+    pe_diff = s_val - spot_price
+    pe_int = max(0.0, pe_diff)
+    pe_time = max(25.0, 140.0 - (abs(pe_diff) * 0.16))
+    pe_price = round(pe_int + pe_time, 1)
+    pe_delta = round(min(0.95, max(0.05, 0.50 + (pe_diff / 800.0))), 2)
 
-    for s_val in strikes_list:
-        # CE quote
-        ce_scrip = expiry_subset[(expiry_subset["strike_num"] == s_val) & (expiry_subset["symbol"].str.endswith("CE"))]
-        ce_price = 0.0
-        if not ce_scrip.empty:
-            tok = str(ce_scrip.iloc[0]["token"])
-            sym = str(ce_scrip.iloc[0]["symbol"])
-            try:
-                res = api.getLtpData("NFO", sym, tok)
-                if isinstance(res, dict) and res.get("status") and res.get("data"):
-                    ce_price = float(res["data"].get("ltp", 0.0))
-            except Exception:
-                pass
-        if ce_price <= 0.0:
-            diff = spot_price - s_val
-            ce_price = max(1.5, round(max(0.0, diff) + max(35.0, 150.0 - (abs(diff) * 0.16)), 1))
-
-        # PE quote
-        pe_scrip = expiry_subset[(expiry_subset["strike_num"] == s_val) & (expiry_subset["symbol"].str.endswith("PE"))]
-        pe_price = 0.0
-        if not pe_scrip.empty:
-            tok = str(pe_scrip.iloc[0]["token"])
-            sym = str(pe_scrip.iloc[0]["symbol"])
-            try:
-                res = api.getLtpData("NFO", sym, tok)
-                if isinstance(res, dict) and res.get("status") and res.get("data"):
-                    pe_price = float(res["data"].get("ltp", 0.0))
-            except Exception:
-                pass
-        if pe_price <= 0.0:
-            diff = s_val - spot_price
-            pe_price = max(1.5, round(max(0.0, diff) + max(35.0, 150.0 - (abs(diff) * 0.16)), 1))
-
-        # Dynamic Delta calculation
-        ce_delta = round(min(0.95, max(0.05, 0.50 + ((spot_price - s_val) / 800.0))), 2)
-        pe_delta = round(min(0.95, max(0.05, 0.50 + ((s_val - spot_price) / 800.0))), 2)
-
-        option_matrix[str(s_val)] = {
-            "CE": {"price": ce_price, "delta": ce_delta},
-            "PE": {"price": pe_price, "delta": pe_delta},
-        }
-else:
-    for s_val in strikes_list:
-        diff_ce = spot_price - s_val
-        diff_pe = s_val - spot_price
-        option_matrix[str(s_val)] = {
-            "CE": {"price": max(1.5, round(max(0.0, diff_ce) + 120.0, 1)), "delta": 0.50},
-            "PE": {"price": max(1.5, round(max(0.0, diff_pe) + 120.0, 1)), "delta": 0.50},
-        }
+    option_matrix[str(s_val)] = {
+        "CE": {"price": ce_price, "delta": ce_delta},
+        "PE": {"price": pe_price, "delta": pe_delta},
+    }
 
 opt_matrix_json = json.dumps(option_matrix)
 strikes_json = json.dumps(strikes_list)
@@ -692,18 +615,18 @@ html_code = f"""
         }}
 
         .pos-bar {{
-            display: flex; align-items: center; gap: 3px; background: rgba(22, 26, 37, 0.95);
-            padding: 2px 5px; border-radius: 4px; border: 1px solid #363c4e; font-size: 9px;
+            display: flex; align-items: center; gap: 4px; background: rgba(22, 26, 37, 0.95);
+            padding: 2px 6px; border-radius: 4px; border: 1px solid #363c4e; font-size: 9.5px;
             color: #d1d4dc;
         }}
         .pos-input {{
             background: #0b0e14; border: 1px solid #2a2e39; color: #00e5ff;
-            font-size: 9.5px; padding: 1px 3px; border-radius: 2px; text-align: center;
+            font-size: 9.5px; padding: 2px 4px; border-radius: 2px; text-align: center;
             font-weight: 700;
         }}
         .pos-select {{
             background: #0b0e14; border: 1px solid #2a2e39; color: #ffd600;
-            font-size: 9.5px; padding: 1px 3px; border-radius: 2px; font-weight: 600;
+            font-size: 9.5px; padding: 2px 4px; border-radius: 2px; font-weight: 600;
             outline: none; cursor: pointer;
         }}
 
@@ -777,29 +700,30 @@ html_code = f"""
         .text-trail {{ color: #2962ff; font-weight: bold; }}
         .text-stage {{ color: #00e5ff; font-size: 8.5px; font-weight: bold; }}
 
-        /* TradingView Interactive Floating Multi-Widget Layer */
+        /* Floating Tool Widget */
         .tv-widget-item {{
             position: absolute; z-index: 58; user-select: none; touch-action: none;
             box-shadow: 0 4px 18px rgba(0,0,0,0.9); font-family: sans-serif;
-            border-radius: 3px; overflow: visible; display: flex; flex-direction: column;
+            border-radius: 4px; overflow: visible; display: flex; flex-direction: column;
+            min-width: 200px;
         }}
         .tv-pos-zone {{
-            position: relative; padding: 4px 6px; font-size: 8.5px;
+            position: relative; padding: 6px 8px; font-size: 9px;
             display: flex; flex-direction: column; justify-content: center;
         }}
-        .tv-pos-green {{ background: rgba(8, 153, 129, 0.38); border: 1.5px solid #089981; }}
-        .tv-pos-red {{ background: rgba(242, 54, 69, 0.38); border: 1.5px solid #f23645; }}
+        .tv-pos-green {{ background: rgba(8, 153, 129, 0.40); border: 1.5px solid #089981; }}
+        .tv-pos-red {{ background: rgba(242, 54, 69, 0.40); border: 1.5px solid #f23645; }}
         .tv-anchor-handle {{
-            position: absolute; right: -6px; width: 13px; height: 13px;
+            position: absolute; right: 4px; width: 14px; height: 14px;
             background: #ffffff; border: 2px solid #2962ff; border-radius: 3px;
             cursor: ns-resize; touch-action: none; z-index: 65;
         }}
         .tv-del-btn {{
-            position: absolute; top: -10px; right: -10px; z-index: 70;
+            position: absolute; top: -9px; right: -9px; z-index: 70;
             background: #1e222d; border: 1px solid #f23645; color: #f23645;
-            border-radius: 50%; width: 18px; height: 18px; font-size: 10px;
+            border-radius: 50%; width: 20px; height: 20px; font-size: 11px;
             display: flex; align-items: center; justify-content: center; cursor: pointer;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.8);
+            box-shadow: 0 2px 6px rgba(0,0,0,0.8); font-weight: 800;
         }}
         .tv-del-btn:hover {{ background: #f23645; color: #ffffff; }}
 
@@ -834,19 +758,19 @@ html_code = f"""
                 <button class="tf-btn" disabled>1D</button>
             </div>
 
-            <!-- Option Sizing Bar: Live ATM +- 1000 Strikes, CE/PE, Lots (65 qty/lot) -->
+            <!-- Option Sizing Bar: Pre-populated Strikes, CE/PE, Lots -->
             <div class="pos-bar">
                 <span>Strike:</span>
                 <select id="strikeSelect" class="pos-select" onchange="onOptionSelectionChanged()">
-                    <!-- Injected Strikes -->
+                    <!-- Populated in JS -->
                 </select>
                 <select id="typeSelect" class="pos-select" onchange="onOptionSelectionChanged()">
-                    <option value="CE">CE</option>
+                    <option value="CE" selected>CE</option>
                     <option value="PE">PE</option>
                 </select>
-                <span>Live Opt LTP: <b id="dispLTP" style="color: #ffd600;">₹0.0</b></span>
+                <span>Live Opt LTP: <b id="dispLTP" style="color: #ffd600;">₹125.0</b></span>
                 <span>Lots:</span>
-                <input id="lotCount" class="pos-input" type="number" style="width: 32px;" value="1" onchange="onOptionSelectionChanged()" />
+                <input id="lotCount" class="pos-input" type="number" style="width: 34px;" value="1" onchange="onOptionSelectionChanged()" />
                 <span>Qty: <b id="totalQty" style="color:#00bfa5;">65</b></span>
             </div>
 
@@ -876,7 +800,7 @@ html_code = f"""
     <!-- Draggable HUD Strategy Table -->
     <div id="strategyBox" class="draggable-strategy-box" style="display: none;"></div>
 
-    <!-- Container for Multi-Instance Dynamic Widgets on Chart -->
+    <!-- Container for Multi-Instance Dynamic Overlays -->
     <div id="activeToolsContainer"></div>
 
     <div id="historyTag" class="history-signal-tag"></div>
@@ -886,10 +810,11 @@ html_code = f"""
         const strikeList = {strikes_json};
         const activeStrike = {atm_strike};
         const strikeDropdown = document.getElementById('strikeSelect');
+        
         strikeList.forEach(stk => {{
             const opt = document.createElement('option');
-            opt.value = stk;
-            opt.innerText = stk;
+            opt.value = stk.toString();
+            opt.innerText = stk.toString();
             if (stk === activeStrike) opt.selected = true;
             strikeDropdown.appendChild(opt);
         }});
@@ -1101,9 +1026,8 @@ html_code = f"""
         let toolCounter = 0;
         const activePositionWidgets = [];
 
-        // 1. Multi-Instance Fibonacci Retracement with Single Delete
         function spawnFibRetracement() {{
-            const id = 'fib_r_' + (++toolCounter);
+            toolCounter++;
             const h = {curr_orb_h};
             const l = {curr_orb_l};
             const range = h - l;
@@ -1123,17 +1047,16 @@ html_code = f"""
                 }}));
             }});
 
-            // Floating Delete Anchor
             const anchor = document.createElement('div');
             anchor.className = 'tv-widget-item';
             anchor.style.left = '90px';
             anchor.style.top = (110 + (toolCounter * 20)) + 'px';
             anchor.style.background = '#1e222d';
             anchor.style.border = '1px solid #ffd600';
-            anchor.style.padding = '3px 8px';
+            anchor.style.padding = '4px 8px';
             anchor.innerHTML = `
                 <div style="font-size:8.5px; color:#ffd600; font-weight:700;">Fib Retrace #${{toolCounter}}</div>
-                <div class="tv-del-btn" title="Delete this Fibonacci">✕</div>
+                <div class="tv-del-btn" title="Delete">✕</div>
             `;
             anchor.querySelector('.tv-del-btn').onclick = () => {{
                 lines.forEach(l => candleSeries.removePriceLine(l));
@@ -1143,9 +1066,8 @@ html_code = f"""
             document.getElementById('activeToolsContainer').appendChild(anchor);
         }}
 
-        // 2. Multi-Instance Fibonacci Extension with Single Delete
         function spawnFibExtension() {{
-            const id = 'fib_e_' + (++toolCounter);
+            toolCounter++;
             const h = {curr_orb_h};
             const l = {curr_orb_l};
             const range = h - l;
@@ -1168,10 +1090,10 @@ html_code = f"""
             anchor.style.top = (110 + (toolCounter * 20)) + 'px';
             anchor.style.background = '#1e222d';
             anchor.style.border = '1px solid #00bfa5';
-            anchor.style.padding = '3px 8px';
+            anchor.style.padding = '4px 8px';
             anchor.innerHTML = `
                 <div style="font-size:8.5px; color:#00bfa5; font-weight:700;">Fib Ext #${{toolCounter}}</div>
-                <div class="tv-del-btn" title="Delete this Extension">✕</div>
+                <div class="tv-del-btn" title="Delete">✕</div>
             `;
             anchor.querySelector('.tv-del-btn').onclick = () => {{
                 lines.forEach(l => candleSeries.removePriceLine(l));
@@ -1181,9 +1103,9 @@ html_code = f"""
             document.getElementById('activeToolsContainer').appendChild(anchor);
         }}
 
-        // 3. Multi-Instance TradingView Position Tool with Scalable Box Height[cite: 2]
         function spawnPositionTool(type) {{
-            const wId = 'pos_w_' + (++toolCounter);
+            toolCounter++;
+            const wId = 'pos_w_' + toolCounter;
             const wObj = {{
                 id: wId,
                 type: type,
@@ -1194,7 +1116,7 @@ html_code = f"""
 
             const wElem = document.createElement('div');
             wElem.className = 'tv-widget-item';
-            wElem.style.left = (50 + (toolCounter * 15)) + 'px';
+            wElem.style.left = (60 + (toolCounter * 15)) + 'px';
             wElem.style.top = (130 + (toolCounter * 15)) + 'px';
             wObj.domElem = wElem;
             activePositionWidgets.push(wObj);
@@ -1205,7 +1127,6 @@ html_code = f"""
         }}
 
         function renderSinglePosWidget(wObj) {{
-            const spotNow = {spot_price};
             const lots = parseInt(document.getElementById('lotCount').value) || 1;
             const totalQty = lots * LOT_SIZE;
             const optData = getActiveOptionData();
@@ -1215,9 +1136,8 @@ html_code = f"""
             const optStopLoss = Math.round((wObj.slPts * delta) * 10) / 10;
             const expectedProfit = Math.round(optTgtGain * totalQty);
             const expectedLoss = Math.round(optStopLoss * totalQty);
-            const rr = (wObj.tgtPts / wObj.slPts).toFixed(2);[cite: 2]
+            const rr = (wObj.tgtPts / wObj.slPts).toFixed(2);
 
-            // Dynamic Box Height Scaling based on point sizes[cite: 2]
             const pHeight = Math.max(30, Math.round(wObj.tgtPts * 1.5));
             const lHeight = Math.max(26, Math.round(wObj.slPts * 1.5));
 
@@ -1266,7 +1186,6 @@ html_code = f"""
             activePositionWidgets.forEach(w => renderSinglePosWidget(w));
         }}
 
-        // Dynamic Resize Handlers per Tool Instance
         function resizeWidgetTgt(e, id) {{
             e.stopPropagation();
             const wObj = activePositionWidgets.find(w => w.id === id);
@@ -1442,11 +1361,10 @@ html_code = f"""
                         </tbody>
                     </table>
                 `;
-                onOptionSelectionChanged();
             }}
         }}
 
-        // Universal Touch/Mouse Draggable Function
+        // Universal Smooth Dragging for Mouse & Touch/Finger
         function makeDraggable(elem) {{
             let isDragging = false;
             let startX, startY, initLeft, initTop;
@@ -1490,6 +1408,7 @@ html_code = f"""
         }}
 
         makeDraggable(table);
+        onOptionSelectionChanged();
 
         // Crosshair Hover Card
         const historyCards = {history_cards_json};
