@@ -67,45 +67,51 @@ if not api:
     st.error("Authentication failed. Please verify credentials in Secrets.")
     st.stop()
 
-# Fixed 5-minute configuration strictly
-api_interval = "FIVE_MINUTE"
-lookback_days = 30
 
-
-def fetch_nifty_candles(interval_code, days_back):
+def fetch_nifty_candles_paginated(total_days=45):
     now = datetime.datetime.now()
-    from_date = (now - datetime.timedelta(days=days_back)).strftime(
-        "%Y-%m-%d 09:15"
-    )
-    to_date = now.strftime("%Y-%m-%d %H:%M")
+    chunk_size_days = 10
+    collected_frames = []
 
-    try:
-        resp = api.getCandleData(
-            {
-                "exchange": "NSE",
-                "symboltoken": INDEX_TOKEN,
-                "interval": interval_code,
-                "fromdate": from_date,
-                "todate": to_date,
-            }
-        )
-    except Exception:
+    end_dt = now
+    for _ in range(0, total_days, chunk_size_days):
+        start_dt = end_dt - datetime.timedelta(days=chunk_size_days)
+        from_str = start_dt.strftime("%Y-%m-%d 09:15")
+        to_str = end_dt.strftime("%Y-%m-%d %H:%M")
+
+        try:
+            resp = api.getCandleData(
+                {
+                    "exchange": "NSE",
+                    "symboltoken": INDEX_TOKEN,
+                    "interval": "FIVE_MINUTE",
+                    "fromdate": from_str,
+                    "todate": to_str,
+                }
+            )
+            if isinstance(resp, dict) and resp.get("status") and resp.get("data"):
+                df_chunk = pd.DataFrame(
+                    resp["data"],
+                    columns=["timestamp", "open", "high", "low", "close", "volume"],
+                )
+                collected_frames.append(df_chunk)
+        except Exception:
+            pass
+
+        end_dt = start_dt
+
+    if not collected_frames:
         return None
 
-    if not isinstance(resp, dict) or not resp.get("status") or not resp.get("data"):
-        return None
-
-    df = pd.DataFrame(
-        resp["data"],
-        columns=["timestamp", "open", "high", "low", "close", "volume"],
-    )
+    df = pd.concat(collected_frames, ignore_index=True)
     df["dt"] = pd.to_datetime(df["timestamp"])
+    df = df.drop_duplicates(subset=["dt"]).sort_values(by="dt").reset_index(drop=True)
+
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
 
     df = df[(df["open"] > 1000) & (df["high"] > 1000) & (df["low"] > 1000) & (df["close"] > 1000)].copy()
 
-    # NSE Trading Hours strictly
     df = df[
         (df["dt"].dt.time >= datetime.time(9, 15))
         & (df["dt"].dt.time <= datetime.time(15, 30))
@@ -120,12 +126,12 @@ def fetch_nifty_candles(interval_code, days_back):
     ).astype(int)
     df["date"] = df["dt"].dt.date
 
-    # Dynamic Volume Proxy for Index
+    # Dynamic Volatility Volume Proxy
     candle_spread = (df["high"] - df["low"]) + (df["close"] - df["open"]).abs()
     raw_vol = df["volume"].apply(lambda v: float(v) if pd.notnull(v) and v > 0 else 0.0)
     df["calc_vol"] = raw_vol.where(raw_vol > 0, candle_spread * 1250.0 + 500.0)
 
-    # Indicators: Day-Reset VWAP
+    # Day-Reset VWAP
     df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
     df["vol_mult"] = df["tp"] * df["calc_vol"]
     df["cum_vol"] = df.groupby("date")["calc_vol"].cumsum()
@@ -148,17 +154,20 @@ def fetch_nifty_candles(interval_code, days_back):
     return df
 
 
-df = fetch_nifty_candles(api_interval, lookback_days)
+df = fetch_nifty_candles_paginated(total_days=45)
 if df is None or len(df) == 0:
     st.info("Market feed is initializing...")
     st.stop()
 
-# --- Adaptive Two-Phase Trailing Engine ---
+# --- Strategy Engine ---
 markers = []
 historical_trade_cards = {}
 latest_trade_for_hud = None
+alarm_signal_triggered = False
 
 grouped = df.groupby("date")
+latest_session_date = df["date"].iloc[-1]
+trade_executed_in_latest_session = False
 
 for session_date, day_df in grouped:
     orb_window = day_df[day_df["dt"].dt.time <= datetime.time(9, 30)]
@@ -179,13 +188,13 @@ for session_date, day_df in grouped:
         vwap_val = row["vwap"]
         atr_val = row["atr"]
 
+        # 1. Manage Active Trade (Tracks dynamically even after 10:30 AM)
         if session_trade and not session_trade["closed"]:
             t_type = session_trade["type"]
             entry = session_trade["entry"]
             base_atr = session_trade["entry_atr"]
             tp1_target = session_trade["tp1"]
 
-            # Pullback room (generous before TP1) vs Tight room (nearby/after TP1)
             wide_buffer = min(max(round(atr_val * 1.0, 1), 7.0), 12.0)
             tight_buffer = min(max(round(atr_val * 0.35, 1), 3.0), 5.0)
 
@@ -200,12 +209,10 @@ for session_date, day_df in grouped:
                 elif is_nearby_tp1 and not session_trade["tp1_hit"]:
                     session_trade["trail_stage"] = "NEARBY TP1 (Tightening Trail)"
 
-                # Breakeven lock once +1.5 ATR is made
                 if h >= (entry + (1.5 * base_atr)) and not session_trade["be_locked"]:
                     session_trade["be_locked"] = True
                     session_trade["current_sl"] = max(session_trade["current_sl"], round(entry + 3.0, 1))
 
-                # Adaptive Trailing
                 if session_trade["tp1_hit"] or is_nearby_tp1:
                     tight_trail = max(round(ema - tight_buffer, 1), round(l - 1.5, 1))
                     min_locked = round(entry + (1.8 * base_atr), 1) if session_trade["tp1_hit"] else round(entry + 3.0, 1)
@@ -228,6 +235,7 @@ for session_date, day_df in grouped:
                     session_trade["closed"] = True
                     session_trade["exit_price"] = exit_p
                     session_trade["exit_pts"] = pts
+                    session_trade["trail_stage"] = f"TRADE EXITED ({pts:+.1f} pts)"
                     latest_trade_for_hud = session_trade.copy()
 
             elif t_type == "PE":
@@ -267,10 +275,11 @@ for session_date, day_df in grouped:
                     session_trade["closed"] = True
                     session_trade["exit_price"] = exit_p
                     session_trade["exit_pts"] = pts
+                    session_trade["trail_stage"] = f"TRADE EXITED ({pts:+.1f} pts)"
                     latest_trade_for_hud = session_trade.copy()
 
-        # Breakout Entry Signal Trigger (Entry Arrows Only)
-        if t >= datetime.time(9, 30) and not trade_executed_today:
+        # 2. Entry Window Strictly 09:30 AM to 10:30 AM
+        if datetime.time(9, 30) < t <= datetime.time(10, 30) and not trade_executed_today:
             initial_buf = min(max(round(atr_val * 0.6, 1), 6.0), 9.0)
             if c > day_orb_h and c > vwap_val and c > ema:
                 init_sl = round(day_orb_h - initial_buf, 1)
@@ -313,6 +322,9 @@ for session_date, day_df in grouped:
                 }
                 trade_executed_today = True
                 latest_trade_for_hud = session_trade.copy()
+                if session_date == latest_session_date:
+                    trade_executed_in_latest_session = True
+                    alarm_signal_triggered = True
 
             elif c < day_orb_l and c < vwap_val and c < ema:
                 init_sl = round(day_orb_l + initial_buf, 1)
@@ -355,6 +367,9 @@ for session_date, day_df in grouped:
                 }
                 trade_executed_today = True
                 latest_trade_for_hud = session_trade.copy()
+                if session_date == latest_session_date:
+                    trade_executed_in_latest_session = True
+                    alarm_signal_triggered = True
 
 today_date = df["date"].iloc[-1]
 today_df = df[df["date"] == today_date]
@@ -370,6 +385,7 @@ curr_orb_l = (
     else today_df.iloc[0:3]["low"].min()
 )
 curr = df.iloc[-1]
+latest_bar_time = curr["dt"].time()
 
 candles_data = []
 volume_data = []
@@ -417,8 +433,11 @@ ema_json = json.dumps(
 markers_json = json.dumps(markers)
 history_cards_json = json.dumps(historical_trade_cards)
 
+# Determine HUD table status based on 10:30 AM logic
 hud_payload = None
-if latest_trade_for_hud:
+
+if trade_executed_in_latest_session and latest_trade_for_hud:
+    # A trade was entered before 10:30 AM -> KEEP TABLE ACTIVE THROUGHOUT THE DAY
     is_ce = latest_trade_for_hud["type"] == "CE"
     entry_p = latest_trade_for_hud["entry"]
     trail_p = latest_trade_for_hud["current_sl"]
@@ -428,6 +447,39 @@ if latest_trade_for_hud:
     target_final_pts = round(abs(latest_trade_for_hud["tp_final"] - entry_p), 1)
 
     hud_payload = {
+        "is_no_trade": False,
+        "call_or_put": latest_trade_for_hud["call_or_put"],
+        "reason": latest_trade_for_hud["reason"],
+        "entry": f"{entry_p:.1f}",
+        "sl_risk": f"{latest_trade_for_hud['init_sl']:.1f} (-{risk_pts:.1f} pts)",
+        "target1": f"{latest_trade_for_hud['tp1']:.1f} (+{target1_pts:.1f} pts)",
+        "target_final": f"{latest_trade_for_hud['tp_final']:.1f} (+{target_final_pts:.1f} pts)",
+        "trailing_sl": f"{trail_p:.1f}",
+        "trail_stage": latest_trade_for_hud["trail_stage"],
+        "secured_pts": f"{secured_pts:+.1f} pts",
+        "theme": "#089981" if is_ce else "#f23645",
+    }
+elif (not trade_executed_in_latest_session) and (latest_bar_time >= datetime.time(10, 30)):
+    # 10:30 AM passed without any valid signal -> DISPLAY "NO TRADE TODAY"
+    hud_payload = {
+        "is_no_trade": True,
+        "status": "NO TRADE TODAY",
+        "reason": "No valid breakout before 10:30 AM",
+        "action": "Capital Protected (Wait for tomorrow)",
+        "theme": "#787b86",
+    }
+elif latest_trade_for_hud:
+    # Prior session context display
+    is_ce = latest_trade_for_hud["type"] == "CE"
+    entry_p = latest_trade_for_hud["entry"]
+    trail_p = latest_trade_for_hud["current_sl"]
+    secured_pts = round(trail_p - entry_p, 1) if is_ce else round(entry_p - trail_p, 1)
+    risk_pts = latest_trade_for_hud["risk"]
+    target1_pts = round(abs(latest_trade_for_hud["tp1"] - entry_p), 1)
+    target_final_pts = round(abs(latest_trade_for_hud["tp_final"] - entry_p), 1)
+
+    hud_payload = {
+        "is_no_trade": False,
         "call_or_put": latest_trade_for_hud["call_or_put"],
         "reason": latest_trade_for_hud["reason"],
         "entry": f"{entry_p:.1f}",
@@ -441,6 +493,7 @@ if latest_trade_for_hud:
     }
 
 hud_json = json.dumps(hud_payload)
+play_alarm_flag = "true" if alarm_signal_triggered else "false"
 
 day_open = today_df.iloc[0]["open"]
 chg = curr["close"] - day_open
@@ -499,6 +552,26 @@ html_code = f"""
             background: #2962ff; color: #ffffff; font-weight: 700; cursor: default; opacity: 1.0;
         }}
 
+        .alarm-toggle-btn {{
+            background: rgba(30, 34, 45, 0.95); border: 1px solid #363c4e; color: #00e5ff;
+            font-size: 10px; font-weight: 700; padding: 3px 7px; border-radius: 4px;
+            cursor: pointer; display: flex; align-items: center; gap: 4px;
+        }}
+        .alarm-toggle-btn.enabled {{
+            background: #00bfa5; color: #000; border-color: #00bfa5;
+        }}
+
+        .alarm-ringing-banner {{
+            position: fixed; top: 8px; left: 50%; transform: translateX(-50%); z-index: 100;
+            background: #f23645; color: #ffffff; font-weight: 800; font-size: 11px;
+            padding: 6px 14px; border-radius: 20px; box-shadow: 0 0 20px rgba(242, 54, 69, 0.8);
+            cursor: pointer; display: none; animation: pulseAlarm 0.8s infinite alternate;
+        }}
+        @keyframes pulseAlarm {{
+            from {{ transform: translateX(-50%) scale(1); }}
+            to {{ transform: translateX(-50%) scale(1.06); }}
+        }}
+
         .dynamic-ohlc-row {{
             font-size: 10px; color: #787b86; display: flex; gap: 6px;
             background: rgba(11, 14, 20, 0.92); padding: 2px 6px;
@@ -507,7 +580,6 @@ html_code = f"""
         }}
         .dynamic-ohlc-row b {{ color: #d1d4dc; }}
 
-        /* Draggable HUD Table */
         .draggable-strategy-box {{
             position: absolute; bottom: 48px; right: 65px; z-index: 60;
             background: rgba(19, 23, 34, 0.97); border: 1px solid #2a2e39;
@@ -532,7 +604,6 @@ html_code = f"""
         .text-trail {{ color: #2962ff; font-weight: bold; }}
         .text-stage {{ color: #00e5ff; font-size: 8.5px; font-weight: bold; }}
 
-        /* Hover History Signal Tag */
         .history-signal-tag {{
             position: absolute; z-index: 55; pointer-events: none; display: none;
             background: rgba(22, 26, 37, 0.96); border: 1px solid #363c4e; border-radius: 5px;
@@ -542,6 +613,10 @@ html_code = f"""
     </style>
 </head>
 <body>
+    <div id="ringingBanner" class="alarm-ringing-banner" onclick="silenceAlarmNow()">
+        🚨 SIGNAL CONFIRMED! [TAP TO MUTE] 🔇
+    </div>
+
     <div class="fixed-top-box">
         <div class="top-row-1">
             <div class="sym-group">
@@ -559,6 +634,10 @@ html_code = f"""
                 <button class="tf-btn" disabled>1h</button>
                 <button class="tf-btn" disabled>1D</button>
             </div>
+
+            <button id="alarmBtn" class="alarm-toggle-btn" onclick="toggleAudioAlarm()">
+                🔔 <span id="alarmTxt">Enable Audio</span>
+            </button>
         </div>
 
         <div id="ohlcRow" class="dynamic-ohlc-row">
@@ -571,15 +650,87 @@ html_code = f"""
         </div>
     </div>
 
-    <!-- Draggable HUD Table -->
     <div id="strategyBox" class="draggable-strategy-box" style="display: none;"></div>
-
-    <!-- Hover History Tag -->
     <div id="historyTag" class="history-signal-tag"></div>
-
     <div id="chartArea"></div>
 
     <script>
+        let audioCtx = null;
+        let alarmUnlocked = localStorage.getItem('nifty_alarm_active') === 'true';
+        let alarmTimer = null;
+
+        function updateAlarmButtonUI() {{
+            const btn = document.getElementById('alarmBtn');
+            const txt = document.getElementById('alarmTxt');
+            if (alarmUnlocked) {{
+                btn.className = 'alarm-toggle-btn enabled';
+                txt.innerText = 'Alarm On 🔔';
+            }} else {{
+                btn.className = 'alarm-toggle-btn';
+                txt.innerText = 'Alarm Off 🔕';
+            }}
+        }}
+
+        function toggleAudioAlarm() {{
+            if (!audioCtx) {{
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }}
+            if (audioCtx.state === 'suspended') {{
+                audioCtx.resume();
+            }}
+            alarmUnlocked = !alarmUnlocked;
+            localStorage.setItem('nifty_alarm_active', alarmUnlocked ? 'true' : 'false');
+            updateAlarmButtonUI();
+            if (alarmUnlocked) {{
+                playBeepTone(880, 0.15);
+            }} else {{
+                silenceAlarmNow();
+            }}
+        }}
+
+        function silenceAlarmNow() {{
+            if (alarmTimer) {{
+                clearInterval(alarmTimer);
+                alarmTimer = null;
+            }}
+            document.getElementById('ringingBanner').style.display = 'none';
+            sessionStorage.setItem('alarm_silenced_for_session', 'true');
+        }}
+
+        function playBeepTone(freq = 750, duration = 0.3) {{
+            try {{
+                if (!audioCtx) {{
+                    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                }}
+                if (audioCtx.state === 'suspended') {{
+                    audioCtx.resume();
+                }}
+                const osc = audioCtx.createOscillator();
+                const gain = audioCtx.createGain();
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+                gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+                osc.connect(gain);
+                gain.connect(audioCtx.destination);
+                osc.start();
+                osc.stop(audioCtx.currentTime + duration);
+            }} catch(err) {{}}
+        }}
+
+        const shouldRingAlarm = {play_alarm_flag};
+        updateAlarmButtonUI();
+
+        const isSilenced = sessionStorage.getItem('alarm_silenced_for_session') === 'true';
+
+        if (shouldRingAlarm && alarmUnlocked && !isSilenced) {{
+            document.getElementById('ringingBanner').style.display = 'block';
+            alarmTimer = setInterval(() => {{
+                playBeepTone(880, 0.2);
+                setTimeout(() => playBeepTone(1100, 0.2), 300);
+            }}, 2000);
+        }}
+
         const container = document.getElementById('chartArea');
         const chart = LightweightCharts.createChart(container, {{
             width: window.innerWidth,
@@ -653,10 +804,8 @@ html_code = f"""
         }});
         emaSeries.setData({ema_json});
 
-        // Entry markers only
         candleSeries.setMarkers({markers_json});
 
-        // Session ORB High / Low Reference Lines Only
         candleSeries.createPriceLine({{
             price: {curr_orb_h:.2f},
             color: '#089981',
@@ -680,23 +829,36 @@ html_code = f"""
         const table = document.getElementById('strategyBox');
         if (s) {{
             table.style.display = 'block';
-            table.innerHTML = `
-                <div class="box-drag-handle">::: DRAG TABLE :::</div>
-                <table>
-                    <tr><td class="label-cell">Call or Put</td><td class="val-cell"><span class="tag-pill" style="background:${{s.theme}}">${{s.call_or_put}}</span></td></tr>
-                    <tr><td class="label-cell">Reason for trade</td><td class="val-cell" style="font-size:9px; color:#cfd3dc;">${{s.reason}}</td></tr>
-                    <tr><td class="label-cell">Entry</td><td class="val-cell"><b>${{s.entry}}</b></td></tr>
-                    <tr><td class="label-cell">SL (risk pts)</td><td class="val-cell text-red">${{s.sl_risk}}</td></tr>
-                    <tr><td class="label-cell">Target 1 (3 ATR)</td><td class="val-cell text-green">${{s.target1}}</td></tr>
-                    <tr><td class="label-cell">Target Final</td><td class="val-cell text-green">${{s.target_final}}</td></tr>
-                    <tr><td class="label-cell">Trailing SL</td><td class="val-cell text-trail">${{s.trailing_sl}}</td></tr>
-                    <tr><td class="label-cell">Trail Mode</td><td class="val-cell text-stage">${{s.trail_stage}}</td></tr>
-                    <tr><td class="label-cell">Secured Points</td><td class="val-cell text-green"><b>${{s.secured_pts}}</b></td></tr>
-                </table>
-            `;
+            if (s.is_no_trade) {{
+                // Card displayed when no signal triggered by 10:30 AM
+                table.innerHTML = `
+                    <div class="box-drag-handle">::: DRAG TABLE :::</div>
+                    <table>
+                        <tr><td class="label-cell">Session Status</td><td class="val-cell"><span class="tag-pill" style="background:#546e7a;">${{s.status}}</span></td></tr>
+                        <tr><td class="label-cell">Reason</td><td class="val-cell" style="font-size:9px; color:#cfd3dc;">${{s.reason}}</td></tr>
+                        <tr><td class="label-cell">Action</td><td class="val-cell text-green">${{s.action}}</td></tr>
+                    </table>
+                `;
+            }} else {{
+                // Active or Managed Trade Table (Stays active throughout the day)
+                table.innerHTML = `
+                    <div class="box-drag-handle">::: DRAG TABLE :::</div>
+                    <table>
+                        <tr><td class="label-cell">Call or Put</td><td class="val-cell"><span class="tag-pill" style="background:${{s.theme}}">${{s.call_or_put}}</span></td></tr>
+                        <tr><td class="label-cell">Reason for trade</td><td class="val-cell" style="font-size:9px; color:#cfd3dc;">${{s.reason}}</td></tr>
+                        <tr><td class="label-cell">Entry</td><td class="val-cell"><b>${{s.entry}}</b></td></tr>
+                        <tr><td class="label-cell">SL (risk pts)</td><td class="val-cell text-red">${{s.sl_risk}}</td></tr>
+                        <tr><td class="label-cell">Target 1 (3 ATR)</td><td class="val-cell text-green">${{s.target1}}</td></tr>
+                        <tr><td class="label-cell">Target Final</td><td class="val-cell text-green">${{s.target_final}}</td></tr>
+                        <tr><td class="label-cell">Trailing SL</td><td class="val-cell text-trail">${{s.trailing_sl}}</td></tr>
+                        <tr><td class="label-cell">Trail Mode</td><td class="val-cell text-stage">${{s.trail_stage}}</td></tr>
+                        <tr><td class="label-cell">Secured Points</td><td class="val-cell text-green"><b>${{s.secured_pts}}</b></td></tr>
+                    </table>
+                `;
+            }}
         }}
 
-        // Mouse & Touch Drag Implementation
+        // Draggable HUD Logic
         let isDragging = false;
         let startX, startY, initLeft, initTop;
 
@@ -736,7 +898,7 @@ html_code = f"""
         window.addEventListener('touchmove', onDragMove, {{ passive: true }});
         window.addEventListener('touchend', onDragEnd);
 
-        // Historical Hover Signal Card & Crosshair
+        // Historical Trade Card & Crosshair
         const historyCards = {history_cards_json};
         const hTag = document.getElementById('historyTag');
 
@@ -788,7 +950,7 @@ html_code = f"""
 
 components.html(html_code, height=720, scrolling=False)
 
-# Auto-refresh
+# Auto-refresh interval (15 seconds)
 st.markdown(
     """
     <script>
