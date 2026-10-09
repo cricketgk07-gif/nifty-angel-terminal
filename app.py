@@ -248,7 +248,7 @@ if not nfo_df.empty:
                 "PE": {"token": pe_tok, "symbol": pe_sym},
             }
 
-# Read Query Params so changing Expiry/Strike pulls real Angel One quote
+# Read Query Params from URL or defaults
 params = st.query_params
 active_strike_sel = str(params.get("opt_strike", str(atm_strike)))
 active_exp_sel = params.get("opt_exp", available_expiries[0] if available_expiries else "CURRENT")
@@ -256,16 +256,24 @@ active_type_sel = params.get("opt_type", "CE").upper()
 
 live_real_ltp = 0.0
 
+# Exact Angel One Dictionary getLtpData Query
 if active_exp_sel in expiry_contract_tokens and active_strike_sel in expiry_contract_tokens[active_exp_sel]:
     c_info = expiry_contract_tokens[active_exp_sel][active_strike_sel][active_type_sel]
     if c_info["symbol"] and c_info["token"]:
         try:
-            q_res = api.getLtpData("NFO", c_info["symbol"], c_info["token"])
+            q_res = api.getLtpData({
+                "exchange": "NFO",
+                "tradingsymbol": c_info["symbol"],
+                "symboltoken": str(c_info["token"])
+            })
             if isinstance(q_res, dict) and q_res.get("status") and q_res.get("data"):
-                live_real_ltp = float(q_res["data"].get("ltp", 0.0))
+                ltp_val = float(q_res["data"].get("ltp", 0.0))
+                if ltp_val > 0.0:
+                    live_real_ltp = ltp_val
         except Exception:
             pass
 
+# Fallback only if exchange is closed and API returns 0
 if live_real_ltp <= 0.0:
     stk_f = float(active_strike_sel)
     diff = (spot_price - stk_f) if active_type_sel == "CE" else (stk_f - spot_price)
@@ -656,10 +664,6 @@ html_code = f"""
             width: 100vw; height: calc(100vh - 35px);
             position: absolute; top: 0; left: 0;
         }}
-        #drawingSvgLayer {{
-            position: absolute; top: 0; left: 0; width: 100vw; height: calc(100vh - 35px);
-            pointer-events: none; z-index: 52;
-        }}
 
         .fixed-top-box {{
             position: absolute; top: 6px; left: 8px; z-index: 60;
@@ -779,7 +783,7 @@ html_code = f"""
         .text-trail {{ color: #2962ff; font-weight: bold; }}
         .text-stage {{ color: #00e5ff; font-size: 8.5px; font-weight: bold; }}
 
-        /* Floating Interactive TradingView Tools Layer */
+        /* Multi-Instance Floating Tool Item */
         .tv-widget-item {{
             position: absolute; z-index: 55; user-select: none; touch-action: none;
             font-family: sans-serif; border-radius: 4px; overflow: visible;
@@ -792,7 +796,6 @@ html_code = f"""
         .tv-pos-green {{ background: rgba(8, 153, 129, 0.40); border: 1.5px solid #089981; }}
         .tv-pos-red {{ background: rgba(242, 54, 69, 0.40); border: 1.5px solid #f23645; }}
         
-        /* Drag Handles matching video */
         .tv-touch-circle {{
             position: absolute; right: 4px; width: 14px; height: 14px;
             background: #ffffff; border: 2px solid #2962ff; border-radius: 50%;
@@ -890,8 +893,7 @@ html_code = f"""
     <!-- Draggable HUD Strategy Table -->
     <div id="strategyBox" class="draggable-strategy-box" style="display: none;"></div>
 
-    <!-- Active Vector Overlay for Interactive Fibonacci & Position Tools -->
-    <svg id="drawingSvgLayer"></svg>
+    <!-- Container for Multi-Instance Dynamic Overlays -->
     <div id="activeToolsContainer"></div>
 
     <div id="historyTag" class="history-signal-tag"></div>
@@ -1142,12 +1144,11 @@ html_code = f"""
             candleSeries.createPriceLine({{ price: pv.PDL, color: '#fb8c00', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'PDL' }});
         }}
 
-        // --- Interactive Click-to-Anchor & SVG Visual Tools Engine ---
+        // --- Interactive Click-to-Anchor Drawing Engine ---
         let toolCounter = 0;
         let currentDrawMode = null;
         let drawPoints = [];
         const activePositionWidgets = [];
-        const activeFibWidgets = [];
 
         function activateDrawMode(mode) {{
             currentDrawMode = mode;
@@ -1178,24 +1179,23 @@ html_code = f"""
 
             drawPoints.push({{ price: price, x: param.point.x, y: param.point.y }});
 
-            // 1. Long / Short Tool Anchored Directly to Clicked Candle
+            // 1. Long / Short Tool Anchored Directly to Click Point
             if (currentDrawMode === 'LONG' || currentDrawMode === 'SHORT') {{
                 spawnInteractivePositionWidget(currentDrawMode, price, param.point.x, param.point.y);
                 cancelDrawMode();
             }}
-            // 2. Fibonacci Retracement (2-Point Interactive Click & Drag)
+            // 2. Fibonacci Retracement (2-Point Click)
             else if (currentDrawMode === 'FIB_RETRACE' && drawPoints.length === 2) {{
                 spawnInteractiveFibRetrace(drawPoints[0], drawPoints[1]);
                 cancelDrawMode();
             }}
-            // 3. Fibonacci Extension (3-Point Interactive Click & Drag)
+            // 3. Fibonacci Extension (3-Point Click)
             else if (currentDrawMode === 'FIB_EXT' && drawPoints.length === 3) {{
                 spawnInteractiveFibExt(drawPoints[0], drawPoints[1], drawPoints[2]);
                 cancelDrawMode();
             }}
         }});
 
-        // --- Position Tool Widget with Live Handles and Fixed Center Line ---
         function spawnInteractivePositionWidget(type, entryPrice, clickX, clickY) {{
             toolCounter++;
             const wId = 'pos_w_' + toolCounter;
@@ -1284,7 +1284,6 @@ html_code = f"""
             activePositionWidgets.forEach(w => renderSinglePosWidget(w));
         }}
 
-        // Dynamic Resize Handlers per Tool Instance
         function resizeWidgetTgt(e, id) {{
             e.stopPropagation();
             const wObj = activePositionWidgets.find(w => w.id === id);
@@ -1362,7 +1361,6 @@ html_code = f"""
         // --- Interactive 2-Point and 3-Point Fibonacci Vector Overlay Engine ---
         function spawnInteractiveFibRetrace(pt1, pt2) {{
             toolCounter++;
-            const fId = 'fib_r_' + toolCounter;
             const pHigh = Math.max(pt1.price, pt2.price);
             const pLow = Math.min(pt1.price, pt2.price);
             const range = pHigh - pLow;
