@@ -1,7 +1,10 @@
+
 streamlit
 plotly
 pandas
 numpy
 smartapi-python
+logzero
 pyotp
 requests
+websocket-client
