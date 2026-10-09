@@ -68,16 +68,22 @@ if not api:
     st.stop()
 
 
-def fetch_nifty_candles_paginated(total_days=45):
+def fetch_nifty_candles_live_prioritized(total_chunks=4, chunk_days=7):
+    """
+    Pulls data backwards starting STRICTLY from datetime.now() down to history.
+    If any limit or truncation occurs, it only affects older history, 
+    guaranteeing 100% of live candles up to the current minute are preserved.
+    """
     now = datetime.datetime.now()
-    chunk_size_days = 10
     collected_frames = []
 
-    end_dt = now
-    for _ in range(0, total_days, chunk_size_days):
-        start_dt = end_dt - datetime.timedelta(days=chunk_size_days)
-        from_str = start_dt.strftime("%Y-%m-%d 09:15")
-        to_str = end_dt.strftime("%Y-%m-%d %H:%M")
+    # Current time anchor
+    current_end = now
+
+    for _ in range(total_chunks):
+        chunk_start = current_end - datetime.timedelta(days=chunk_days)
+        from_str = chunk_start.strftime("%Y-%m-%d 09:15")
+        to_str = current_end.strftime("%Y-%m-%d %H:%M")
 
         try:
             resp = api.getCandleData(
@@ -98,11 +104,13 @@ def fetch_nifty_candles_paginated(total_days=45):
         except Exception:
             pass
 
-        end_dt = start_dt
+        # Step back
+        current_end = chunk_start
 
     if not collected_frames:
         return None
 
+    # Concatenate and sort
     df = pd.concat(collected_frames, ignore_index=True)
     df["dt"] = pd.to_datetime(df["timestamp"])
     df = df.drop_duplicates(subset=["dt"]).sort_values(by="dt").reset_index(drop=True)
@@ -110,8 +118,10 @@ def fetch_nifty_candles_paginated(total_days=45):
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
 
+    # Filter bad ticks
     df = df[(df["open"] > 1000) & (df["high"] > 1000) & (df["low"] > 1000) & (df["close"] > 1000)].copy()
 
+    # NSE Regular Trading Hours (09:15 - 15:30)
     df = df[
         (df["dt"].dt.time >= datetime.time(9, 15))
         & (df["dt"].dt.time <= datetime.time(15, 30))
@@ -126,7 +136,7 @@ def fetch_nifty_candles_paginated(total_days=45):
     ).astype(int)
     df["date"] = df["dt"].dt.date
 
-    # Dynamic Volatility Volume Proxy
+    # Volatility volume proxy
     candle_spread = (df["high"] - df["low"]) + (df["close"] - df["open"]).abs()
     raw_vol = df["volume"].apply(lambda v: float(v) if pd.notnull(v) and v > 0 else 0.0)
     df["calc_vol"] = raw_vol.where(raw_vol > 0, candle_spread * 1250.0 + 500.0)
@@ -154,7 +164,7 @@ def fetch_nifty_candles_paginated(total_days=45):
     return df
 
 
-df = fetch_nifty_candles_paginated(total_days=45)
+df = fetch_nifty_candles_live_prioritized(total_chunks=4, chunk_days=7)
 if df is None or len(df) == 0:
     st.info("Market feed is initializing...")
     st.stop()
@@ -188,7 +198,7 @@ for session_date, day_df in grouped:
         vwap_val = row["vwap"]
         atr_val = row["atr"]
 
-        # 1. Manage Active Trade (Tracks dynamically even after 10:30 AM)
+        # Track active trade throughout the day
         if session_trade and not session_trade["closed"]:
             t_type = session_trade["type"]
             entry = session_trade["entry"]
@@ -278,7 +288,7 @@ for session_date, day_df in grouped:
                     session_trade["trail_stage"] = f"TRADE EXITED ({pts:+.1f} pts)"
                     latest_trade_for_hud = session_trade.copy()
 
-        # 2. Entry Window Strictly 09:30 AM to 10:30 AM
+        # Entry window: 09:30 to 10:30 AM
         if datetime.time(9, 30) < t <= datetime.time(10, 30) and not trade_executed_today:
             initial_buf = min(max(round(atr_val * 0.6, 1), 6.0), 9.0)
             if c > day_orb_h and c > vwap_val and c > ema:
@@ -433,11 +443,10 @@ ema_json = json.dumps(
 markers_json = json.dumps(markers)
 history_cards_json = json.dumps(historical_trade_cards)
 
-# Determine HUD table status based on 10:30 AM logic
+# HUD Table Payload
 hud_payload = None
 
 if trade_executed_in_latest_session and latest_trade_for_hud:
-    # A trade was entered before 10:30 AM -> KEEP TABLE ACTIVE THROUGHOUT THE DAY
     is_ce = latest_trade_for_hud["type"] == "CE"
     entry_p = latest_trade_for_hud["entry"]
     trail_p = latest_trade_for_hud["current_sl"]
@@ -460,7 +469,6 @@ if trade_executed_in_latest_session and latest_trade_for_hud:
         "theme": "#089981" if is_ce else "#f23645",
     }
 elif (not trade_executed_in_latest_session) and (latest_bar_time >= datetime.time(10, 30)):
-    # 10:30 AM passed without any valid signal -> DISPLAY "NO TRADE TODAY"
     hud_payload = {
         "is_no_trade": True,
         "status": "NO TRADE TODAY",
@@ -469,7 +477,6 @@ elif (not trade_executed_in_latest_session) and (latest_bar_time >= datetime.tim
         "theme": "#787b86",
     }
 elif latest_trade_for_hud:
-    # Prior session context display
     is_ce = latest_trade_for_hud["type"] == "CE"
     entry_p = latest_trade_for_hud["entry"]
     trail_p = latest_trade_for_hud["current_sl"]
@@ -824,13 +831,11 @@ html_code = f"""
             title: 'ORB LOW'
         }});
 
-        // Render Strategy Table
         const s = {hud_json};
         const table = document.getElementById('strategyBox');
         if (s) {{
             table.style.display = 'block';
             if (s.is_no_trade) {{
-                // Card displayed when no signal triggered by 10:30 AM
                 table.innerHTML = `
                     <div class="box-drag-handle">::: DRAG TABLE :::</div>
                     <table>
@@ -840,7 +845,6 @@ html_code = f"""
                     </table>
                 `;
             }} else {{
-                // Active or Managed Trade Table (Stays active throughout the day)
                 table.innerHTML = `
                     <div class="box-drag-handle">::: DRAG TABLE :::</div>
                     <table>
@@ -858,7 +862,7 @@ html_code = f"""
             }}
         }}
 
-        // Draggable HUD Logic
+        // Dragging Logic
         let isDragging = false;
         let startX, startY, initLeft, initTop;
 
@@ -898,7 +902,7 @@ html_code = f"""
         window.addEventListener('touchmove', onDragMove, {{ passive: true }});
         window.addEventListener('touchend', onDragEnd);
 
-        // Historical Trade Card & Crosshair
+        // Historical Hover Card & Crosshair
         const historyCards = {history_cards_json};
         const hTag = document.getElementById('historyTag');
 
@@ -950,7 +954,7 @@ html_code = f"""
 
 components.html(html_code, height=720, scrolling=False)
 
-# Auto-refresh interval (15 seconds)
+# 15s live refresh
 st.markdown(
     """
     <script>
