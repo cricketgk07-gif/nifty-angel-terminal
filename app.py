@@ -9,7 +9,7 @@ import streamlit.components.v1 as components
 
 st.set_page_config(
     layout="wide",
-    page_title="Nifty 50 Morning Alert Terminal",
+    page_title="Nifty 50 Pro Terminal",
     page_icon="📈",
     initial_sidebar_state="collapsed",
 )
@@ -33,13 +33,7 @@ st.markdown(
         top: 0 !important;
         left: 0 !important;
     }
-    body {
-        background-color: #0c0d10;
-        margin: 0;
-        overflow: hidden;
-        touch-action: none;
-        user-select: none;
-    }
+    body {background-color: #0b0e14; margin: 0; overflow: hidden;}
 </style>
 """,
     unsafe_allow_html=True,
@@ -53,27 +47,49 @@ TOTP_SECRET = st.secrets.get("TOTP_SECRET", "")
 INDEX_TOKEN = "99926000"
 
 
-def get_authenticated_api():
+@st.cache_resource(ttl=28800)
+def init_angel_session(api_key, client_code, pin, totp_sec):
     try:
-        api = SmartConnect(API_KEY)
-        totp = pyotp.TOTP(TOTP_SECRET).now()
-        sess = api.generateSession(CLIENT_CODE, PIN, totp)
-        if sess and sess.get("status"):
+        api = SmartConnect(api_key)
+        totp = pyotp.TOTP(totp_sec).now()
+        data = api.generateSession(client_code, pin, totp)
+        if data.get("status"):
             return api
         return None
     except Exception:
         return None
 
 
-api = get_authenticated_api()
+api = init_angel_session(API_KEY, CLIENT_CODE, PIN, TOTP_SECRET)
 if not api:
-    st.error("Authentication failed. Please verify credentials in Secrets.")
+    st.error("Authentication failed. Please check Streamlit Secrets.")
     st.stop()
 
+# Query parameters for interval switching
+params = st.query_params
+current_interval = params.get("interval", "5m")
 
-def fetch_nifty_candles():
+timeframe_config = {
+    "1m": ("ONE_MINUTE", 4),
+    "3m": ("THREE_MINUTE", 7),
+    "5m": ("FIVE_MINUTE", 14),
+    "15m": ("FIFTEEN_MINUTE", 30),
+    "30m": ("THIRTY_MINUTE", 45),
+    "1h": ("ONE_HOUR", 60),
+    "1D": ("ONE_DAY", 365),
+}
+
+if current_interval not in timeframe_config:
+    current_interval = "5m"
+
+api_interval, lookback_days = timeframe_config[current_interval]
+
+
+def fetch_nifty_market_data(interval_code, days_back):
     now = datetime.datetime.now()
-    from_date = (now - datetime.timedelta(days=12)).strftime("%Y-%m-%d 09:15")
+    from_date = (now - datetime.timedelta(days=days_back)).strftime(
+        "%Y-%m-%d 09:15"
+    )
     to_date = now.strftime("%Y-%m-%d %H:%M")
 
     try:
@@ -81,7 +97,7 @@ def fetch_nifty_candles():
             {
                 "exchange": "NSE",
                 "symboltoken": INDEX_TOKEN,
-                "interval": "FIVE_MINUTE",
+                "interval": interval_code,
                 "fromdate": from_date,
                 "todate": to_date,
             }
@@ -100,23 +116,24 @@ def fetch_nifty_candles():
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
 
-    # NSE Intraday Only (09:15 - 15:30)
-    df = df[
-        (df["dt"].dt.time >= datetime.time(9, 15))
-        & (df["dt"].dt.time <= datetime.time(15, 30))
-    ].copy()
+    # NSE Trading Hours (09:15 - 15:30)
+    if interval_code != "ONE_DAY":
+        df = df[
+            (df["dt"].dt.time >= datetime.time(9, 15))
+            & (df["dt"].dt.time <= datetime.time(15, 30))
+        ].copy()
 
     if len(df) == 0:
         return None
 
-    # Precise UTC seconds to match TradingView IST axis
+    # POSIX Seconds
     t_clean = df["dt"].dt.tz_localize(None)
     df["time"] = (
         (t_clean - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
     ).astype(int)
     df["date"] = df["dt"].dt.date
 
-    # Purple Session VWAP
+    # Indicators: Day-Reset VWAP & 9 EMA
     df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
     df["vol_mult"] = df["tp"] * df["volume"].apply(
         lambda v: v if v > 0 else 1000.0
@@ -132,117 +149,205 @@ def fetch_nifty_candles():
         .reset_index(level=0, drop=True)
     )
     df["vwap"] = df["cum_vp"] / df["cum_vol"]
+    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
 
     return df
 
 
-df = fetch_nifty_candles()
+df = fetch_nifty_market_data(api_interval, lookback_days)
 if df is None or len(df) == 0:
-    st.info("Market feed is loading...")
+    st.info("Streaming market data from Angel One...")
     st.stop()
 
-# --- Pine Script Exact Strategy Logic: Option Morning Window Alert Suite (9:30 - 10:15) ---
-cards_data = []
-lines_data = []
-latest_day_info = {}
+# --- Exact Strategy Engine: 1 Trade Per Day with Tight Trailing SL ---
+markers = []
+latest_trade_for_hud = None
 
 grouped = df.groupby("date")
 
 for session_date, day_df in grouped:
-    # 09:15 - 09:30 Accumulation Window
     orb_window = day_df[day_df["dt"].dt.time <= datetime.time(9, 30)]
     if len(orb_window) == 0:
         continue
 
-    day_orb_h = round(float(orb_window["high"].max()), 2)
-    day_orb_l = round(float(orb_window["low"].min()), 2)
+    day_orb_h = orb_window["high"].max()
+    day_orb_l = orb_window["low"].min()
 
-    # Store lines for this session
-    start_time = int(day_df.iloc[0]["time"])
-    end_time = int(day_df.iloc[-1]["time"])
-    lines_data.append(
-        {
-            "start": start_time,
-            "end": end_time,
-            "high": day_orb_h,
-            "low": day_orb_l,
-        }
-    )
-
-    trade_taken = False
-    trade_info = None
+    session_trade = None
+    trade_executed_today = False
 
     for idx in range(len(day_df)):
         row = day_df.iloc[idx]
         t = row["dt"].time()
-        c = row["close"]
+        o, h, l, c = row["open"], row["high"], row["low"], row["close"]
+        ema = row["ema9"]
         vwap_val = row["vwap"]
 
-        # Morning Window: 09:30 to 10:15 strictly (1 Trade Max)
-        if (
-            datetime.time(9, 30) < t <= datetime.time(10, 15)
-            and not trade_taken
-        ):
-            # MORNING CE BREAKOUT
-            if c > day_orb_h and c > vwap_val:
-                sl = round(day_orb_h - 4.5, 1)
-                risk = round(c - sl, 1)
-                tp = round(c + (risk * 2.0), 1)
-                cards_data.append(
+        if session_trade and not session_trade["closed"]:
+            t_type = session_trade["type"]
+
+            if t_type == "CE":
+                # Dynamic Target 2 extension
+                if h > session_trade["tp2"]:
+                    session_trade["tp2"] = round(h + (session_trade["risk"] * 1.0), 1)
+
+                # Target 1 Reached: Snap Tight Stop Loss
+                if h >= session_trade["tp1"] and not session_trade["tp1_hit"]:
+                    session_trade["tp1_hit"] = True
+                    session_trade["current_sl"] = max(
+                        session_trade["current_sl"],
+                        round(session_trade["entry"] + 3.0, 1),
+                    )
+
+                if not session_trade["tp1_hit"]:
+                    trail_candidate = round(ema - 2.5, 1)
+                    if trail_candidate > session_trade["current_sl"]:
+                        session_trade["current_sl"] = trail_candidate
+                else:
+                    tight_ref = max(
+                        round(l - 1.0, 1), round(session_trade["entry"] + 3.0, 1)
+                    )
+                    if tight_ref > session_trade["current_sl"]:
+                        session_trade["current_sl"] = tight_ref
+
+                if l <= session_trade["current_sl"] or (c < ema and c < o):
+                    exit_p = min(c, session_trade["current_sl"])
+                    pts = round(exit_p - session_trade["entry"], 1)
+                    markers.append(
+                        {
+                            "time": int(row["time"]),
+                            "position": "aboveBar",
+                            "color": "#f23645",
+                            "shape": "arrowDown",
+                            "text": f"EXIT SL @ {exit_p:.1f} ({pts:+.1f})",
+                        }
+                    )
+                    session_trade["closed"] = True
+                    session_trade["status"] = (
+                        f"TIGHT SL HIT (+{pts:.1f} pts)"
+                        if pts > 0
+                        else f"STOPPED OUT ({pts:+.1f} pts)"
+                    )
+                    session_trade["exit_price"] = exit_p
+                    session_trade["exit_pts"] = pts
+                    latest_trade_for_hud = session_trade.copy()
+
+            elif t_type == "PE":
+                if l < session_trade["tp2"]:
+                    session_trade["tp2"] = round(l - (session_trade["risk"] * 1.0), 1)
+
+                if l <= session_trade["tp1"] and not session_trade["tp1_hit"]:
+                    session_trade["tp1_hit"] = True
+                    session_trade["current_sl"] = min(
+                        session_trade["current_sl"],
+                        round(session_trade["entry"] - 3.0, 1),
+                    )
+
+                if not session_trade["tp1_hit"]:
+                    trail_candidate = round(ema + 2.5, 1)
+                    if trail_candidate < session_trade["current_sl"]:
+                        session_trade["current_sl"] = trail_candidate
+                else:
+                    tight_ref = min(
+                        round(h + 1.0, 1), round(session_trade["entry"] - 3.0, 1)
+                    )
+                    if tight_ref < session_trade["current_sl"]:
+                        session_trade["current_sl"] = tight_ref
+
+                if h >= session_trade["current_sl"] or (c > ema and c > o):
+                    exit_p = max(c, session_trade["current_sl"])
+                    pts = round(session_trade["entry"] - exit_p, 1)
+                    markers.append(
+                        {
+                            "time": int(row["time"]),
+                            "position": "belowBar",
+                            "color": "#00bfa5",
+                            "shape": "arrowUp",
+                            "text": f"EXIT SL @ {exit_p:.1f} ({pts:+.1f})",
+                        }
+                    )
+                    session_trade["closed"] = True
+                    session_trade["status"] = (
+                        f"TIGHT SL HIT (+{pts:.1f} pts)"
+                        if pts > 0
+                        else f"STOPPED OUT ({pts:+.1f} pts)"
+                    )
+                    session_trade["exit_price"] = exit_p
+                    session_trade["exit_pts"] = pts
+                    latest_trade_for_hud = session_trade.copy()
+
+        # Entry Signal (First valid breakout after 09:30)
+        if t >= datetime.time(9, 30) and not trade_executed_today:
+            if c > day_orb_h and c > vwap_val and c > ema:
+                init_sl = round(day_orb_h - 5.0, 1)
+                risk = round(c - init_sl, 1)
+                session_trade = {
+                    "name": "ORB BREAKOUT (CE)",
+                    "type": "CE",
+                    "entry": round(c, 1),
+                    "init_sl": init_sl,
+                    "current_sl": init_sl,
+                    "tp1": round(c + (risk * 1.5), 1),
+                    "tp2": round(c + (risk * 2.5), 1),
+                    "tp1_hit": False,
+                    "risk": risk,
+                    "closed": False,
+                    "reason": "Close > ORB High & VWAP",
+                }
+                markers.append(
                     {
                         "time": int(row["time"]),
-                        "price": float(row["low"]),
-                        "type": "CE",
-                        "name": "MORNING CE",
-                        "entry": round(c, 1),
-                        "sl": sl,
-                        "tp": tp,
-                        "risk": risk,
-                        "gain": round(tp - c, 1),
+                        "position": "belowBar",
+                        "color": "#00bfa5",
+                        "shape": "arrowUp",
+                        "text": f"BUY CE @ {c:.1f}",
                     }
                 )
-                trade_taken = True
-                trade_info = {"type": "CE", "entry": c, "sl": sl, "tp": tp}
+                trade_executed_today = True
+                latest_trade_for_hud = session_trade.copy()
 
-            # MORNING PE BREAKDOWN
-            elif c < day_orb_l and c < vwap_val:
-                sl = round(day_orb_l + 4.5, 1)
-                risk = round(sl - c, 1)
-                tp = round(c - (risk * 2.0), 1)
-                cards_data.append(
+            elif c < day_orb_l and c < vwap_val and c < ema:
+                init_sl = round(day_orb_l + 5.0, 1)
+                risk = round(init_sl - c, 1)
+                session_trade = {
+                    "name": "ORB BREAKDOWN (PE)",
+                    "type": "PE",
+                    "entry": round(c, 1),
+                    "init_sl": init_sl,
+                    "current_sl": init_sl,
+                    "tp1": round(c - (risk * 1.5), 1),
+                    "tp2": round(c - (risk * 2.5), 1),
+                    "tp1_hit": False,
+                    "risk": risk,
+                    "closed": False,
+                    "reason": "Close < ORB Low & VWAP",
+                }
+                markers.append(
                     {
                         "time": int(row["time"]),
-                        "price": float(row["high"]),
-                        "type": "PE",
-                        "name": "MORNING PE",
-                        "entry": round(c, 1),
-                        "sl": sl,
-                        "tp": tp,
-                        "risk": risk,
-                        "gain": round(c - tp, 1),
+                        "position": "aboveBar",
+                        "color": "#f23645",
+                        "shape": "arrowDown",
+                        "text": f"BUY PE @ {c:.1f}",
                     }
                 )
-                trade_taken = True
-                trade_info = {"type": "PE", "entry": c, "sl": sl, "tp": tp}
+                trade_executed_today = True
+                latest_trade_for_hud = session_trade.copy()
 
-    # Record latest active session status for bottom table
-    latest_day_info = {
-        "trades_taken": "1 / 1 Max" if trade_taken else "0 / 1 Max",
-        "orb_h": day_orb_h,
-        "orb_l": day_orb_l,
-        "status": "CLOSED (Do Not Trade)"
-        if (day_df.iloc[-1]["dt"].time() > datetime.time(10, 15) or trade_taken)
-        else "SCANNING WINDOW",
-    }
-
-# Serialization
+today_date = df["date"].iloc[-1]
+today_df = df[df["date"] == today_date]
+today_orb = today_df[today_df["dt"].dt.time <= datetime.time(9, 30)]
+curr_orb_h = (
+    today_orb["high"].max()
+    if len(today_orb) > 0
+    else today_df.iloc[0:3]["high"].max()
+)
+curr_orb_l = (
+    today_orb["low"].min()
+    if len(today_orb) > 0
+    else today_df.iloc[0:3]["low"].min()
+)
 curr = df.iloc[-1]
-today_df = df[df["date"] == df["date"].iloc[-1]]
-day_open = today_df.iloc[0]["open"]
-chg = curr["close"] - day_open
-chg_pct = (chg / day_open) * 100
-chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
-chg_color = "#089981" if chg >= 0 else "#f23645"
 
 candles_json = json.dumps(
     [
@@ -263,11 +368,22 @@ vwap_json = json.dumps(
         for _, r in df.iterrows()
     ]
 )
+ema_json = json.dumps(
+    [
+        {"time": int(r["time"]), "value": round(float(r["ema9"]), 2)}
+        for _, r in df.iterrows()
+    ]
+)
+markers_json = json.dumps(markers)
+hud_json = json.dumps(latest_trade_for_hud)
 
-cards_json = json.dumps(cards_data)
-lines_json = json.dumps(lines_data)
-status_json = json.dumps(latest_day_info)
+day_open = today_df.iloc[0]["open"]
+chg = curr["close"] - day_open
+chg_pct = (chg / day_open) * 100
+chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
+chg_color = "#089981" if chg >= 0 else "#f23645"
 
+# --- Complete TradingView Web Component ---
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -278,108 +394,146 @@ html_code = f"""
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         html, body {{
             width: 100vw; height: 100vh;
-            background-color: #000000;
+            background-color: #0b0e14;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             overflow: hidden;
             touch-action: none;
             user-select: none;
         }}
-        #chartArea {{ width: 100vw; height: 100vh; position: relative; }}
-
-        /* Top Bar Header */
-        .tv-top {{
-            position: absolute; top: 10px; left: 14px; z-index: 30; pointer-events: none;
-            display: flex; flex-direction: column; gap: 3px;
-        }}
-        .sym-row {{ display: flex; align-items: center; gap: 6px; }}
-        .badge {{ background: #2962ff; color: #fff; font-size: 11px; padding: 1px 5px; border-radius: 3px; font-weight: 700; }}
-        .sym-title {{ font-size: 15px; font-weight: 700; color: #d1d4dc; }}
-        .sym-p {{ font-size: 13px; font-weight: 600; color: {chg_color}; }}
-        .strat-subtitle {{ font-size: 11px; color: #787b86; }}
-
-        /* Exact Strategy Cards Anchored to Candles */
-        .candle-card {{
-            position: absolute; z-index: 25; pointer-events: none;
-            padding: 6px 10px; border-radius: 4px; font-size: 10px; font-weight: 700;
-            text-align: center; line-height: 1.35; transform: translate(-50%, 0);
-            box-shadow: 0 4px 12px rgba(0,0,0,0.6);
-        }}
-        .card-ce {{
-            background: #2e7d32; color: #ffffff; border: 1px solid #4caf50;
-        }}
-        .card-pe {{
-            background: #c62828; color: #ffffff; border: 1px solid #ef5350;
+        #chartContainer {{
+            width: 100vw; height: 100vh;
+            position: absolute; top: 0; left: 0; z-index: 1;
         }}
 
-        /* TradingView Bottom Info Table */
-        .tv-hud {{
-            position: absolute; bottom: 25px; left: 50%; transform: translateX(-50%);
-            z-index: 30; background: rgba(18, 20, 26, 0.95);
-            border: 1px solid #2a2e39; border-radius: 6px; font-size: 11px;
-            color: #d1d4dc; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.8);
+        /* Top-Left Header Bar */
+        .tv-top-bar {{
+            position: absolute; top: 8px; left: 12px; z-index: 20;
+            display: flex; flex-direction: column; gap: 4px; pointer-events: none;
         }}
-        .tv-hud table {{ border-collapse: collapse; }}
-        .tv-hud td {{ padding: 4px 10px; border-bottom: 1px solid #222631; white-space: nowrap; }}
-        .tv-hud tr:last-child td {{ border-bottom: none; }}
-        .tag-status {{ background: #2a2e39; color: #ff5252; font-weight: 700; border-radius: 3px; padding: 2px 6px; }}
-        .tag-val {{ font-weight: 700; color: #ffffff; text-align: right; }}
+        .tv-title-row {{
+            display: flex; align-items: center; gap: 8px; pointer-events: auto;
+        }}
+        .badge {{
+            background: #2962ff; color: #fff; font-size: 11px; padding: 2px 6px;
+            border-radius: 3px; font-weight: 700;
+        }}
+        .tv-symbol {{
+            font-size: 14px; font-weight: 700; color: #d1d4dc;
+        }}
+        .tv-price {{
+            font-size: 13px; font-weight: 700;
+        }}
+
+        /* Timeframe Buttons */
+        .tf-bar {{
+            display: flex; gap: 3px; background: rgba(30, 34, 45, 0.9);
+            padding: 2px 5px; border-radius: 4px; border: 1px solid #2a2e39;
+        }}
+        .tf-btn {{
+            background: transparent; border: none; color: #787b86;
+            font-size: 11px; font-weight: 600; padding: 3px 6px;
+            border-radius: 3px; cursor: pointer;
+        }}
+        .tf-btn.active {{
+            background: #2a2e39; color: #d1d4dc; font-weight: 700;
+        }}
+
+        /* Dynamic OHLC Row */
+        .tv-ohlc-row {{
+            font-size: 11px; color: #787b86; display: flex; gap: 7px;
+            background: rgba(11, 14, 20, 0.85); padding: 2px 6px;
+            border-radius: 3px; border: 1px solid rgba(42, 46, 57, 0.4);
+            font-family: monospace; width: fit-content;
+        }}
+        .tv-ohlc-row span b {{ color: #d1d4dc; }}
+
+        /* Strategy Status Table at Lower Right */
+        .strategy-table {{
+            position: absolute; bottom: 30px; right: 75px; z-index: 25;
+            background: rgba(19, 23, 34, 0.96); border: 1px solid #2a2e39;
+            border-radius: 6px; font-size: 11px; color: #d1d4dc; overflow: hidden;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.65);
+        }}
+        .strategy-table table {{ border-collapse: collapse; }}
+        .strategy-table td {{ padding: 5px 9px; border-bottom: 1px solid #2a2e39; }}
+        .strategy-table tr:last-child td {{ border-bottom: none; }}
+        .td-tag {{ color: #fff; font-weight: bold; border-radius: 3px; padding: 2px 6px; text-align: center; }}
+        .text-red {{ color: #f23645; }}
+        .text-green {{ color: #089981; }}
+        .text-trail {{ color: #2962ff; font-weight: bold; }}
+        .text-reason {{ color: #e0e3eb; font-style: italic; max-width: 170px; }}
     </style>
 </head>
 <body>
-    <div id="chartArea">
-        <div class="tv-top">
-            <div class="sym-row">
+    <div id="chartContainer">
+        <!-- Top Left Section: Symbol + Timeframes + Dynamic OHLC -->
+        <div class="tv-top-bar">
+            <div class="tv-title-row">
                 <span class="badge">50</span>
-                <span class="sym-title">Nifty 50 Index</span>
+                <span class="tv-symbol">NIFTY</span>
+                <span class="tv-price" style="color: {chg_color};">{curr['close']:.2f} <span style="font-size: 10px;">{chg_str}</span></span>
+
+                <div class="tf-bar">
+                    <button class="tf-btn {'active' if current_interval=='1m' else ''}" onclick="changeTF('1m')">1m</button>
+                    <button class="tf-btn {'active' if current_interval=='3m' else ''}" onclick="changeTF('3m')">3m</button>
+                    <button class="tf-btn {'active' if current_interval=='5m' else ''}" onclick="changeTF('5m')">5m</button>
+                    <button class="tf-btn {'active' if current_interval=='15m' else ''}" onclick="changeTF('15m')">15m</button>
+                    <button class="tf-btn {'active' if current_interval=='30m' else ''}" onclick="changeTF('30m')">30m</button>
+                    <button class="tf-btn {'active' if current_interval=='1h' else ''}" onclick="changeTF('1h')">1h</button>
+                    <button class="tf-btn {'active' if current_interval=='1D' else ''}" onclick="changeTF('1D')">1D</button>
+                </div>
             </div>
-            <div class="sym-p">{curr['close']:.2f} {chg_str}</div>
-            <div class="strat-subtitle">Option Morning Window Alert Suite (9:30 - 10:15)</div>
+
+            <div id="ohlcRow" class="tv-ohlc-row">
+                <span>O: <b id="barO">{curr['open']:.2f}</b></span>
+                <span>H: <b id="barH">{curr['high']:.2f}</b></span>
+                <span>L: <b id="barL">{curr['low']:.2f}</b></span>
+                <span>C: <b id="barC">{curr['close']:.2f}</b></span>
+                <span>VWAP: <b id="barVWAP" style="color:#ab47bc;">{curr['vwap']:.2f}</b></span>
+                <span>9-EMA: <b id="barEMA" style="color:#2962ff;">{curr['ema9']:.2f}</b></span>
+            </div>
         </div>
 
-        <!-- Dynamic Candle-Anchored Cards Container -->
-        <div id="cardsLayer"></div>
-
-        <!-- TradingView Fixed Strategy Table -->
-        <div class="tv-hud" id="hudTable"></div>
+        <div id="strategyTable" class="strategy-table" style="display: none;"></div>
     </div>
 
     <script>
-        const container = document.getElementById('chartArea');
+        const container = document.getElementById('chartContainer');
         const chart = LightweightCharts.createChart(container, {{
             width: window.innerWidth,
             height: window.innerHeight,
             layout: {{
-                background: {{ color: '#000000' }},
+                background: {{ color: '#0b0e14' }},
                 textColor: '#787b86',
                 fontSize: 11,
             }},
             grid: {{
-                vertLines: {{ color: '#13151b' }},
-                horzLines: {{ color: '#13151b' }}
+                vertLines: {{ color: '#161a25' }},
+                horzLines: {{ color: '#161a25' }}
             }},
             crosshair: {{
                 mode: LightweightCharts.CrosshairMode.Normal,
-                vertLine: {{ color: '#555e6f', width: 1, style: 3 }},
-                horzLine: {{ color: '#555e6f', width: 1, style: 3 }}
+                vertLine: {{ color: '#758696', width: 1, style: 3 }},
+                horzLine: {{ color: '#758696', width: 1, style: 3 }}
             }},
             rightPriceScale: {{
                 borderColor: '#2a2e39',
                 autoScale: true,
-                scaleMargins: {{ top: 0.1, bottom: 0.15 }},
+                scaleMargins: {{ top: 0.12, bottom: 0.15 }},
+                entireTextOnly: true,
                 alignLabels: true
             }},
             timeScale: {{
                 borderColor: '#2a2e39',
                 timeVisible: true,
                 secondsVisible: false,
-                rightOffset: 10
+                rightOffset: 12
             }},
             localization: {{
-                priceFormatter: p => p.toFixed(2)
+                priceFormatter: p => p.toFixed(2) // 5-digit index precision: 22485.65
             }}
         }});
 
-        // Candlesticks (Volume deleted to prevent vertical screen overflow)
         const candleSeries = chart.addCandlestickSeries({{
             upColor: '#089981',
             downColor: '#f23645',
@@ -391,7 +545,6 @@ html_code = f"""
         }});
         candleSeries.setData({candles_json});
 
-        // Purple Session VWAP
         const vwapSeries = chart.addLineSeries({{
             color: '#ab47bc',
             lineWidth: 2,
@@ -400,89 +553,85 @@ html_code = f"""
         }});
         vwapSeries.setData({vwap_json});
 
-        // Latest ORB Horizontal Level Lines (Green High / Red Low)
-        const lines = {lines_json};
-        if (lines.length > 0) {{
-            const lastLine = lines[lines.length - 1];
-            candleSeries.createPriceLine({{
-                price: lastLine.high,
-                color: '#2e7d32',
-                lineWidth: 2,
-                lineStyle: LightweightCharts.LineStyle.Solid,
-                axisLabelVisible: true,
-                title: 'ORB HIGH'
-            }});
-            candleSeries.createPriceLine({{
-                price: lastLine.low,
-                color: '#c62828',
-                lineWidth: 2,
-                lineStyle: LightweightCharts.LineStyle.Solid,
-                axisLabelVisible: true,
-                title: 'ORB LOW'
-            }});
+        const emaSeries = chart.addLineSeries({{
+            color: '#2962ff',
+            lineWidth: 1,
+            title: '9-EMA',
+            priceFormat: {{ type: 'price', precision: 2, minMove: 0.05 }}
+        }});
+        emaSeries.setData({ema_json});
+
+        candleSeries.setMarkers({markers_json});
+
+        // Current Session ORB lines
+        candleSeries.createPriceLine({{
+            price: {curr_orb_h:.2f},
+            color: '#089981',
+            lineWidth: 2,
+            lineStyle: LightweightCharts.LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: 'ORB HIGH'
+        }});
+
+        candleSeries.createPriceLine({{
+            price: {curr_orb_l:.2f},
+            color: '#f23645',
+            lineWidth: 2,
+            lineStyle: LightweightCharts.LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: 'ORB LOW'
+        }});
+
+        // Strategy Status Table
+        const tData = {hud_json};
+        if (tData) {{
+            const isBuy = tData.type === 'CE';
+            const theme = isBuy ? '#00bfa5' : '#f23645';
+            const statusText = tData.status ? tData.status : (tData.tp1_hit ? 'IN TRADE (TIGHT TRAIL)' : 'IN TRADE (EMA TRAIL)');
+            const statusColor = (tData.exit_price !== undefined && tData.exit_price < tData.entry) ? '#f23645' : '#089981';
+
+            const table = document.getElementById('strategyTable');
+            table.style.display = 'block';
+            table.innerHTML = `
+                <table>
+                    <tr><td>Signal</td><td class="td-tag" style="background:${{theme}}">${{tData.name}}</td></tr>
+                    <tr><td>Reason</td><td class="text-reason">${{tData.reason}}</td></tr>
+                    <tr><td>Status</td><td style="font-weight:bold; color:${{statusColor}}">${{statusText}}</td></tr>
+                    <tr><td>Entry</td><td><b>${{tData.entry.toFixed(1)}}</b></td></tr>
+                    <tr><td>Initial SL</td><td class="text-red">${{tData.init_sl.toFixed(1)}}</td></tr>
+                    <tr><td>Target 1 (Fixed)</td><td class="text-green">${{tData.tp1.toFixed(1)}}</td></tr>
+                    <tr><td>Target 2 (Dynamic)</td><td class="text-green">${{tData.tp2.toFixed(1)}}</td></tr>
+                    <tr><td>Current Trail SL</td><td class="text-trail">${{tData.current_sl.toFixed(1)}}</td></tr>
+                </table>
+            `;
         }}
 
-        // Render Strategy Table
-        const sData = {status_json};
-        document.getElementById('hudTable').innerHTML = `
-            <table>
-                <tr>
-                    <td>Window (9:30-10:15)</td>
-                    <td><span class="tag-status">${{sData.status}}</span></td>
-                </tr>
-                <tr>
-                    <td>Trades Taken</td>
-                    <td class="tag-val">${{sData.trades_taken}}</td>
-                </tr>
-                <tr>
-                    <td>Daily ORB High</td>
-                    <td class="tag-val" style="color: #4caf50;">${{sData.orb_h.toFixed(1)}}</td>
-                </tr>
-                <tr>
-                    <td>Daily ORB Low</td>
-                    <td class="tag-val" style="color: #ef5350;">${{sData.orb_l.toFixed(1)}}</td>
-                </tr>
-            </table>
-        `;
-
-        // Candle-Anchored Moving Cards (Tracks zoom & pan)
-        const cards = {cards_json};
-        const cardsLayer = document.getElementById('cardsLayer');
-
-        function updateCardPositions() {{
-            cardsLayer.innerHTML = '';
-            cards.forEach(card => {{
-                const x = chart.timeScale().timeToCoordinate(card.time);
-                const y = candleSeries.priceToCoordinate(card.price);
-
-                if (x !== null && y !== null && x >= 0 && x <= window.innerWidth && y >= 0 && y <= window.innerHeight) {{
-                    const el = document.createElement('div');
-                    el.className = 'candle-card ' + (card.type === 'CE' ? 'card-ce' : 'card-pe');
-                    el.innerHTML = `
-                        ${{card.name}}<br>
-                        Entry: ${{card.entry.toFixed(1)}}<br>
-                        SL: ${{card.sl.toFixed(1)}}<br>
-                        TP: ${{card.tp.toFixed(1)}}
-                    `;
-                    el.style.left = x + 'px';
-                    if (card.type === 'CE') {{
-                        el.style.top = (y + 12) + 'px';
-                    }} else {{
-                        el.style.bottom = (window.innerHeight - y + 12) + 'px';
-                    }}
-                    cardsLayer.appendChild(el);
-                }}
-            }});
-        }}
-
-        // Keep cards synced whenever you zoom or pan
-        chart.timeScale().subscribeVisibleTimeRangeChange(updateCardPositions);
-        updateCardPositions();
+        // Dynamic Crosshair Inspector (Live OHLC on hover/drag)
+        chart.subscribeCrosshairMove(param => {{
+            if (!param.time || !param.seriesData.get(candleSeries)) return;
+            const bar = param.seriesData.get(candleSeries);
+            document.getElementById('barO').innerText = bar.open.toFixed(2);
+            document.getElementById('barH').innerText = bar.high.toFixed(2);
+            document.getElementById('barL').innerText = bar.low.toFixed(2);
+            document.getElementById('barC').innerText = bar.close.toFixed(2);
+            const vBar = param.seriesData.get(vwapSeries);
+            if (vBar) document.getElementById('barVWAP').innerText = vBar.value.toFixed(2);
+            const eBar = param.seriesData.get(emaSeries);
+            if (eBar) document.getElementById('barEMA').innerText = eBar.value.toFixed(2);
+        }});
 
         window.addEventListener('resize', () => {{
-            chart.applyOptions({{ width: window.innerWidth, height: window.innerHeight }});
-            updateCardPositions();
+            chart.applyOptions({{
+                width: window.innerWidth,
+                height: window.innerHeight
+            }});
         }});
+
+        function changeTF(tf) {{
+            const url = new URL(window.parent.location.href);
+            url.searchParams.set('interval', tf);
+            window.parent.location.href = url.href;
+        }}
     </script>
 </body>
 </html>
