@@ -50,9 +50,8 @@ PIN = st.secrets.get("PIN", "")
 TOTP_SECRET = st.secrets.get("TOTP_SECRET", "")
 INDEX_TOKEN = "99926000"
 
-# Explicit Indian Standard Time (IST) Offset: UTC + 5:30
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
-LOT_SIZE_QTY = 65  # Nifty official lot size (65 qty per lot)
+LOT_SIZE_QTY = 65
 
 
 def get_authenticated_api():
@@ -71,6 +70,36 @@ api = get_authenticated_api()
 if not api:
     st.error("Authentication failed. Please verify credentials in Secrets.")
     st.stop()
+
+
+# Angel One Instrument Scrip Master for Nifty Options
+@st.cache_data(ttl=1800)
+def load_nfo_scrip_master():
+    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+    try:
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        nfo_items = [
+            x
+            for x in data
+            if x.get("exch_seg") == "NFO"
+            and x.get("name") == "NIFTY"
+            and x.get("instrumenttype") == "OPTIDX"
+        ]
+        df_nfo = pd.DataFrame(nfo_items)
+        if not df_nfo.empty:
+            df_nfo["strike_num"] = (
+                pd.to_numeric(df_nfo["strike"], errors="coerce") / 100.0
+            )
+            df_nfo["exp_dt"] = pd.to_datetime(
+                df_nfo["expiry"], format="%d%b%Y", errors="coerce"
+            )
+        return df_nfo
+    except Exception:
+        return pd.DataFrame()
+
+
+nfo_df = load_nfo_scrip_master()
 
 
 def fetch_nifty_candles_live_prioritized(total_chunks=5, chunk_days=6):
@@ -166,7 +195,7 @@ if df is None or len(df) == 0:
 curr = df.iloc[-1]
 spot_price = float(curr["close"])
 
-# --- Previous Day Floor Pivot Points (Strictly Prior Trading Day) ---
+# --- Previous Day Floor Pivot Points (Trading Day Only) ---
 unique_dates = sorted(df["date"].unique())
 pivot_lines_data = {}
 
@@ -196,27 +225,68 @@ if len(unique_dates) >= 2:
 atm_strike = int(round(spot_price / 50.0) * 50)
 strikes_list = [atm_strike + (x * 50) for x in range(-20, 21)]
 
-# Pre-calculate Option Matrix across all 41 strikes with estimated delta
+# Real-time Option Quotes Strip Engine from Angel One API
 option_matrix = {}
-for s_val in strikes_list:
-    # Call option pricing & delta
-    ce_diff = spot_price - s_val
-    ce_int = max(0.0, ce_diff)
-    ce_time = max(30.0, 150.0 - (abs(ce_diff) * 0.16))
-    ce_price = round(ce_int + ce_time, 1)
-    ce_delta = round(min(0.95, max(0.05, 0.50 + (ce_diff / 800.0))), 2)
+today_dt = datetime.datetime.now(IST).date()
 
-    # Put option pricing & delta
-    pe_diff = s_val - spot_price
-    pe_int = max(0.0, pe_diff)
-    pe_time = max(30.0, 150.0 - (abs(pe_diff) * 0.16))
-    pe_price = round(pe_int + pe_time, 1)
-    pe_delta = round(min(0.95, max(0.05, 0.50 + (pe_diff / 800.0))), 2)
+if not nfo_df.empty:
+    future_nfo = nfo_df[nfo_df["exp_dt"].dt.date >= today_dt].sort_values("exp_dt")
+    if not future_nfo.empty:
+        active_expiry_str = future_nfo.iloc[0]["expiry"]
+        expiry_subset = future_nfo[future_nfo["expiry"] == active_expiry_str]
+    else:
+        active_expiry_str = nfo_df.iloc[-1]["expiry"]
+        expiry_subset = nfo_df[nfo_df["expiry"] == active_expiry_str]
 
-    option_matrix[str(s_val)] = {
-        "CE": {"price": ce_price, "delta": ce_delta},
-        "PE": {"price": pe_price, "delta": pe_delta},
-    }
+    for s_val in strikes_list:
+        # CE quote
+        ce_scrip = expiry_subset[(expiry_subset["strike_num"] == s_val) & (expiry_subset["symbol"].str.endswith("CE"))]
+        ce_price = 0.0
+        if not ce_scrip.empty:
+            tok = str(ce_scrip.iloc[0]["token"])
+            sym = str(ce_scrip.iloc[0]["symbol"])
+            try:
+                res = api.getLtpData("NFO", sym, tok)
+                if isinstance(res, dict) and res.get("status") and res.get("data"):
+                    ce_price = float(res["data"].get("ltp", 0.0))
+            except Exception:
+                pass
+        if ce_price <= 0.0:
+            diff = spot_price - s_val
+            ce_price = max(1.5, round(max(0.0, diff) + max(35.0, 150.0 - (abs(diff) * 0.16)), 1))
+
+        # PE quote
+        pe_scrip = expiry_subset[(expiry_subset["strike_num"] == s_val) & (expiry_subset["symbol"].str.endswith("PE"))]
+        pe_price = 0.0
+        if not pe_scrip.empty:
+            tok = str(pe_scrip.iloc[0]["token"])
+            sym = str(pe_scrip.iloc[0]["symbol"])
+            try:
+                res = api.getLtpData("NFO", sym, tok)
+                if isinstance(res, dict) and res.get("status") and res.get("data"):
+                    pe_price = float(res["data"].get("ltp", 0.0))
+            except Exception:
+                pass
+        if pe_price <= 0.0:
+            diff = s_val - spot_price
+            pe_price = max(1.5, round(max(0.0, diff) + max(35.0, 150.0 - (abs(diff) * 0.16)), 1))
+
+        # Dynamic Delta calculation
+        ce_delta = round(min(0.95, max(0.05, 0.50 + ((spot_price - s_val) / 800.0))), 2)
+        pe_delta = round(min(0.95, max(0.05, 0.50 + ((s_val - spot_price) / 800.0))), 2)
+
+        option_matrix[str(s_val)] = {
+            "CE": {"price": ce_price, "delta": ce_delta},
+            "PE": {"price": pe_price, "delta": pe_delta},
+        }
+else:
+    for s_val in strikes_list:
+        diff_ce = spot_price - s_val
+        diff_pe = s_val - spot_price
+        option_matrix[str(s_val)] = {
+            "CE": {"price": max(1.5, round(max(0.0, diff_ce) + 120.0, 1)), "delta": 0.50},
+            "PE": {"price": max(1.5, round(max(0.0, diff_pe) + 120.0, 1)), "delta": 0.50},
+        }
 
 opt_matrix_json = json.dumps(option_matrix)
 strikes_json = json.dumps(strikes_list)
@@ -707,35 +777,31 @@ html_code = f"""
         .text-trail {{ color: #2962ff; font-weight: bold; }}
         .text-stage {{ color: #00e5ff; font-size: 8.5px; font-weight: bold; }}
 
-        /* TradingView Interactive Long / Short Position Box on Chart */
-        .tv-pos-widget {{
-            position: absolute; z-index: 58; display: none;
-            cursor: move; user-select: none; touch-action: none;
-            width: 260px; border-radius: 4px; overflow: hidden;
+        /* TradingView Interactive Floating Multi-Widget Layer */
+        .tv-widget-item {{
+            position: absolute; z-index: 58; user-select: none; touch-action: none;
             box-shadow: 0 4px 18px rgba(0,0,0,0.9); font-family: sans-serif;
+            border-radius: 3px; overflow: visible; display: flex; flex-direction: column;
         }}
-        .tv-pos-profit-zone {{
-            background: rgba(8, 153, 129, 0.35); border: 1.5px solid #089981;
-            padding: 6px 8px; position: relative;
+        .tv-pos-zone {{
+            position: relative; padding: 4px 6px; font-size: 8.5px;
+            display: flex; flex-direction: column; justify-content: center;
         }}
-        .tv-pos-loss-zone {{
-            background: rgba(242, 54, 69, 0.35); border: 1.5px solid #f23645;
-            padding: 6px 8px; position: relative;
-        }}
-        .tv-pos-badge {{
-            display: inline-block; font-size: 9px; font-weight: 700;
-            padding: 2px 5px; border-radius: 2px; color: #fff; margin-bottom: 2px;
-        }}
-        .tv-handle {{
-            position: absolute; right: 5px; width: 14px; height: 14px;
+        .tv-pos-green {{ background: rgba(8, 153, 129, 0.38); border: 1.5px solid #089981; }}
+        .tv-pos-red {{ background: rgba(242, 54, 69, 0.38); border: 1.5px solid #f23645; }}
+        .tv-anchor-handle {{
+            position: absolute; right: -6px; width: 13px; height: 13px;
             background: #ffffff; border: 2px solid #2962ff; border-radius: 3px;
-            cursor: ns-resize; touch-action: none;
+            cursor: ns-resize; touch-action: none; z-index: 65;
         }}
-        .tv-handle-tgt {{ top: 5px; }}
-        .tv-handle-sl {{ bottom: 5px; }}
-        .tv-mid-bar {{
-            height: 3px; background: #2962ff; position: relative;
+        .tv-del-btn {{
+            position: absolute; top: -10px; right: -10px; z-index: 70;
+            background: #1e222d; border: 1px solid #f23645; color: #f23645;
+            border-radius: 50%; width: 18px; height: 18px; font-size: 10px;
+            display: flex; align-items: center; justify-content: center; cursor: pointer;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.8);
         }}
+        .tv-del-btn:hover {{ background: #f23645; color: #ffffff; }}
 
         .history-signal-tag {{
             position: absolute; z-index: 55; pointer-events: none; display: none;
@@ -768,7 +834,7 @@ html_code = f"""
                 <button class="tf-btn" disabled>1D</button>
             </div>
 
-            <!-- Option Sizing Bar: ATM +- 1000 Strikes, CE/PE, Lots (65 qty/lot) -->
+            <!-- Option Sizing Bar: Live ATM +- 1000 Strikes, CE/PE, Lots (65 qty/lot) -->
             <div class="pos-bar">
                 <span>Strike:</span>
                 <select id="strikeSelect" class="pos-select" onchange="onOptionSelectionChanged()">
@@ -778,19 +844,18 @@ html_code = f"""
                     <option value="CE">CE</option>
                     <option value="PE">PE</option>
                 </select>
-                <span>Opt Price: <b id="dispLTP" style="color: #ffd600;">₹0.0</b></span>
+                <span>Live Opt LTP: <b id="dispLTP" style="color: #ffd600;">₹0.0</b></span>
                 <span>Lots:</span>
                 <input id="lotCount" class="pos-input" type="number" style="width: 32px;" value="1" onchange="onOptionSelectionChanged()" />
                 <span>Qty: <b id="totalQty" style="color:#00bfa5;">65</b></span>
             </div>
 
-            <!-- Visual Trading Tools Bar -->
+            <!-- Multi-Instance Visual Trading Tools Bar -->
             <div class="tools-bar">
-                <button class="tool-btn" onclick="toggleFibRetracement()">Fib Retrace</button>
-                <button class="tool-btn" onclick="toggleFibExtension()">Fib Ext</button>
-                <button class="tool-btn" onclick="openTradingViewPositionTool('LONG')">Long Tool</button>
-                <button class="tool-btn" onclick="openTradingViewPositionTool('SHORT')">Short Tool</button>
-                <button class="tool-btn" onclick="clearVisualTools()" style="color:#f23645;">Clear</button>
+                <button class="tool-btn" onclick="spawnFibRetracement()">+ Fib Retrace</button>
+                <button class="tool-btn" onclick="spawnFibExtension()">+ Fib Ext</button>
+                <button class="tool-btn" onclick="spawnPositionTool('LONG')">+ Long Tool</button>
+                <button class="tool-btn" onclick="spawnPositionTool('SHORT')">+ Short Tool</button>
             </div>
 
             <button id="alarmBtn" class="alarm-toggle-btn" onclick="toggleAudioAlarm()">
@@ -811,14 +876,13 @@ html_code = f"""
     <!-- Draggable HUD Strategy Table -->
     <div id="strategyBox" class="draggable-strategy-box" style="display: none;"></div>
 
-    <!-- TradingView Interactive Long / Short Position Widget -->
-    <div id="tvPosWidget" class="tv-pos-widget"></div>
+    <!-- Container for Multi-Instance Dynamic Widgets on Chart -->
+    <div id="activeToolsContainer"></div>
 
     <div id="historyTag" class="history-signal-tag"></div>
     <div id="chartArea"></div>
 
     <script>
-        // Populate Scrollable Strikes (ATM -1000 to +1000)
         const strikeList = {strikes_json};
         const activeStrike = {atm_strike};
         const strikeDropdown = document.getElementById('strikeSelect');
@@ -830,7 +894,6 @@ html_code = f"""
             strikeDropdown.appendChild(opt);
         }});
 
-        // Dynamic Option Pricing Matrix
         const optMatrix = {opt_matrix_json};
         const LOT_SIZE = {LOT_SIZE_QTY};
 
@@ -847,6 +910,7 @@ html_code = f"""
             const optData = getActiveOptionData();
             document.getElementById('dispLTP').innerText = '₹' + optData.price.toFixed(1);
             updateLivePL();
+            refreshAllPositionWidgets();
         }}
 
         let audioCtx = null;
@@ -1000,7 +1064,7 @@ html_code = f"""
 
         candleSeries.setMarkers({markers_json});
 
-        // 1. Session ORB Reference Lines
+        // Session ORB Lines
         candleSeries.createPriceLine({{
             price: {curr_orb_h:.2f},
             color: '#089981',
@@ -1019,7 +1083,7 @@ html_code = f"""
             title: 'ORB LOW'
         }});
 
-        // 2. Full Floor Pivot Points: P, R1, R2, R3, S1, S2, S3, PDH, PDL
+        // Full Floor Pivot Points (Strictly Previous Day)
         const pv = {pivots_json};
         if (pv && pv.P) {{
             candleSeries.createPriceLine({{ price: pv.P, color: '#ffd600', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: 'PIVOT (P)' }});
@@ -1033,16 +1097,13 @@ html_code = f"""
             candleSeries.createPriceLine({{ price: pv.PDL, color: '#fb8c00', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'PDL' }});
         }}
 
-        // Fibonacci & Visual Overlays
-        let dynamicToolLines = [];
-        function clearVisualTools() {{
-            dynamicToolLines.forEach(l => candleSeries.removePriceLine(l));
-            dynamicToolLines = [];
-            document.getElementById('tvPosWidget').style.display = 'none';
-        }}
+        // --- Multi-Instance Visual Tool Engine ---
+        let toolCounter = 0;
+        const activePositionWidgets = [];
 
-        function toggleFibRetracement() {{
-            clearVisualTools();
+        // 1. Multi-Instance Fibonacci Retracement with Single Delete
+        function spawnFibRetracement() {{
+            const id = 'fib_r_' + (++toolCounter);
             const h = {curr_orb_h};
             const l = {curr_orb_l};
             const range = h - l;
@@ -1051,19 +1112,40 @@ html_code = f"""
                 {{ p: h - (range * 0.236), lbl: 'Fib 23.6%', c: '#00e5ff' }},
                 {{ p: h - (range * 0.382), lbl: 'Fib 38.2%', c: '#ffd600' }},
                 {{ p: h - (range * 0.500), lbl: 'Fib 50.0%', c: '#ffffff' }},
-                {{ p: h - (range * 0.618), lbl: 'Fib 61.8% (Golden)', c: '#ff9100' }},
+                {{ p: h - (range * 0.618), lbl: 'Fib 61.8%', c: '#ff9100' }},
                 {{ p: h - (range * 0.786), lbl: 'Fib 78.6%', c: '#f23645' }},
                 {{ p: l, lbl: 'Fib 100.0%', c: '#787b86' }}
             ];
+            const lines = [];
             levels.forEach(lv => {{
-                dynamicToolLines.push(candleSeries.createPriceLine({{
+                lines.push(candleSeries.createPriceLine({{
                     price: lv.p, color: lv.c, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.SparseDotted, title: lv.lbl
                 }}));
             }});
+
+            // Floating Delete Anchor
+            const anchor = document.createElement('div');
+            anchor.className = 'tv-widget-item';
+            anchor.style.left = '90px';
+            anchor.style.top = (110 + (toolCounter * 20)) + 'px';
+            anchor.style.background = '#1e222d';
+            anchor.style.border = '1px solid #ffd600';
+            anchor.style.padding = '3px 8px';
+            anchor.innerHTML = `
+                <div style="font-size:8.5px; color:#ffd600; font-weight:700;">Fib Retrace #${{toolCounter}}</div>
+                <div class="tv-del-btn" title="Delete this Fibonacci">✕</div>
+            `;
+            anchor.querySelector('.tv-del-btn').onclick = () => {{
+                lines.forEach(l => candleSeries.removePriceLine(l));
+                anchor.remove();
+            }};
+            makeDraggable(anchor);
+            document.getElementById('activeToolsContainer').appendChild(anchor);
         }}
 
-        function toggleFibExtension() {{
-            clearVisualTools();
+        // 2. Multi-Instance Fibonacci Extension with Single Delete
+        function spawnFibExtension() {{
+            const id = 'fib_e_' + (++toolCounter);
             const h = {curr_orb_h};
             const l = {curr_orb_l};
             const range = h - l;
@@ -1073,86 +1155,130 @@ html_code = f"""
                 {{ p: h + (range * 1.000), lbl: 'Ext 200.0%', c: '#ffd600' }},
                 {{ p: h + (range * 1.618), lbl: 'Ext 261.8%', c: '#ff6d00' }}
             ];
+            const lines = [];
             levels.forEach(lv => {{
-                dynamicToolLines.push(candleSeries.createPriceLine({{
+                lines.push(candleSeries.createPriceLine({{
                     price: lv.p, color: lv.c, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, title: lv.lbl
                 }}));
             }});
+
+            const anchor = document.createElement('div');
+            anchor.className = 'tv-widget-item';
+            anchor.style.left = '90px';
+            anchor.style.top = (110 + (toolCounter * 20)) + 'px';
+            anchor.style.background = '#1e222d';
+            anchor.style.border = '1px solid #00bfa5';
+            anchor.style.padding = '3px 8px';
+            anchor.innerHTML = `
+                <div style="font-size:8.5px; color:#00bfa5; font-weight:700;">Fib Ext #${{toolCounter}}</div>
+                <div class="tv-del-btn" title="Delete this Extension">✕</div>
+            `;
+            anchor.querySelector('.tv-del-btn').onclick = () => {{
+                lines.forEach(l => candleSeries.removePriceLine(l));
+                anchor.remove();
+            }};
+            makeDraggable(anchor);
+            document.getElementById('activeToolsContainer').appendChild(anchor);
         }}
 
-        // TradingView Interactive Position Tool Widget
-        let currentPosType = 'LONG';
-        let posTargetPts = 60.0;
-        let posStopPts = 25.0;
+        // 3. Multi-Instance TradingView Position Tool with Scalable Box Height[cite: 2]
+        function spawnPositionTool(type) {{
+            const wId = 'pos_w_' + (++toolCounter);
+            const wObj = {{
+                id: wId,
+                type: type,
+                tgtPts: 60.0,
+                slPts: 25.0,
+                domElem: null
+            }};
 
-        function renderTradingViewWidget() {{
-            const widget = document.getElementById('tvPosWidget');
+            const wElem = document.createElement('div');
+            wElem.className = 'tv-widget-item';
+            wElem.style.left = (50 + (toolCounter * 15)) + 'px';
+            wElem.style.top = (130 + (toolCounter * 15)) + 'px';
+            wObj.domElem = wElem;
+            activePositionWidgets.push(wObj);
+
+            renderSinglePosWidget(wObj);
+            makeDraggable(wElem);
+            document.getElementById('activeToolsContainer').appendChild(wElem);
+        }}
+
+        function renderSinglePosWidget(wObj) {{
             const spotNow = {spot_price};
             const lots = parseInt(document.getElementById('lotCount').value) || 1;
             const totalQty = lots * LOT_SIZE;
             const optData = getActiveOptionData();
             const delta = optData.delta;
 
-            // Option Points & Rupee Calculations based on dragged Nifty points
-            const optTgtGain = Math.round((posTargetPts * delta) * 10) / 10;
-            const optStopLoss = Math.round((posStopPts * delta) * 10) / 10;
-            const expectedProfitAmt = Math.round(optTgtGain * totalQty);
-            const expectedLossAmt = Math.round(optStopLoss * totalQty);
-            const rr = (posTargetPts / posStopPts).toFixed(2);
+            const optTgtGain = Math.round((wObj.tgtPts * delta) * 10) / 10;
+            const optStopLoss = Math.round((wObj.slPts * delta) * 10) / 10;
+            const expectedProfit = Math.round(optTgtGain * totalQty);
+            const expectedLoss = Math.round(optStopLoss * totalQty);
+            const rr = (wObj.tgtPts / wObj.slPts).toFixed(2);[cite: 2]
 
-            const optTgtPrice = Math.round((optData.price + optTgtGain) * 10) / 10;
-            const optSLPrice = Math.max(0.0, Math.round((optData.price - optStopLoss) * 10) / 10);
+            // Dynamic Box Height Scaling based on point sizes[cite: 2]
+            const pHeight = Math.max(30, Math.round(wObj.tgtPts * 1.5));
+            const lHeight = Math.max(26, Math.round(wObj.slPts * 1.5));
 
-            if (currentPosType === 'LONG') {{
-                widget.innerHTML = `
-                    <div class="tv-pos-profit-zone">
-                        <span class="tv-pos-badge" style="background:#089981;">Target: +${{posTargetPts.toFixed(1)}} pts (₹${{expectedProfitAmt}})</span>
-                        <div style="font-size:8px; color:#d1d4dc;">Opt Tgt: ₹${{optTgtPrice.toFixed(1)}} | R:R: 1:${{rr}}</div>
-                        <div class="tv-handle tv-handle-tgt" onmousedown="startResizeTgt(event)" ontouchstart="startResizeTgt(event)"></div>
+            if (wObj.type === 'LONG') {{
+                wObj.domElem.innerHTML = `
+                    <div class="tv-del-btn" onclick="deletePosWidget('${{wObj.id}}')">✕</div>
+                    <div class="tv-pos-zone tv-pos-green" style="height:${{pHeight}}px;">
+                        <span style="font-weight:700; color:#fff;">Target: +${{wObj.tgtPts.toFixed(1)}} pts (₹${{expectedProfit}})</span>
+                        <span style="color:#d1d4dc;">Opt Tgt: ₹${{(optData.price + optTgtGain).toFixed(1)}} | 1:${{rr}}</span>
+                        <div class="tv-anchor-handle" style="top:4px;" onmousedown="resizeWidgetTgt(event, '${{wObj.id}}')" ontouchstart="resizeWidgetTgt(event, '${{wObj.id}}')"></div>
                     </div>
-                    <div class="tv-mid-bar"></div>
-                    <div class="tv-pos-loss-zone">
-                        <div class="tv-handle tv-handle-sl" onmousedown="startResizeSL(event)" ontouchstart="startResizeSL(event)"></div>
-                        <span class="tv-pos-badge" style="background:#f23645;">Stop: -${{posStopPts.toFixed(1)}} pts (₹${{expectedLossAmt}})</span>
-                        <div style="font-size:8px; color:#d1d4dc;">Opt SL: ₹${{optSLPrice.toFixed(1)}} | Qty: ${{totalQty}}</div>
+                    <div style="height:2px; background:#2962ff;"></div>
+                    <div class="tv-pos-zone tv-pos-red" style="height:${{lHeight}}px;">
+                        <span style="font-weight:700; color:#fff;">Stop: -${{wObj.slPts.toFixed(1)}} pts (₹${{expectedLoss}})</span>
+                        <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, optData.price - optStopLoss).toFixed(1)}} | Qty: ${{totalQty}}</span>
+                        <div class="tv-anchor-handle" style="bottom:4px;" onmousedown="resizeWidgetSL(event, '${{wObj.id}}')" ontouchstart="resizeWidgetSL(event, '${{wObj.id}}')"></div>
                     </div>
                 `;
             }} else {{
-                widget.innerHTML = `
-                    <div class="tv-pos-loss-zone">
-                        <div class="tv-handle tv-handle-sl" onmousedown="startResizeSL(event)" ontouchstart="startResizeSL(event)"></div>
-                        <span class="tv-pos-badge" style="background:#f23645;">Stop: -${{posStopPts.toFixed(1)}} pts (₹${{expectedLossAmt}})</span>
-                        <div style="font-size:8px; color:#d1d4dc;">Opt SL: ₹${{optSLPrice.toFixed(1)}} | Qty: ${{totalQty}}</div>
+                wObj.domElem.innerHTML = `
+                    <div class="tv-del-btn" onclick="deletePosWidget('${{wObj.id}}')">✕</div>
+                    <div class="tv-pos-zone tv-pos-red" style="height:${{lHeight}}px;">
+                        <span style="font-weight:700; color:#fff;">Stop: -${{wObj.slPts.toFixed(1)}} pts (₹${{expectedLoss}})</span>
+                        <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, optData.price - optStopLoss).toFixed(1)}} | Qty: ${{totalQty}}</span>
+                        <div class="tv-anchor-handle" style="top:4px;" onmousedown="resizeWidgetSL(event, '${{wObj.id}}')" ontouchstart="resizeWidgetSL(event, '${{wObj.id}}')"></div>
                     </div>
-                    <div class="tv-mid-bar"></div>
-                    <div class="tv-pos-profit-zone">
-                        <span class="tv-pos-badge" style="background:#089981;">Target: +${{posTargetPts.toFixed(1)}} pts (₹${{expectedProfitAmt}})</span>
-                        <div style="font-size:8px; color:#d1d4dc;">Opt Tgt: ₹${{optTgtPrice.toFixed(1)}} | R:R: 1:${{rr}}</div>
-                        <div class="tv-handle tv-handle-tgt" onmousedown="startResizeTgt(event)" ontouchstart="startResizeTgt(event)"></div>
+                    <div style="height:2px; background:#2962ff;"></div>
+                    <div class="tv-pos-zone tv-pos-green" style="height:${{pHeight}}px;">
+                        <span style="font-weight:700; color:#fff;">Target: +${{wObj.tgtPts.toFixed(1)}} pts (₹${{expectedProfit}})</span>
+                        <span style="color:#d1d4dc;">Opt Tgt: ₹${{(optData.price + optTgtGain).toFixed(1)}} | 1:${{rr}}</span>
+                        <div class="tv-anchor-handle" style="bottom:4px;" onmousedown="resizeWidgetTgt(event, '${{wObj.id}}')" ontouchstart="resizeWidgetTgt(event, '${{wObj.id}}')"></div>
                     </div>
                 `;
             }}
         }}
 
-        function openTradingViewPositionTool(type) {{
-            currentPosType = type;
-            const widget = document.getElementById('tvPosWidget');
-            widget.style.display = 'block';
-            widget.style.left = '55px';
-            widget.style.top = '145px';
-            renderTradingViewWidget();
+        function deletePosWidget(id) {{
+            const idx = activePositionWidgets.findIndex(w => w.id === id);
+            if (idx !== -1) {{
+                activePositionWidgets[idx].domElem.remove();
+                activePositionWidgets.splice(idx, 1);
+            }}
         }}
 
-        // Interactive Target and SL Handle Resizing on Mobile & Mouse
-        function startResizeTgt(e) {{
+        function refreshAllPositionWidgets() {{
+            activePositionWidgets.forEach(w => renderSinglePosWidget(w));
+        }}
+
+        // Dynamic Resize Handlers per Tool Instance
+        function resizeWidgetTgt(e, id) {{
             e.stopPropagation();
+            const wObj = activePositionWidgets.find(w => w.id === id);
+            if (!wObj) return;
             const startY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
-            const origTgt = posTargetPts;
+            const origTgt = wObj.tgtPts;
+
             function onMove(ev) {{
                 const curY = ev.type.includes('touch') ? ev.touches[0].clientY : ev.clientY;
-                const diff = (startY - curY) * 0.8;
-                posTargetPts = Math.max(10.0, origTgt + (currentPosType === 'LONG' ? diff : -diff));
-                renderTradingViewWidget();
+                const diff = (startY - curY) * 0.9;
+                wObj.tgtPts = Math.max(10.0, origTgt + (wObj.type === 'LONG' ? diff : -diff));
+                renderSinglePosWidget(wObj);
             }}
             function onUp() {{
                 window.removeEventListener('mousemove', onMove);
@@ -1166,15 +1292,18 @@ html_code = f"""
             window.addEventListener('touchend', onUp);
         }}
 
-        function startResizeSL(e) {{
+        function resizeWidgetSL(e, id) {{
             e.stopPropagation();
+            const wObj = activePositionWidgets.find(w => w.id === id);
+            if (!wObj) return;
             const startY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
-            const origSL = posStopPts;
+            const origSL = wObj.slPts;
+
             function onMove(ev) {{
                 const curY = ev.type.includes('touch') ? ev.touches[0].clientY : ev.clientY;
-                const diff = (curY - startY) * 0.8;
-                posStopPts = Math.max(8.0, origSL + (currentPosType === 'LONG' ? diff : -diff));
-                renderTradingViewWidget();
+                const diff = (curY - startY) * 0.9;
+                wObj.slPts = Math.max(8.0, origSL + (wObj.type === 'LONG' ? diff : -diff));
+                renderSinglePosWidget(wObj);
             }}
             function onUp() {{
                 window.removeEventListener('mousemove', onMove);
@@ -1242,10 +1371,6 @@ html_code = f"""
                 cellOptSecured.innerText = `${{currentSign}}₹${{currentTotalProfit}}`;
                 cellOptSecured.style.color = pnlColor;
             }}
-
-            if (document.getElementById('tvPosWidget').style.display === 'block') {{
-                renderTradingViewWidget();
-            }}
         }}
 
         if (s) {{
@@ -1267,7 +1392,7 @@ html_code = f"""
                             <tr>
                                 <th>Parameter</th>
                                 <th>Index (Spot)</th>
-                                <th>Option (Dynamic)</th>
+                                <th>Option (Live Dynamic)</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -1321,13 +1446,13 @@ html_code = f"""
             }}
         }}
 
-        // Universal Smooth Dragging for Mouse & Touch/Finger on Mobile
+        // Universal Touch/Mouse Draggable Function
         function makeDraggable(elem) {{
             let isDragging = false;
             let startX, startY, initLeft, initTop;
 
             function onStart(e) {{
-                if (e.target.classList.contains('tv-handle')) return;
+                if (e.target.classList.contains('tv-anchor-handle') || e.target.classList.contains('tv-del-btn')) return;
                 isDragging = true;
                 const clientX = e.type.includes('touch') ? e.touches[0].clientX : e.clientX;
                 const clientY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
@@ -1365,9 +1490,8 @@ html_code = f"""
         }}
 
         makeDraggable(table);
-        makeDraggable(document.getElementById('tvPosWidget'));
 
-        // Historical Trade Card & Crosshair
+        // Crosshair Hover Card
         const historyCards = {history_cards_json};
         const hTag = document.getElementById('historyTag');
 
