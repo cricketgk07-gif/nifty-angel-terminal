@@ -14,7 +14,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Complete Streamlit Chrome Elimination (Pure Fullscreen Styling)
 st.markdown(
     """
 <style>
@@ -69,7 +68,7 @@ if not api:
 
 def fetch_nifty_market_data():
     now = datetime.datetime.now()
-    from_date = (now - datetime.timedelta(days=25)).strftime("%Y-%m-%d 09:15")
+    from_date = (now - datetime.timedelta(days=20)).strftime("%Y-%m-%d 09:15")
     to_date = now.strftime("%Y-%m-%d %H:%M")
 
     resp = api.getCandleData(
@@ -99,7 +98,7 @@ def fetch_nifty_market_data():
         & (df["dt"].dt.time <= datetime.time(15, 30))
     ].copy()
 
-    # Accurate POSIX Seconds (No 1970 bug)
+    # POSIX Seconds Timestamp Conversion
     t_clean = df["dt"].dt.tz_localize(None)
     df["time"] = (
         (t_clean - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
@@ -129,10 +128,10 @@ def fetch_nifty_market_data():
 
 df = fetch_nifty_market_data()
 if df is None or len(df) == 0:
-    st.info("Connecting to live Angel One feed...")
+    st.info("Streaming market data from Angel One...")
     st.stop()
 
-# --- ORB Breakout Engine (1 Trade/Day, Fixed TP1, Dynamic TP2, Tight Trail SL) ---
+# --- Exact Strategy Engine: 1 Trade Per Day with Tight Trailing SL ---
 markers = []
 latest_trade_for_hud = None
 
@@ -356,7 +355,7 @@ chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
-# Fullscreen TradingView Canvas
+# TradingView Native Canvas with Top-Left Timeframes & Clean Right Price Scale
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -368,28 +367,46 @@ html_code = f"""
         html, body {{ width: 100vw; height: 100vh; background-color: #0b0e14; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; overflow: hidden; }}
         #chartContainer {{ width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; }}
 
-        /* Top Header Overlay */
-        .tv-header {{
-            position: absolute; top: 8px; left: 12px; z-index: 20; pointer-events: none;
-            display: flex; flex-direction: column; gap: 2px;
+        /* Top-Left Header Bar */
+        .tv-top-bar {{
+            position: absolute; top: 8px; left: 12px; z-index: 20;
+            display: flex; flex-direction: column; gap: 4px; pointer-events: none;
         }}
-        .tv-title {{ font-size: 14px; font-weight: 700; color: #d1d4dc; display: flex; align-items: center; gap: 6px; }}
-        .badge {{ background: #2962ff; color: #fff; font-size: 10px; padding: 1px 5px; border-radius: 3px; font-weight: 600; }}
-        .tv-price {{ font-size: 13px; font-weight: 600; }}
-        .tv-ohlc {{ font-size: 11px; color: #787b86; display: flex; gap: 6px; font-family: monospace; }}
+        .tv-title-row {{
+            display: flex; align-items: center; gap: 10px; pointer-events: auto;
+        }}
+        .badge {{ background: #2962ff; color: #fff; font-size: 11px; padding: 2px 6px; border-radius: 3px; font-weight: 700; }}
+        .tv-symbol {{ font-size: 15px; font-weight: 700; color: #d1d4dc; }}
+        .tv-price {{ font-size: 14px; font-weight: 700; }}
+        
+        /* Timeframe Buttons on Top-Left */
+        .tf-bar {{
+            display: flex; gap: 4px; background: rgba(30, 34, 45, 0.85); padding: 2px 5px; border-radius: 4px; border: 1px solid #2a2e39;
+        }}
+        .tf-btn {{
+            background: transparent; border: none; color: #787b86; font-size: 11px; font-weight: 600;
+            padding: 3px 6px; border-radius: 3px; cursor: pointer;
+        }}
+        .tf-btn.active, .tf-btn:hover {{ background: #2a2e39; color: #d1d4dc; }}
+
+        /* OHLC Floating Row */
+        .tv-ohlc-row {{
+            font-size: 11px; color: #787b86; display: flex; gap: 8px; font-family: -apple-system, BlinkMacSystemFont, 'Roboto', monospace;
+            background: rgba(11, 14, 20, 0.7); padding: 2px 6px; border-radius: 3px; width: fit-content;
+        }}
+        .tv-ohlc-row span b {{ color: #d1d4dc; }}
 
         /* Fullscreen Button */
         .fs-btn {{
-            position: absolute; top: 8px; right: 12px; z-index: 30;
+            position: absolute; top: 8px; right: 80px; z-index: 30;
             background: #1e222d; border: 1px solid #2a2e39; color: #d1d4dc;
-            font-size: 13px; padding: 5px 9px; border-radius: 4px; cursor: pointer;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+            font-size: 12px; padding: 4px 8px; border-radius: 4px; cursor: pointer;
         }}
         .fs-btn:active {{ background: #2962ff; color: #fff; }}
 
         /* Lower Right Strategy Status Table */
         .strategy-table {{
-            position: absolute; bottom: 25px; right: 65px; z-index: 25;
+            position: absolute; bottom: 30px; right: 80px; z-index: 25;
             background: rgba(19, 23, 34, 0.96); border: 1px solid #2a2e39;
             border-radius: 6px; font-size: 11px; color: #d1d4dc; overflow: hidden;
             box-shadow: 0 4px 14px rgba(0,0,0,0.65);
@@ -408,14 +425,25 @@ html_code = f"""
     <button class="fs-btn" onclick="toggleFullScreen()">⛶ Fullscreen</button>
 
     <div id="chartContainer">
-        <div class="tv-header">
-            <div class="tv-title">
-                <span class="badge">50</span> NIFTY 50 5m
+        <!-- Top Left Section: Title + Timeframes + OHLC -->
+        <div class="tv-top-bar">
+            <div class="tv-title-row">
+                <span class="badge">50</span>
+                <span class="tv-symbol">NIFTY</span>
+                <span class="tv-price" style="color: {chg_color};">{curr['close']:.2f} <span style="font-size: 11px;">{chg_str}</span></span>
+                
+                <div class="tf-bar">
+                    <button class="tf-btn">1m</button>
+                    <button class="tf-btn">3m</button>
+                    <button class="tf-btn active">5m</button>
+                    <button class="tf-btn">15m</button>
+                    <button class="tf-btn">30m</button>
+                    <button class="tf-btn">1h</button>
+                    <button class="tf-btn">1D</button>
+                </div>
             </div>
-            <div class="tv-price" style="color: {chg_color};">
-                {curr['close']:.2f} <span style="font-size: 11px;">{chg_str}</span>
-            </div>
-            <div id="ohlcRow" class="tv-ohlc">
+
+            <div id="ohlcRow" class="tv-ohlc-row">
                 <span>O: <b id="barO">{curr['open']:.2f}</b></span>
                 <span>H: <b id="barH">{curr['high']:.2f}</b></span>
                 <span>L: <b id="barL">{curr['low']:.2f}</b></span>
@@ -450,15 +478,20 @@ html_code = f"""
             rightPriceScale: {{
                 borderColor: '#2a2e39',
                 autoScale: true,
-                scaleMargins: {{ top: 0.08, bottom: 0.08 }}
+                scaleMargins: {{ top: 0.12, bottom: 0.12 }},
+                entireTextOnly: true,
+                alignLabels: true
             }},
             timeScale: {{
                 borderColor: '#2a2e39',
                 timeVisible: true,
                 secondsVisible: false,
+                rightOffset: 12
             }},
             localization: {{
-                priceFormatter: p => p.toFixed(2)
+                priceFormatter: function(price) {{
+                    return price.toFixed(2); // Strict 5-digit index precision: 22485.65
+                }}
             }}
         }});
 
@@ -491,7 +524,7 @@ html_code = f"""
 
         candleSeries.setMarkers({markers_json});
 
-        // ORB Level Lines
+        // Current Session ORB lines
         candleSeries.createPriceLine({{
             price: {curr_orb_h:.2f},
             color: '#089981',
@@ -534,7 +567,7 @@ html_code = f"""
             `;
         }}
 
-        // Dynamic Crosshair Inspector
+        // Dynamic Crosshair Inspector (Live OHLC on hover/drag)
         chart.subscribeCrosshairMove(param => {{
             if (!param.time || !param.seriesData.get(candleSeries)) return;
             const bar = param.seriesData.get(candleSeries);
