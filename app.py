@@ -14,6 +14,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# Lock Viewport and Strip Streamlit Margins
 st.markdown(
     """
 <style>
@@ -33,7 +34,14 @@ st.markdown(
         top: 0 !important;
         left: 0 !important;
     }
-    body {background-color: #0b0e14; margin: 0; overflow: hidden;}
+    body {
+        background-color: #0b0e14;
+        margin: 0;
+        overflow: hidden;
+        touch-action: none;
+        -webkit-user-select: none;
+        user-select: none;
+    }
 </style>
 """,
     unsafe_allow_html=True,
@@ -62,20 +70,41 @@ def init_angel_session(api_key, client_code, pin, totp_sec):
 
 api = init_angel_session(API_KEY, CLIENT_CODE, PIN, TOTP_SECRET)
 if not api:
-    st.error("Authentication failed. Please check Streamlit Secrets.")
+    st.error("Authentication failed. Please verify Streamlit Secrets.")
     st.stop()
 
+# Query param for URL-driven timeframe selection
+params = st.query_params
+current_interval = params.get("interval", "5m")
 
-def fetch_nifty_market_data():
+timeframe_config = {
+    "1m": ("ONE_MINUTE", 5),
+    "3m": ("THREE_MINUTE", 10),
+    "5m": ("FIVE_MINUTE", 20),
+    "15m": ("FIFTEEN_MINUTE", 45),
+    "30m": ("THIRTY_MINUTE", 90),
+    "1h": ("ONE_HOUR", 180),
+    "1D": ("ONE_DAY", 1000),
+}
+
+if current_interval not in timeframe_config:
+    current_interval = "5m"
+
+api_interval, lookback_days = timeframe_config[current_interval]
+
+
+def fetch_nifty_data(interval_code, days_back):
     now = datetime.datetime.now()
-    from_date = (now - datetime.timedelta(days=20)).strftime("%Y-%m-%d 09:15")
+    from_date = (now - datetime.timedelta(days=days_back)).strftime(
+        "%Y-%m-%d 09:15"
+    )
     to_date = now.strftime("%Y-%m-%d %H:%M")
 
     resp = api.getCandleData(
         {
             "exchange": "NSE",
             "symboltoken": INDEX_TOKEN,
-            "interval": "FIVE_MINUTE",
+            "interval": interval_code,
             "fromdate": from_date,
             "todate": to_date,
         }
@@ -92,13 +121,14 @@ def fetch_nifty_market_data():
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
 
-    # NSE Trading Hours Only (09:15 - 15:30)
-    df = df[
-        (df["dt"].dt.time >= datetime.time(9, 15))
-        & (df["dt"].dt.time <= datetime.time(15, 30))
-    ].copy()
+    # NSE Regular Intraday Filter (09:15 - 15:30)
+    if interval_code != "ONE_DAY":
+        df = df[
+            (df["dt"].dt.time >= datetime.time(9, 15))
+            & (df["dt"].dt.time <= datetime.time(15, 30))
+        ].copy()
 
-    # POSIX Seconds Timestamp Conversion
+    # POSIX Seconds
     t_clean = df["dt"].dt.tz_localize(None)
     df["time"] = (
         (t_clean - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
@@ -126,9 +156,9 @@ def fetch_nifty_market_data():
     return df
 
 
-df = fetch_nifty_market_data()
+df = fetch_nifty_data(api_interval, lookback_days)
 if df is None or len(df) == 0:
-    st.info("Streaming market data from Angel One...")
+    st.info("Streaming live candles from Angel One...")
     st.stop()
 
 # --- Exact Strategy Engine: 1 Trade Per Day with Tight Trailing SL ---
@@ -159,7 +189,7 @@ for session_date, day_df in grouped:
             t_type = session_trade["type"]
 
             if t_type == "CE":
-                # Dynamic Target 2 extension
+                # Dynamic Target 2 Extension
                 if h > session_trade["tp2"]:
                     session_trade["tp2"] = round(h + (session_trade["risk"] * 1.0), 1)
 
@@ -248,7 +278,7 @@ for session_date, day_df in grouped:
                     session_trade["exit_pts"] = pts
                     latest_trade_for_hud = session_trade.copy()
 
-        # Entry Signal (First valid breakout after 09:30)
+        # 1 Trade per Day (First valid Breakout after 09:30 AM)
         if t >= datetime.time(9, 30) and not trade_executed_today:
             if c > day_orb_h and c > vwap_val and c > ema:
                 init_sl = round(day_orb_h - 5.0, 1)
@@ -321,8 +351,12 @@ curr_orb_l = (
 )
 curr = df.iloc[-1]
 
-candles_json = json.dumps(
-    [
+# Candlestick and Volume Data Serialization
+candles_data = []
+volume_data = []
+
+for _, r in df.iterrows():
+    candles_data.append(
         {
             "time": int(r["time"]),
             "open": float(r["open"]),
@@ -330,9 +364,22 @@ candles_json = json.dumps(
             "low": float(r["low"]),
             "close": float(r["close"]),
         }
-        for _, r in df.iterrows()
-    ]
-)
+    )
+    vol_color = (
+        "rgba(8, 153, 129, 0.4)"
+        if r["close"] >= r["open"]
+        else "rgba(242, 54, 69, 0.4)"
+    )
+    volume_data.append(
+        {
+            "time": int(r["time"]),
+            "value": float(r["volume"]) if float(r["volume"]) > 0 else 500.0,
+            "color": vol_color,
+        }
+    )
+
+candles_json = json.dumps(candles_data)
+volume_json = json.dumps(volume_data)
 
 vwap_json = json.dumps(
     [
@@ -355,7 +402,7 @@ chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
-# TradingView Native Canvas with Top-Left Timeframes & Clean Right Price Scale
+# --- Edge-to-Edge Locked Canvas with Pinned HUD & Controls ---
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -364,97 +411,130 @@ html_code = f"""
     <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        html, body {{ width: 100vw; height: 100vh; background-color: #0b0e14; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; overflow: hidden; }}
-        #chartContainer {{ width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; }}
+        html, body {{
+            width: 100vw; height: 100vh;
+            background-color: #0b0e14;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            overflow: hidden;
+            touch-action: none;
+            -webkit-user-select: none;
+            user-select: none;
+        }}
+        #chartContainer {{
+            width: 100vw; height: 100vh;
+            position: absolute; top: 0; left: 0; z-index: 1;
+        }}
 
-        /* Top-Left Header Bar */
-        .tv-top-bar {{
-            position: absolute; top: 8px; left: 12px; z-index: 20;
+        /* Pinned Top-Left UI Overlay */
+        .pinned-header {{
+            position: fixed; top: 8px; left: 10px; z-index: 50;
             display: flex; flex-direction: column; gap: 4px; pointer-events: none;
         }}
-        .tv-title-row {{
-            display: flex; align-items: center; gap: 10px; pointer-events: auto;
+        .top-row {{
+            display: flex; align-items: center; gap: 8px; pointer-events: auto;
         }}
-        .badge {{ background: #2962ff; color: #fff; font-size: 11px; padding: 2px 6px; border-radius: 3px; font-weight: 700; }}
-        .tv-symbol {{ font-size: 15px; font-weight: 700; color: #d1d4dc; }}
-        .tv-price {{ font-size: 14px; font-weight: 700; }}
-        
-        /* Timeframe Buttons on Top-Left */
+        .badge {{
+            background: #2962ff; color: #fff; font-size: 11px; padding: 2px 5px;
+            border-radius: 3px; font-weight: 700;
+        }}
+        .symbol-name {{
+            font-size: 14px; font-weight: 700; color: #d1d4dc;
+        }}
+        .symbol-price {{
+            font-size: 13px; font-weight: 700;
+        }}
+
+        /* Pinned Timeframe Switcher */
         .tf-bar {{
-            display: flex; gap: 4px; background: rgba(30, 34, 45, 0.85); padding: 2px 5px; border-radius: 4px; border: 1px solid #2a2e39;
+            display: flex; gap: 3px; background: rgba(30, 34, 45, 0.9);
+            padding: 2px 4px; border-radius: 4px; border: 1px solid #2a2e39;
         }}
         .tf-btn {{
-            background: transparent; border: none; color: #787b86; font-size: 11px; font-weight: 600;
-            padding: 3px 6px; border-radius: 3px; cursor: pointer;
+            background: transparent; border: none; color: #787b86;
+            font-size: 11px; font-weight: 600; padding: 3px 6px;
+            border-radius: 3px; cursor: pointer;
         }}
-        .tf-btn.active, .tf-btn:hover {{ background: #2a2e39; color: #d1d4dc; }}
-
-        /* OHLC Floating Row */
-        .tv-ohlc-row {{
-            font-size: 11px; color: #787b86; display: flex; gap: 8px; font-family: -apple-system, BlinkMacSystemFont, 'Roboto', monospace;
-            background: rgba(11, 14, 20, 0.7); padding: 2px 6px; border-radius: 3px; width: fit-content;
+        .tf-btn.active {{
+            background: #2a2e39; color: #d1d4dc; font-weight: 700;
         }}
-        .tv-ohlc-row span b {{ color: #d1d4dc; }}
 
-        /* Fullscreen Button */
-        .fs-btn {{
-            position: absolute; top: 8px; right: 80px; z-index: 30;
-            background: #1e222d; border: 1px solid #2a2e39; color: #d1d4dc;
-            font-size: 12px; padding: 4px 8px; border-radius: 4px; cursor: pointer;
+        /* Pinned Live OHLC & Indicators Ribbon */
+        .ohlc-ribbon {{
+            font-size: 11px; color: #787b86; display: flex; gap: 7px;
+            background: rgba(11, 14, 20, 0.85); padding: 3px 8px;
+            border-radius: 4px; border: 1px solid rgba(42, 46, 57, 0.4);
+            font-family: monospace; width: fit-content;
         }}
-        .fs-btn:active {{ background: #2962ff; color: #fff; }}
+        .ohlc-ribbon b {{ color: #d1d4dc; }}
 
-        /* Lower Right Strategy Status Table */
-        .strategy-table {{
-            position: absolute; bottom: 30px; right: 80px; z-index: 25;
+        /* Pinned Top-Right Controls */
+        .pinned-top-right {{
+            position: fixed; top: 8px; right: 75px; z-index: 50;
+            display: flex; gap: 6px;
+        }}
+        .action-btn {{
+            background: rgba(30, 34, 45, 0.9); border: 1px solid #2a2e39;
+            color: #d1d4dc; font-size: 11px; padding: 4px 8px;
+            border-radius: 4px; cursor: pointer; font-weight: 600;
+        }}
+        .action-btn:active {{ background: #2962ff; color: #fff; }}
+
+        /* Pinned Bottom-Right Strategy Table */
+        .pinned-strategy-table {{
+            position: fixed; bottom: 35px; right: 75px; z-index: 50;
             background: rgba(19, 23, 34, 0.96); border: 1px solid #2a2e39;
             border-radius: 6px; font-size: 11px; color: #d1d4dc; overflow: hidden;
-            box-shadow: 0 4px 14px rgba(0,0,0,0.65);
+            box-shadow: 0 4px 16px rgba(0,0,0,0.7);
         }}
-        .strategy-table table {{ border-collapse: collapse; }}
-        .strategy-table td {{ padding: 5px 9px; border-bottom: 1px solid #2a2e39; }}
-        .strategy-table tr:last-child td {{ border-bottom: none; }}
+        .pinned-strategy-table table {{ border-collapse: collapse; }}
+        .pinned-strategy-table td {{ padding: 5px 9px; border-bottom: 1px solid #2a2e39; }}
+        .pinned-strategy-table tr:last-child td {{ border-bottom: none; }}
         .td-tag {{ color: #fff; font-weight: bold; border-radius: 3px; padding: 2px 6px; text-align: center; }}
         .text-red {{ color: #f23645; }}
         .text-green {{ color: #089981; }}
         .text-trail {{ color: #2962ff; font-weight: bold; }}
-        .text-reason {{ color: #e0e3eb; font-style: italic; max-width: 170px; }}
+        .text-reason {{ color: #e0e3eb; font-style: italic; max-width: 175px; }}
     </style>
 </head>
 <body>
-    <button class="fs-btn" onclick="toggleFullScreen()">⛶ Fullscreen</button>
+    <!-- Top-Left Fixed Header -->
+    <div class="pinned-header">
+        <div class="top-row">
+            <span class="badge">50</span>
+            <span class="symbol-name">NIFTY</span>
+            <span class="symbol-price" style="color: {chg_color};">{curr['close']:.2f} <span style="font-size: 10px;">{chg_str}</span></span>
 
-    <div id="chartContainer">
-        <!-- Top Left Section: Title + Timeframes + OHLC -->
-        <div class="tv-top-bar">
-            <div class="tv-title-row">
-                <span class="badge">50</span>
-                <span class="tv-symbol">NIFTY</span>
-                <span class="tv-price" style="color: {chg_color};">{curr['close']:.2f} <span style="font-size: 11px;">{chg_str}</span></span>
-                
-                <div class="tf-bar">
-                    <button class="tf-btn">1m</button>
-                    <button class="tf-btn">3m</button>
-                    <button class="tf-btn active">5m</button>
-                    <button class="tf-btn">15m</button>
-                    <button class="tf-btn">30m</button>
-                    <button class="tf-btn">1h</button>
-                    <button class="tf-btn">1D</button>
-                </div>
-            </div>
-
-            <div id="ohlcRow" class="tv-ohlc-row">
-                <span>O: <b id="barO">{curr['open']:.2f}</b></span>
-                <span>H: <b id="barH">{curr['high']:.2f}</b></span>
-                <span>L: <b id="barL">{curr['low']:.2f}</b></span>
-                <span>C: <b id="barC">{curr['close']:.2f}</b></span>
-                <span>VWAP: <b id="barVWAP" style="color:#ab47bc;">{curr['vwap']:.2f}</b></span>
-                <span>9-EMA: <b id="barEMA" style="color:#2962ff;">{curr['ema9']:.2f}</b></span>
+            <div class="tf-bar">
+                <button class="tf-btn {'active' if current_interval=='1m' else ''}" onclick="changeTF('1m')">1m</button>
+                <button class="tf-btn {'active' if current_interval=='3m' else ''}" onclick="changeTF('3m')">3m</button>
+                <button class="tf-btn {'active' if current_interval=='5m' else ''}" onclick="changeTF('5m')">5m</button>
+                <button class="tf-btn {'active' if current_interval=='15m' else ''}" onclick="changeTF('15m')">15m</button>
+                <button class="tf-btn {'active' if current_interval=='30m' else ''}" onclick="changeTF('30m')">30m</button>
+                <button class="tf-btn {'active' if current_interval=='1h' else ''}" onclick="changeTF('1h')">1h</button>
+                <button class="tf-btn {'active' if current_interval=='1D' else ''}" onclick="changeTF('1D')">1D</button>
             </div>
         </div>
 
-        <div id="strategyTable" class="strategy-table" style="display: none;"></div>
+        <div id="ohlcRow" class="ohlc-ribbon">
+            <span>O: <b id="barO">{curr['open']:.2f}</b></span>
+            <span>H: <b id="barH">{curr['high']:.2f}</b></span>
+            <span>L: <b id="barL">{curr['low']:.2f}</b></span>
+            <span>C: <b id="barC">{curr['close']:.2f}</b></span>
+            <span>VWAP: <b id="barVWAP" style="color:#ab47bc;">{curr['vwap']:.2f}</b></span>
+            <span>9-EMA: <b id="barEMA" style="color:#2962ff;">{curr['ema9']:.2f}</b></span>
+        </div>
     </div>
+
+    <!-- Top-Right Fixed Controls -->
+    <div class="pinned-top-right">
+        <button class="action-btn" onclick="toggleFullScreen()">⛶ Fullscreen</button>
+    </div>
+
+    <!-- Bottom-Right Fixed Strategy Table -->
+    <div id="strategyTable" class="pinned-strategy-table" style="display: none;"></div>
+
+    <!-- Main Chart Canvas Container -->
+    <div id="chartContainer"></div>
 
     <script>
         const container = document.getElementById('chartContainer');
@@ -478,23 +558,22 @@ html_code = f"""
             rightPriceScale: {{
                 borderColor: '#2a2e39',
                 autoScale: true,
-                scaleMargins: {{ top: 0.12, bottom: 0.12 }},
-                entireTextOnly: true,
-                alignLabels: true
+                scaleMargins: {{ top: 0.12, bottom: 0.22 }},
+                alignLabels: true,
+                entireTextOnly: true
             }},
             timeScale: {{
                 borderColor: '#2a2e39',
                 timeVisible: true,
                 secondsVisible: false,
-                rightOffset: 12
+                rightOffset: 8
             }},
             localization: {{
-                priceFormatter: function(price) {{
-                    return price.toFixed(2); // Strict 5-digit index precision: 22485.65
-                }}
+                priceFormatter: p => p.toFixed(2) // 5-digit index precision: 22485.65
             }}
         }});
 
+        // 1. Candlestick Series
         const candleSeries = chart.addCandlestickSeries({{
             upColor: '#089981',
             downColor: '#f23645',
@@ -506,6 +585,18 @@ html_code = f"""
         }});
         candleSeries.setData({candles_json});
 
+        // 2. Volume Histogram Series (Bottom Sub-pane)
+        const volumeSeries = chart.addHistogramSeries({{
+            priceFormat: {{ type: 'volume' }},
+            priceScaleId: '', // Separate scale
+            scaleMargins: {{
+                top: 0.82,
+                bottom: 0.0
+            }}
+        }});
+        volumeSeries.setData({volume_json});
+
+        // 3. Purple Session VWAP
         const vwapSeries = chart.addLineSeries({{
             color: '#ab47bc',
             lineWidth: 2,
@@ -514,6 +605,7 @@ html_code = f"""
         }});
         vwapSeries.setData({vwap_json});
 
+        // 4. Blue 9-EMA
         const emaSeries = chart.addLineSeries({{
             color: '#2962ff',
             lineWidth: 1,
@@ -522,9 +614,10 @@ html_code = f"""
         }});
         emaSeries.setData({ema_json});
 
+        // 5. Strategy Signal Markers (BUY CE, BUY PE, EXIT SL)
         candleSeries.setMarkers({markers_json});
 
-        // Current Session ORB lines
+        // 6. Current Session 09:15 - 09:30 ORB Boundaries
         candleSeries.createPriceLine({{
             price: {curr_orb_h:.2f},
             color: '#089981',
@@ -543,7 +636,7 @@ html_code = f"""
             title: 'ORB LOW'
         }});
 
-        // Strategy Status Table
+        // 7. Render Pinned Strategy Status Table
         const tData = {hud_json};
         if (tData) {{
             const isBuy = tData.type === 'CE';
@@ -567,7 +660,7 @@ html_code = f"""
             `;
         }}
 
-        // Dynamic Crosshair Inspector (Live OHLC on hover/drag)
+        // 8. Dynamic Floating Crosshair Inspector
         chart.subscribeCrosshairMove(param => {{
             if (!param.time || !param.seriesData.get(candleSeries)) return;
             const bar = param.seriesData.get(candleSeries);
@@ -581,14 +674,22 @@ html_code = f"""
             if (eBar) document.getElementById('barEMA').innerText = eBar.value.toFixed(2);
         }});
 
-        function resizeChart() {{
+        // Window resize event handler
+        window.addEventListener('resize', () => {{
             chart.applyOptions({{
                 width: window.innerWidth,
                 height: window.innerHeight
             }});
-        }}
-        window.addEventListener('resize', resizeChart);
+        }});
 
+        // Timeframe switch helper
+        function changeTF(tf) {{
+            const url = new URL(window.parent.location.href);
+            url.searchParams.set('interval', tf);
+            window.parent.location.href = url.href;
+        }}
+
+        // Fullscreen toggle helper
         function toggleFullScreen() {{
             if (!document.fullscreenElement) {{
                 document.documentElement.requestFullscreen().catch(() => {{}});
@@ -603,9 +704,9 @@ html_code = f"""
 </html>
 """
 
-components.html(html_code, height=900, scrolling=False)
+components.html(html_code, height=920, scrolling=False)
 
-# Auto-refresh
+# Auto-refresh market feed every 15s
 st.markdown(
     """
     <script>
