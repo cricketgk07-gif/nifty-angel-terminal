@@ -21,7 +21,7 @@ st.markdown(
 <style>
     #MainMenu, footer, header {display: none !important;}
     .block-container {
-        padding: 0 !important;
+        padding: 0.25rem 0.5rem !important;
         margin: 0 !important;
         max-width: 100vw !important;
         height: 100vh !important;
@@ -30,13 +30,16 @@ st.markdown(
     iframe {
         border: none !important;
         width: 100vw !important;
-        height: 100vh !important;
+        height: calc(100vh - 65px) !important;
         display: block !important;
     }
     body {
         background-color: #0b0e14;
         margin: 0;
         overflow: hidden;
+    }
+    div[data-testid="stSelectbox"] label, div[data-testid="stNumberInput"] label {
+        display: none !important;
     }
 </style>
 """,
@@ -215,7 +218,7 @@ if len(unique_dates) >= 2:
             "PDH": pdh, "PDL": pdl
         }
 
-# ATM ± 1000 Strikes (41 strikes)
+# ATM ± 1000 Strikes
 atm_strike = int(round(spot_price / 50.0) * 50)
 strikes_list = [atm_strike + (x * 50) for x in range(-20, 21)]
 
@@ -229,23 +232,52 @@ if not nfo_df.empty:
     else:
         available_expiries = nfo_df["expiry"].dropna().drop_duplicates().tolist()
 
-# Read active selection from URL Query Parameters
-params = st.query_params
-active_strike_sel = str(params.get("opt_strike", str(atm_strike)))
-active_exp_sel = str(params.get("opt_exp", available_expiries[0] if available_expiries else "CURRENT"))
-active_type_sel = str(params.get("opt_type", "CE")).upper()
-active_lot_sel = int(params.get("opt_lots", 1))
+# ----------------- NATIVE STATE CONTROL BAR -----------------
+bar_cols = st.columns([1.4, 1.4, 0.9, 0.9, 3.8])
 
-# Live Order-Book LTP from SmartAPI for selected contract
+with bar_cols[0]:
+    default_strike_idx = strikes_list.index(atm_strike) if atm_strike in strikes_list else 20
+    selected_strike = st.selectbox(
+        "StrikeSelect",
+        strikes_list,
+        index=default_strike_idx,
+        key="selected_strike_key"
+    )
+
+with bar_cols[1]:
+    selected_expiry = st.selectbox(
+        "ExpirySelect",
+        available_expiries if available_expiries else ["CURRENT"],
+        key="selected_expiry_key"
+    )
+
+with bar_cols[2]:
+    selected_type = st.selectbox(
+        "TypeSelect",
+        ["CE", "PE"],
+        key="selected_type_key"
+    )
+
+with bar_cols[3]:
+    selected_lots = st.number_input(
+        "LotsInput",
+        min_value=1,
+        max_value=100,
+        value=1,
+        step=1,
+        key="selected_lots_key"
+    )
+
+# Direct Query to Angel One for the selected strike
 live_real_ltp = 0.0
 target_symbol = ""
 target_token = ""
 
 if not nfo_df.empty:
     scrip_match = nfo_df[
-        (nfo_df["strike_num"] == float(active_strike_sel))
-        & (nfo_df["symbol"].str.endswith(active_type_sel))
-        & (nfo_df["expiry"] == active_exp_sel)
+        (nfo_df["strike_num"] == float(selected_strike))
+        & (nfo_df["symbol"].str.endswith(selected_type))
+        & (nfo_df["expiry"] == selected_expiry)
     ]
     if not scrip_match.empty:
         target_symbol = str(scrip_match.iloc[0]["symbol"])
@@ -259,19 +291,29 @@ if not nfo_df.empty:
         except Exception:
             pass
 
+# Fallback only if exchange is closed and API returns 0
 if live_real_ltp <= 0.0:
-    stk_f = float(active_strike_sel)
-    diff = (spot_price - stk_f) if active_type_sel == "CE" else (stk_f - spot_price)
+    diff = (spot_price - float(selected_strike)) if selected_type == "CE" else (float(selected_strike) - spot_price)
     live_real_ltp = max(1.5, round(max(0.0, diff) + max(20.0, 110.0 - (abs(diff) * 0.15)), 2))
 
-# Delta Calculation
-diff_val = (spot_price - float(active_strike_sel)) if active_type_sel == "CE" else (float(active_strike_sel) - spot_price)
+diff_val = (spot_price - float(selected_strike)) if selected_type == "CE" else (float(selected_strike) - spot_price)
 active_delta = round(min(0.95, max(0.05, 0.50 + (diff_val / 800.0))), 2)
+total_qty = selected_lots * LOT_SIZE_QTY
 
-strikes_json = json.dumps(strikes_list)
-expiries_json = json.dumps(available_expiries)
+with bar_cols[4]:
+    st.markdown(
+        f"""
+        <div style="background:#161a25; border:1px solid #2a2e39; border-radius:4px; padding:4px 10px; margin-top:2px; display:flex; gap:14px; align-items:center; font-size:12px;">
+            <div>Contract: <b style="color:#00e5ff;">{target_symbol or 'NIFTY OPT'}</b></div>
+            <div>Live LTP: <b style="color:#ffd600; font-size:15px;">₹{live_real_ltp:.2f}</b></div>
+            <div>Qty: <b style="color:#089981;">{total_qty}</b> ({selected_lots}L)</div>
+            <div>Delta: <b style="color:#ab47bc;">{active_delta}</b></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-# Strategy Engine
+# ----------------- STRATEGY ENGINE & HUD TABLE -----------------
 markers = []
 historical_trade_cards = {}
 latest_trade_for_hud = None
@@ -594,13 +636,7 @@ elif latest_trade_for_hud:
 hud_json = json.dumps(hud_payload)
 play_alarm_flag = "true" if alarm_signal_triggered else "false"
 
-day_open = today_df.iloc[0]["open"]
-chg = curr["close"] - day_open
-chg_pct = (chg / day_open) * 100
-chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
-chg_color = "#089981" if chg >= 0 else "#f23645"
-
-# --- Embedded Web Terminal ---
+# ----------------- EMBEDDED JAVASCRIPT TERMINAL -----------------
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -610,70 +646,24 @@ html_code = f"""
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         html, body {{
-            width: 100vw; height: 100vh;
+            width: 100vw; height: 100%;
             background-color: #0b0e14;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             overflow: hidden;
         }}
         #chartArea {{
-            width: 100vw; height: calc(100vh - 35px);
+            width: 100vw; height: 100vh;
             position: absolute; top: 0; left: 0;
         }}
 
-        .fixed-top-box {{
-            position: absolute; top: 6px; left: 8px; z-index: 60;
-            display: flex; flex-direction: column; gap: 4px; pointer-events: none;
-            max-width: calc(100vw - 80px);
-        }}
-        .top-row-1 {{
-            display: flex; align-items: center; gap: 5px; pointer-events: auto; flex-wrap: wrap;
-        }}
-        .sym-group {{
-            display: flex; align-items: center; gap: 5px;
-        }}
-        .badge {{
-            background: #2962ff; color: #fff; font-size: 11px; padding: 2px 5px;
-            border-radius: 3px; font-weight: 700;
-        }}
-        .sym-title {{ font-size: 13px; font-weight: 700; color: #d1d4dc; }}
-        .sym-price {{ font-size: 12px; font-weight: 700; }}
-
-        .tf-bar {{
-            display: flex; gap: 2px; background: rgba(30, 34, 45, 0.95);
-            padding: 2px 4px; border-radius: 4px; border: 1px solid #2a2e39;
-        }}
-        .tf-btn {{
-            background: transparent; border: none; color: #787b86;
-            font-size: 10px; font-weight: 600; padding: 2px 5px;
-            border-radius: 2px; cursor: not-allowed; opacity: 0.45;
-        }}
-        .tf-btn.active {{
-            background: #2962ff; color: #ffffff; font-weight: 700; cursor: default; opacity: 1.0;
-        }}
-
-        .pos-bar {{
-            display: flex; align-items: center; gap: 3px; background: rgba(22, 26, 37, 0.95);
-            padding: 2px 5px; border-radius: 4px; border: 1px solid #363c4e; font-size: 9px;
-            color: #d1d4dc;
-        }}
-        .pos-input {{
-            background: #0b0e14; border: 1px solid #2a2e39; color: #00e5ff;
-            font-size: 9.5px; padding: 1px 3px; border-radius: 2px; text-align: center;
-            font-weight: 700;
-        }}
-        .pos-select {{
-            background: #0b0e14; border: 1px solid #2a2e39; color: #ffd600;
-            font-size: 9.5px; padding: 1px 3px; border-radius: 2px; font-weight: 600;
-            outline: none; cursor: pointer;
-        }}
-
         .tools-bar {{
-            display: flex; align-items: center; gap: 3px; background: rgba(22, 26, 37, 0.95);
-            padding: 2px 5px; border-radius: 4px; border: 1px solid #363c4e; font-size: 9px;
+            position: absolute; top: 8px; left: 12px; z-index: 60;
+            display: flex; align-items: center; gap: 4px; background: rgba(22, 26, 37, 0.95);
+            padding: 3px 6px; border-radius: 4px; border: 1px solid #363c4e;
         }}
         .tool-btn {{
             background: #161a25; border: 1px solid #2a2e39; color: #d1d4dc;
-            font-size: 9px; padding: 2px 5px; border-radius: 3px; cursor: pointer;
+            font-size: 9.5px; padding: 3px 6px; border-radius: 3px; cursor: pointer;
             font-weight: 600;
         }}
         .tool-btn:hover {{ background: #2962ff; color: #ffffff; }}
@@ -699,21 +689,13 @@ html_code = f"""
             to {{ transform: translateX(-50%) scale(1.06); }}
         }}
 
-        .dynamic-ohlc-row {{
-            font-size: 10px; color: #787b86; display: flex; gap: 6px;
-            background: rgba(11, 14, 20, 0.92); padding: 2px 6px;
-            border-radius: 3px; border: 1px solid rgba(42, 46, 57, 0.4);
-            font-family: monospace; width: fit-content;
-        }}
-        .dynamic-ohlc-row b {{ color: #d1d4dc; }}
-
         /* 3-Column Strategy Table */
         .draggable-strategy-box {{
-            position: absolute; bottom: 48px; right: 65px; z-index: 60;
+            position: absolute; bottom: 35px; right: 55px; z-index: 60;
             background: rgba(19, 23, 34, 0.97); border: 1px solid #2a2e39;
             border-radius: 6px; font-size: 9.5px; color: #d1d4dc; overflow: hidden;
             box-shadow: 0 4px 18px rgba(0,0,0,0.9); cursor: grab; user-select: none;
-            touch-action: none; min-width: 330px;
+            touch-action: none; min-width: 320px;
         }}
         .draggable-strategy-box:active {{ cursor: grabbing; }}
         .box-drag-handle {{
@@ -738,7 +720,7 @@ html_code = f"""
         .text-trail {{ color: #2962ff; font-weight: bold; }}
         .text-stage {{ color: #00e5ff; font-size: 8.5px; font-weight: bold; }}
 
-        /* Position Tools */
+        /* Position Box */
         .tv-widget-item {{
             position: absolute; z-index: 55; user-select: none; touch-action: none;
             font-family: sans-serif; border-radius: 4px; overflow: visible;
@@ -767,16 +749,8 @@ html_code = f"""
             display: flex; align-items: center; justify-content: center; cursor: pointer;
             box-shadow: 0 2px 6px rgba(0,0,0,0.8); font-weight: 800;
         }}
-        .tv-del-btn:hover {{ background: #f23645; color: #ffffff; }}
 
         .chart-click-crosshair {{ cursor: crosshair !important; }}
-
-        .history-signal-tag {{
-            position: absolute; z-index: 55; pointer-events: none; display: none;
-            background: rgba(22, 26, 37, 0.96); border: 1px solid #363c4e; border-radius: 5px;
-            padding: 5px 8px; font-size: 9.5px; color: #d1d4dc; line-height: 1.4;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.7); transform: translate(-50%, -100%);
-        }}
     </style>
 </head>
 <body>
@@ -784,114 +758,26 @@ html_code = f"""
         🚨 SIGNAL CONFIRMED! [TAP TO MUTE] 🔇
     </div>
 
-    <div class="fixed-top-box">
-        <div class="top-row-1">
-            <div class="sym-group">
-                <span class="badge">50</span>
-                <span class="sym-title">NIFTY</span>
-                <span class="sym-price" style="color: {chg_color};">{curr['close']:.2f} <span style="font-size: 10px;">{chg_str}</span></span>
-            </div>
-
-            <div class="tf-bar">
-                <button class="tf-btn" disabled>1m</button>
-                <button class="tf-btn" disabled>3m</button>
-                <button class="tf-btn active">5m</button>
-                <button class="tf-btn" disabled>15m</button>
-                <button class="tf-btn" disabled>30m</button>
-                <button class="tf-btn" disabled>1h</button>
-                <button class="tf-btn" disabled>1D</button>
-            </div>
-
-            <!-- Real-Time Option Selection Controls -->
-            <div class="pos-bar">
-                <span>Strike:</span>
-                <select id="strikeSelect" class="pos-select" onchange="applyOptionContractChange()"></select>
-                <span>Exp:</span>
-                <select id="expirySelect" class="pos-select" onchange="applyOptionContractChange()"></select>
-                <select id="typeSelect" class="pos-select" onchange="applyOptionContractChange()">
-                    <option value="CE" {'selected' if active_type_sel == 'CE' else ''}>CE</option>
-                    <option value="PE" {'selected' if active_type_sel == 'PE' else ''}>PE</option>
-                </select>
-                <span>Live LTP: <b id="dispLTP" style="color: #ffd600;">₹{live_real_ltp:.2f}</b></span>
-                <span>Lots:</span>
-                <input id="lotCount" class="pos-input" type="number" style="width: 32px;" value="{active_lot_sel}" onchange="applyOptionContractChange()" />
-                <span>Qty: <b id="totalQty" style="color:#00bfa5;">{active_lot_sel * LOT_SIZE_QTY}</b></span>
-            </div>
-
-            <div class="tools-bar">
-                <button id="btnFibR" class="tool-btn" onclick="activateDrawMode('FIB_RETRACE')">+ Fib Retrace</button>
-                <button id="btnFibE" class="tool-btn" onclick="activateDrawMode('FIB_EXT')">+ Fib Ext</button>
-                <button id="btnLong" class="tool-btn" onclick="activateDrawMode('LONG')">+ Long Tool</button>
-                <button id="btnShort" class="tool-btn" onclick="activateDrawMode('SHORT')">+ Short Tool</button>
-            </div>
-
-            <button id="alarmBtn" class="alarm-toggle-btn" onclick="toggleAudioAlarm()">
-                🔔 <span id="alarmTxt">Audio</span>
-            </button>
-        </div>
-
-        <div id="ohlcRow" class="dynamic-ohlc-row">
-            <span>O: <b id="barO">{curr['open']:.2f}</b></span>
-            <span>H: <b id="barH">{curr['high']:.2f}</b></span>
-            <span>L: <b id="barL">{curr['low']:.2f}</b></span>
-            <span>C: <b id="barC">{curr['close']:.2f}</b></span>
-            <span>VWAP: <b id="barVWAP" style="color:#ab47bc;">{curr['vwap']:.2f}</b></span>
-            <span>EMA: <b id="barEMA" style="color:#2962ff;">{curr['ema9']:.2f}</b></span>
-        </div>
+    <!-- Drawing Tools -->
+    <div class="tools-bar">
+        <button id="btnFibR" class="tool-btn" onclick="activateDrawMode('FIB_RETRACE')">+ Fib Retrace</button>
+        <button id="btnFibE" class="tool-btn" onclick="activateDrawMode('FIB_EXT')">+ Fib Ext</button>
+        <button id="btnLong" class="tool-btn" onclick="activateDrawMode('LONG')">+ Long Tool</button>
+        <button id="btnShort" class="tool-btn" onclick="activateDrawMode('SHORT')">+ Short Tool</button>
+        <button id="alarmBtn" class="alarm-toggle-btn" onclick="toggleAudioAlarm()">
+            🔔 <span id="alarmTxt">Audio</span>
+        </button>
     </div>
 
     <div id="strategyBox" class="draggable-strategy-box" style="display: none;"></div>
     <div id="activeToolsContainer"></div>
-    <div id="historyTag" class="history-signal-tag"></div>
     <div id="chartArea"></div>
 
     <script>
-        const strikeList = {strikes_json};
-        const activeStrike = "{active_strike_sel}";
-        const strikeDropdown = document.getElementById('strikeSelect');
-        strikeList.forEach(stk => {{
-            const opt = document.createElement('option');
-            opt.value = stk.toString();
-            opt.innerText = stk.toString();
-            if (stk.toString() === activeStrike) opt.selected = true;
-            strikeDropdown.appendChild(opt);
-        }});
-
-        const expList = {expiries_json};
-        const activeExp = "{active_exp_sel}";
-        const expDropdown = document.getElementById('expirySelect');
-        if (expList && expList.length > 0) {{
-            expList.forEach(exp => {{
-                const opt = document.createElement('option');
-                opt.value = exp;
-                opt.innerText = exp;
-                if (exp === activeExp) opt.selected = true;
-                expDropdown.appendChild(opt);
-            }});
-        }} else {{
-            const opt = document.createElement('option');
-            opt.value = "CURRENT";
-            opt.innerText = "CURRENT";
-            expDropdown.appendChild(opt);
-        }}
-
-        function applyOptionContractChange() {{
-            const stk = document.getElementById('strikeSelect').value;
-            const exp = document.getElementById('expirySelect').value;
-            const typ = document.getElementById('typeSelect').value;
-            const lots = document.getElementById('lotCount').value;
-            const url = new URL(window.parent.location.href);
-            url.searchParams.set('opt_strike', stk);
-            url.searchParams.set('opt_exp', exp);
-            url.searchParams.set('opt_type', typ);
-            url.searchParams.set('opt_lots', lots);
-            window.parent.location.href = url.href;
-        }}
-
-        const LOT_SIZE = {LOT_SIZE_QTY};
         const activeRealLTP = {live_real_ltp};
         const activeDelta = {active_delta};
-        const activeContractLabel = "{active_strike_sel} {active_type_sel}";
+        const activeQty = {total_qty};
+        const activeContractLabel = "{selected_strike} {selected_type}";
 
         let audioCtx = null;
         let alarmUnlocked = localStorage.getItem('nifty_alarm_active') === 'true';
@@ -970,7 +856,7 @@ html_code = f"""
         const container = document.getElementById('chartArea');
         const chart = LightweightCharts.createChart(container, {{
             width: window.innerWidth,
-            height: window.innerHeight - 35,
+            height: window.innerHeight,
             layout: {{
                 background: {{ color: '#0b0e14' }},
                 textColor: '#787b86',
@@ -1022,6 +908,7 @@ html_code = f"""
         }});
         volumeSeries.setData({volume_json});
 
+        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
         const vwapSeries = chart.addLineSeries({{
             color: '#ab47bc',
             lineWidth: 2,
@@ -1031,6 +918,7 @@ html_code = f"""
         }});
         vwapSeries.setData({vwap_json});
 
+        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
         const emaSeries = chart.addLineSeries({{
             color: '#2962ff',
             lineWidth: 1,
@@ -1042,9 +930,11 @@ html_code = f"""
 
         candleSeries.setMarkers({markers_json});
 
+        // ORB Lines
         candleSeries.createPriceLine({{ price: {curr_orb_h:.2f}, color: '#089981', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'ORB HIGH' }});
         candleSeries.createPriceLine({{ price: {curr_orb_l:.2f}, color: '#f23645', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'ORB LOW' }});
 
+        // Floor Pivots
         const pv = {pivots_json};
         if (pv && pv.P) {{
             candleSeries.createPriceLine({{ price: pv.P, color: '#ffd600', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: 'PIVOT (P)' }});
@@ -1058,6 +948,7 @@ html_code = f"""
             candleSeries.createPriceLine({{ price: pv.PDL, color: '#fb8c00', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'PDL' }});
         }}
 
+        // Interactive Drawing Tools
         let toolCounter = 0;
         let currentDrawMode = null;
         let drawPoints = [];
@@ -1116,13 +1007,10 @@ html_code = f"""
         }}
 
         function renderSinglePosWidget(wObj) {{
-            const lots = parseInt(document.getElementById('lotCount').value) || 1;
-            const totalQty = lots * LOT_SIZE;
-
             const optTgtGain = Math.round((wObj.tgtPts * activeDelta) * 10) / 10;
             const optStopLoss = Math.round((wObj.slPts * activeDelta) * 10) / 10;
-            const expectedProfit = Math.round(optTgtGain * totalQty);
-            const expectedLoss = Math.round(optStopLoss * totalQty);
+            const expectedProfit = Math.round(optTgtGain * activeQty);
+            const expectedLoss = Math.round(optStopLoss * activeQty);
             const rr = (wObj.tgtPts / wObj.slPts).toFixed(2);
 
             const pHeight = Math.max(30, Math.round(wObj.tgtPts * 1.5));
@@ -1141,7 +1029,7 @@ html_code = f"""
                     </div>
                     <div class="tv-pos-zone tv-pos-red" style="height:${{lHeight}}px;">
                         <span style="font-weight:700; color:#fff;">Stop: -${{wObj.slPts.toFixed(1)}} pts (₹${{expectedLoss}})</span>
-                        <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, activeRealLTP - optStopLoss).toFixed(2)}} | Qty: ${{totalQty}}</span>
+                        <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, activeRealLTP - optStopLoss).toFixed(2)}} | Qty: ${{activeQty}}</span>
                         <div class="tv-touch-circle" style="bottom:4px;" onmousedown="resizeWidgetSL(event, '${{wObj.id}}')" ontouchstart="resizeWidgetSL(event, '${{wObj.id}}')"></div>
                     </div>
                 `;
@@ -1150,7 +1038,7 @@ html_code = f"""
                     <div class="tv-del-btn" onclick="deletePosWidget('${{wObj.id}}')">✕</div>
                     <div class="tv-pos-zone tv-pos-red" style="height:${{lHeight}}px;">
                         <span style="font-weight:700; color:#fff;">Stop: -${{wObj.slPts.toFixed(1)}} pts (₹${{expectedLoss}})</span>
-                        <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, activeRealLTP - optStopLoss).toFixed(2)}} | Qty: ${{totalQty}}</span>
+                        <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, activeRealLTP - optStopLoss).toFixed(2)}} | Qty: ${{activeQty}}</span>
                         <div class="tv-touch-circle" style="top:4px;" onmousedown="resizeWidgetSL(event, '${{wObj.id}}')" ontouchstart="resizeWidgetSL(event, '${{wObj.id}}')"></div>
                     </div>
                     <div style="height:3px; background:#2962ff; position:relative;">
@@ -1314,16 +1202,13 @@ html_code = f"""
                     </table>
                 `;
             }} else {{
-                const lots = parseInt(document.getElementById('lotCount').value) || 1;
-                const totalQty = lots * LOT_SIZE;
-
                 const optRiskPts = Math.round((s.raw_risk_pts * activeDelta) * 10) / 10;
                 const optSLPrice = Math.max(0.0, Math.round((activeRealLTP - optRiskPts) * 10) / 10);
-                const totalMaxRisk = Math.round(optRiskPts * totalQty);
+                const totalMaxRisk = Math.round(optRiskPts * activeQty);
 
                 const optT1Pts = Math.round((s.raw_target1_pts * activeDelta) * 10) / 10;
                 const optT1Price = Math.round((activeRealLTP + optT1Pts) * 10) / 10;
-                const totalT1Profit = Math.round(optT1Pts * totalQty);
+                const totalT1Profit = Math.round(optT1Pts * activeQty);
 
                 const optFinalPts = Math.round((s.raw_target_final_pts * activeDelta) * 10) / 10;
                 const optFinalPrice = Math.round((activeRealLTP + optFinalPts) * 10) / 10;
@@ -1332,7 +1217,7 @@ html_code = f"""
                 const optTrailPrice = Math.round((activeRealLTP + optTrailPts) * 10) / 10;
 
                 const currentRunningPts = Math.round((s.current_pts * activeDelta) * 10) / 10;
-                const currentTotalProfit = Math.round(currentRunningPts * totalQty);
+                const currentTotalProfit = Math.round(currentRunningPts * activeQty);
                 const currentSign = currentTotalProfit >= 0 ? '+' : '';
                 const pnlColor = currentTotalProfit >= 0 ? '#089981' : '#f23645';
 
@@ -1434,46 +1319,8 @@ html_code = f"""
 
         makeDraggable(table);
 
-        const historyCards = {history_cards_json};
-        const hTag = document.getElementById('historyTag');
-
-        chart.subscribeCrosshairMove(param => {{
-            if (!param.time || !param.seriesData.get(candleSeries)) {{
-                hTag.style.display = 'none';
-                return;
-            }}
-
-            const bar = param.seriesData.get(candleSeries);
-            document.getElementById('barO').innerText = bar.open.toFixed(2);
-            document.getElementById('barH').innerText = bar.high.toFixed(2);
-            document.getElementById('barL').innerText = bar.low.toFixed(2);
-            document.getElementById('barC').innerText = bar.close.toFixed(2);
-            const vBar = param.seriesData.get(vwapSeries);
-            if (vBar) document.getElementById('barVWAP').innerText = vBar.value.toFixed(2);
-            const eBar = param.seriesData.get(emaSeries);
-            if (eBar) document.getElementById('barEMA').innerText = eBar.value.toFixed(2);
-
-            const sig = historyCards[param.time];
-            if (sig && param.point) {{
-                hTag.style.display = 'block';
-                hTag.style.left = param.point.x + 'px';
-                hTag.style.top = (param.point.y - 12) + 'px';
-                const tagColor = sig.type === 'CE' ? '#00bfa5' : '#f23645';
-                hTag.innerHTML = `
-                    <div style="font-weight:bold; color:${{tagColor}}; border-bottom:1px solid #363c4e; padding-bottom:2px; margin-bottom:3px;">
-                        ${{sig.title}}
-                    </div>
-                    <div><b>Entry:</b> ${{sig.entry.toFixed(1)}}</div>
-                    <div><b>Target:</b> ${{sig.target.toFixed(1)}} (+${{sig.target_pts.toFixed(1)}} pts)</div>
-                    <div><b>Stop Loss:</b> ${{sig.sl.toFixed(1)}} (-${{sig.sl_pts.toFixed(1)}} pts)</div>
-                `;
-            }} else {{
-                hTag.style.display = 'none';
-            }}
-        }});
-
         window.addEventListener('resize', () => {{
-            chart.applyOptions({{ width: window.innerWidth, height: window.innerHeight - 35 }});
+            chart.applyOptions({{ width: window.innerWidth, height: window.innerHeight }});
         }});
     </script>
 </body>
@@ -1482,7 +1329,6 @@ html_code = f"""
 
 components.html(html_code, height=720, scrolling=False)
 
-# 15s live refresh
 st.markdown(
     """
     <script>
