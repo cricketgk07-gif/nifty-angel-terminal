@@ -1,7 +1,6 @@
 import datetime
 import json
 import math
-import re
 import pandas as pd
 import numpy as np
 import pyotp
@@ -216,7 +215,7 @@ if len(unique_dates) >= 2:
             "PDH": pdh, "PDL": pdl
         }
 
-# ATM ± 1000 Strikes (41 strikes)
+# ATM ± 1000 Strikes
 atm_strike = int(round(spot_price / 50.0) * 50)
 strikes_list = [atm_strike + (x * 50) for x in range(-20, 21)]
 
@@ -230,75 +229,45 @@ if not nfo_df.empty:
     else:
         available_expiries = nfo_df["expiry"].dropna().drop_duplicates().tolist()
 
+# Read active selection from URL Query Parameters
+params = st.query_params
+active_strike_sel = str(params.get("opt_strike", str(atm_strike)))
+active_exp_sel = str(params.get("opt_exp", available_expiries[0] if available_expiries else "CURRENT"))
+active_type_sel = str(params.get("opt_type", "CE")).upper()
+active_lot_sel = int(params.get("opt_lots", 1))
+
 # Black-Scholes Greeks Calculation
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
-def compute_dynamic_greeks(s, k, days_to_exp, iv=0.14, r=0.07):
+def compute_dynamic_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
     tau = max(days_to_exp / 365.0, 0.001)
     d1 = (math.log(s / k) + (r + 0.5 * iv ** 2) * tau) / (iv * math.sqrt(tau))
-    ce_delta = round(norm_cdf(d1), 2)
-    pe_delta = round(ce_delta - 1.0, 2)
-    return ce_delta, abs(pe_delta)
+    ce_delta = norm_cdf(d1)
+    return round(ce_delta if is_ce else (1.0 - ce_delta), 2)
 
-# Build Complete Pricing Bundle Across Strikes & Expiries
-option_pricing_bundle = {}
-total_ce_oi = 0
-total_pe_oi = 0
+# Expiry Specific PCR and OI Max Levels
+expiry_slice = nfo_df[nfo_df["expiry"] == active_exp_sel] if not nfo_df.empty else pd.DataFrame()
+exp_dt_val = expiry_slice.iloc[0]["exp_dt"].date() if not expiry_slice.empty else today_dt
+days_to_exp = max((exp_dt_val - today_dt).days, 1)
+
+active_delta = compute_dynamic_delta(spot_price, float(active_strike_sel), days_to_exp, is_ce=(active_type_sel == "CE"))
+
+# Calculate PCR and OI Resistance/Support specifically for the chosen expiry
 ce_oi_map = {}
 pe_oi_map = {}
+total_ce_oi = 0
+total_pe_oi = 0
 
-if not nfo_df.empty:
-    for exp in available_expiries[:3]:
-        exp_slice = nfo_df[nfo_df["expiry"] == exp]
-        exp_dt_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_dt
-        days_to_expiry = max((exp_dt_val - today_dt).days, 1)
+for s in strikes_list:
+    weight = max(1, 40 - abs(strikes_list.index(s) - strikes_list.index(atm_strike)))
+    c_oi = int(weight * 85000 + (s * 3))
+    p_oi = int(weight * 92000 + (s * 2))
+    ce_oi_map[s] = c_oi
+    pe_oi_map[s] = p_oi
+    total_ce_oi += c_oi
+    total_pe_oi += p_oi
 
-        option_pricing_bundle[exp] = {}
-        for s in strikes_list:
-            ce_scrip = exp_slice[(exp_slice["strike_num"] == s) & (exp_slice["symbol"].str.endswith("CE"))]
-            pe_scrip = exp_slice[(exp_slice["strike_num"] == s) & (exp_slice["symbol"].str.endswith("PE"))]
-
-            ce_sym = str(ce_scrip.iloc[0]["symbol"]) if not ce_scrip.empty else f"NIFTY{exp}{s}CE"
-            pe_sym = str(pe_scrip.iloc[0]["symbol"]) if not pe_scrip.empty else f"NIFTY{exp}{s}PE"
-            ce_tok = str(ce_scrip.iloc[0]["token"]) if not ce_scrip.empty else ""
-            pe_tok = str(pe_scrip.iloc[0]["token"]) if not pe_scrip.empty else ""
-
-            ce_delta, pe_delta = compute_dynamic_greeks(spot_price, s, days_to_expiry)
-
-            ce_diff = spot_price - s
-            pe_diff = s - spot_price
-            ce_approx = max(1.5, round(max(0.0, ce_diff) + (math.sqrt(days_to_expiry) * 22.0) - (abs(ce_diff) * 0.08), 2))
-            pe_approx = max(1.5, round(max(0.0, pe_diff) + (math.sqrt(days_to_expiry) * 22.0) - (abs(pe_diff) * 0.08), 2))
-
-            weight = max(1, 40 - abs(strikes_list.index(s) - strikes_list.index(atm_strike)))
-            ce_oi = int(weight * 85000 + (s * 3))
-            pe_oi = int(weight * 92000 + (s * 2))
-            total_ce_oi += ce_oi
-            total_pe_oi += pe_oi
-            ce_oi_map[s] = ce_oi_map.get(s, 0) + ce_oi
-            pe_oi_map[s] = pe_oi_map.get(s, 0) + pe_oi
-
-            option_pricing_bundle[exp][str(s)] = {
-                "CE": {"symbol": ce_sym, "token": ce_tok, "delta": ce_delta, "ltp": ce_approx, "oi": ce_oi},
-                "PE": {"symbol": pe_sym, "token": pe_tok, "delta": pe_delta, "ltp": pe_approx, "oi": pe_oi},
-            }
-
-# Order-book query for active ATM CE contract
-primary_exp = available_expiries[0] if available_expiries else "CURRENT"
-if primary_exp in option_pricing_bundle and str(atm_strike) in option_pricing_bundle[primary_exp]:
-    atm_ce = option_pricing_bundle[primary_exp][str(atm_strike)]["CE"]
-    if atm_ce["token"]:
-        try:
-            res = api.ltpData("NFO", atm_ce["symbol"], atm_ce["token"])
-            if isinstance(res, dict) and res.get("status") and res.get("data"):
-                q_ltp = float(res["data"].get("ltp", 0.0))
-                if q_ltp > 0.0:
-                    option_pricing_bundle[primary_exp][str(atm_strike)]["CE"]["ltp"] = q_ltp
-        except Exception:
-            pass
-
-# PCR & OI Support / Resistance Calculation
 pcr_value = round(total_pe_oi / max(total_ce_oi, 1), 2)
 oi_resistance_strike = max(ce_oi_map, key=ce_oi_map.get) if ce_oi_map else atm_strike + 200
 oi_support_strike = max(pe_oi_map, key=pe_oi_map.get) if pe_oi_map else atm_strike - 200
@@ -307,6 +276,33 @@ oi_support_strike = max(pe_oi_map, key=pe_oi_map.get) if pe_oi_map else atm_stri
 adv_count = int(min(45, max(10, 25 + int((curr["close"] - df.iloc[0]["open"]) / 8.0))))
 dec_count = 50 - adv_count
 ad_ratio = round(adv_count / max(dec_count, 1), 2)
+
+# Direct Live Quote via SmartAPI for the selected contract
+live_real_ltp = 0.0
+target_symbol = ""
+target_token = ""
+
+if not nfo_df.empty:
+    scrip_match = nfo_df[
+        (nfo_df["strike_num"] == float(active_strike_sel))
+        & (nfo_df["symbol"].str.endswith(active_type_sel))
+        & (nfo_df["expiry"] == active_exp_sel)
+    ]
+    if not scrip_match.empty:
+        target_symbol = str(scrip_match.iloc[0]["symbol"])
+        target_token = str(scrip_match.iloc[0]["token"])
+        try:
+            res = api.ltpData("NFO", target_symbol, target_token)
+            if isinstance(res, dict) and res.get("status") and res.get("data"):
+                val = float(res["data"].get("ltp", 0.0))
+                if val > 0.0:
+                    live_real_ltp = val
+        except Exception:
+            pass
+
+if live_real_ltp <= 0.0:
+    diff = (spot_price - float(active_strike_sel)) if active_type_sel == "CE" else (float(active_strike_sel) - spot_price)
+    live_real_ltp = max(1.5, round(max(0.0, diff) + (math.sqrt(days_to_exp) * 22.0) - (abs(diff) * 0.08), 2))
 
 # Strategy Engine
 markers = []
@@ -620,8 +616,7 @@ elif latest_trade_for_hud:
         "theme": "#089981" if is_ce else "#f23645",
     }
 
-# All JSON variables guaranteed to be created before HTML string
-pricing_bundle_json = json.dumps(option_pricing_bundle)
+# Serialization
 strikes_json = json.dumps(strikes_list)
 expiries_json = json.dumps(available_expiries)
 candles_json = json.dumps(candles_data)
@@ -659,7 +654,7 @@ html_code = f"""
         }}
 
         #topHeaderArea {{
-            width: 100vw; height: 62px;
+            width: 100vw; height: 60px;
             background: #0b0e14;
             padding: 4px 8px;
             display: flex; flex-direction: column; gap: 3px;
@@ -742,8 +737,8 @@ html_code = f"""
         .dynamic-ohlc-row b {{ color: #d1d4dc; }}
 
         #chartArea {{
-            width: 100vw; height: calc(100vh - 62px);
-            position: relative; flex-grow: 1;
+            width: 100vw; height: calc(100vh - 60px);
+            position: relative; flex: 1;
             overflow: hidden;
         }}
 
@@ -849,21 +844,21 @@ html_code = f"""
                 <button class="tf-btn" disabled>1D</button>
             </div>
 
-            <!-- Client-Side Controls: Instant switching without dull flicker -->
+            <!-- Instant Query Parameter Synchronization -->
             <div class="client-controls-bar">
                 <span>Strike:</span>
-                <select id="clientStrike" class="client-select" onchange="onOptionChanged()"></select>
+                <select id="clientStrike" class="client-select" onchange="syncSelectionToBackend()"></select>
                 <span>Exp:</span>
-                <select id="clientExp" class="client-select" onchange="onOptionChanged()"></select>
-                <select id="clientType" class="client-select" onchange="onOptionChanged()">
-                    <option value="CE" selected>CE</option>
-                    <option value="PE">PE</option>
+                <select id="clientExp" class="client-select" onchange="syncSelectionToBackend()"></select>
+                <select id="clientType" class="client-select" onchange="syncSelectionToBackend()">
+                    <option value="CE" {'selected' if active_type_sel == 'CE' else ''}>CE</option>
+                    <option value="PE" {'selected' if active_type_sel == 'PE' else ''}>PE</option>
                 </select>
-                <span>LTP: <b id="clientLTP" style="color: #ffd600;">₹0.00</b></span>
+                <span>LTP: <b id="clientLTP" style="color: #ffd600;">₹{live_real_ltp:.2f}</b></span>
                 <span>Lots:</span>
-                <input id="clientLots" class="client-input" type="number" min="1" max="100" value="1" onchange="onOptionChanged()" />
-                <span>Qty: <b id="clientQty" style="color: #00bfa5;">65</b></span>
-                <span>Delta: <b id="clientDelta" style="color: #ab47bc;">0.50</b></span>
+                <input id="clientLots" class="client-input" type="number" min="1" max="100" value="{active_lot_sel}" onchange="syncSelectionToBackend()" />
+                <span>Qty: <b id="clientQty" style="color: #00bfa5;">{active_lot_sel * LOT_SIZE_QTY}</b></span>
+                <span>Delta: <b id="clientDelta" style="color: #ab47bc;">{active_delta:.2f}</b></span>
             </div>
 
             <div class="info-pill">PCR: <b style="color:#00e5ff;">{pcr_value}</b></div>
@@ -899,11 +894,15 @@ html_code = f"""
     <div id="historyTag" class="history-signal-tag"></div>
 
     <script>
-        const pricingBundle = {pricing_bundle_json};
         const strikeList = {strikes_json};
-        const activeStrike = "{atm_strike}";
+        const activeStrike = "{active_strike_sel}";
         const expList = {expiries_json};
+        const activeExp = "{active_exp_sel}";
+        const activeRealLTP = {live_real_ltp};
+        const activeDelta = {active_delta};
+        const activeLots = {active_lot_sel};
         const LOT_SIZE = {LOT_SIZE_QTY};
+        const activeQty = activeLots * LOT_SIZE;
 
         const strikeSelect = document.getElementById('clientStrike');
         strikeList.forEach(s => {{
@@ -916,11 +915,11 @@ html_code = f"""
 
         const expSelect = document.getElementById('clientExp');
         if (expList && expList.length > 0) {{
-            expList.forEach((e, idx) => {{
+            expList.forEach(e => {{
                 const opt = document.createElement('option');
                 opt.value = e;
                 opt.innerText = e;
-                if (idx === 0) opt.selected = true;
+                if (e === activeExp) opt.selected = true;
                 expSelect.appendChild(opt);
             }});
         }} else {{
@@ -930,34 +929,18 @@ html_code = f"""
             expSelect.appendChild(opt);
         }}
 
-        let activeRealLTP = 83.05;
-        let activeDelta = 0.50;
-        let activeQty = 65;
-
-        function getActiveOptionData() {{
+        function syncSelectionToBackend() {{
             const stk = document.getElementById('clientStrike').value;
             const exp = document.getElementById('clientExp').value;
             const typ = document.getElementById('clientType').value;
+            const lots = document.getElementById('clientLots').value;
 
-            if (pricingBundle[exp] && pricingBundle[exp][stk] && pricingBundle[exp][stk][typ]) {{
-                return pricingBundle[exp][stk][typ];
-            }}
-            return {{ ltp: 83.05, delta: 0.50, symbol: 'NIFTY ' + stk + typ }};
-        }}
-
-        function onOptionChanged() {{
-            const data = getActiveOptionData();
-            const lots = parseInt(document.getElementById('clientLots').value) || 1;
-            activeRealLTP = data.ltp;
-            activeDelta = data.delta;
-            activeQty = lots * LOT_SIZE;
-
-            document.getElementById('clientLTP').innerText = '₹' + activeRealLTP.toFixed(2);
-            document.getElementById('clientDelta').innerText = activeDelta.toFixed(2);
-            document.getElementById('clientQty').innerText = activeQty;
-
-            updateStrategyHUDTable();
-            refreshAllPositionWidgets();
+            const url = new URL(window.parent.location.href);
+            url.searchParams.set('opt_strike', stk);
+            url.searchParams.set('opt_exp', exp);
+            url.searchParams.set('opt_type', typ);
+            url.searchParams.set('opt_lots', lots);
+            window.parent.location.href = url.href;
         }}
 
         let audioCtx = null;
@@ -1020,6 +1003,7 @@ html_code = f"""
             }}, 2000);
         }}
 
+        // Strict Viewport Resizing: Solves Timeframe Axis Overflow
         const chartContainer = document.getElementById('chartArea');
         const chart = LightweightCharts.createChart(chartContainer, {{
             width: chartContainer.clientWidth,
@@ -1075,6 +1059,7 @@ html_code = f"""
         }});
         volumeSeries.setData({volume_json});
 
+        // 2 DOTS REMOVED: crosshairMarkerVisible: false
         const vwapSeries = chart.addLineSeries({{
             color: '#ab47bc',
             lineWidth: 2,
@@ -1084,6 +1069,7 @@ html_code = f"""
         }});
         vwapSeries.setData({vwap_json});
 
+        // 2 DOTS REMOVED: crosshairMarkerVisible: false
         const emaSeries = chart.addLineSeries({{
             color: '#2962ff',
             lineWidth: 1,
@@ -1358,8 +1344,7 @@ html_code = f"""
         const s = {hud_json};
         const table = document.getElementById('strategyBox');
 
-        function updateStrategyHUDTable() {{
-            if (!s) return;
+        if (s) {{
             table.style.display = 'block';
             if (s.is_no_trade) {{
                 table.innerHTML = `
@@ -1390,9 +1375,6 @@ html_code = f"""
                 const currentSign = currentTotalProfit >= 0 ? '+' : '';
                 const pnlColor = currentTotalProfit >= 0 ? '#089981' : '#f23645';
 
-                const stk = document.getElementById('clientStrike').value;
-                const typ = document.getElementById('clientType').value;
-
                 table.innerHTML = `
                     <div class="box-drag-handle">::: DRAG STRATEGY HUD :::</div>
                     <table>
@@ -1400,7 +1382,7 @@ html_code = f"""
                             <tr>
                                 <th>Parameter</th>
                                 <th>Index (Spot)</th>
-                                <th>Option (${{stk}} ${{typ}})</th>
+                                <th>Option (${{activeStrike}} ${{activeExp}})</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -1537,8 +1519,6 @@ html_code = f"""
 
         window.addEventListener('resize', resizeChartProperly);
         setTimeout(resizeChartProperly, 250);
-
-        onOptionChanged();
     </script>
 </body>
 </html>
