@@ -21,7 +21,7 @@ st.markdown(
 <style>
     #MainMenu, footer, header {display: none !important;}
     .block-container {
-        padding: 0 !important;
+        padding: 0.5rem 1rem !important;
         margin: 0 !important;
         max-width: 100vw !important;
         height: 100vh !important;
@@ -30,7 +30,7 @@ st.markdown(
     iframe {
         border: none !important;
         width: 100vw !important;
-        height: 100vh !important;
+        height: calc(100vh - 65px) !important;
         display: block !important;
     }
     body {
@@ -54,6 +54,7 @@ IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 LOT_SIZE_QTY = 65
 
 
+@st.cache_resource
 def get_authenticated_api():
     try:
         api = SmartConnect(API_KEY)
@@ -72,12 +73,12 @@ if not api:
     st.stop()
 
 
-# Angel One Instrument Scrip Master for Nifty Options Expiries and Tokens
+# Load Angel One NFO Scrip Master
 @st.cache_data(ttl=3600)
 def load_nfo_scrip_master():
     url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
     try:
-        r = requests.get(url, timeout=12)
+        r = requests.get(url, timeout=15)
         data = r.json()
         nfo_items = [
             x
@@ -102,13 +103,13 @@ def load_nfo_scrip_master():
 nfo_df = load_nfo_scrip_master()
 
 
-def fetch_nifty_candles_live_prioritized(total_chunks=5, chunk_days=6):
+def fetch_nifty_candles():
     now_ist = datetime.datetime.now(IST)
     collected_frames = []
     current_end = now_ist
 
-    for _ in range(total_chunks):
-        chunk_start = current_end - datetime.timedelta(days=chunk_days)
+    for _ in range(4):
+        chunk_start = current_end - datetime.timedelta(days=6)
         from_str = chunk_start.strftime("%Y-%m-%d 09:15")
         to_str = current_end.strftime("%Y-%m-%d %H:%M")
 
@@ -144,7 +145,6 @@ def fetch_nifty_candles_live_prioritized(total_chunks=5, chunk_days=6):
         df[col] = pd.to_numeric(df[col])
 
     df = df[(df["open"] > 1000) & (df["high"] > 1000) & (df["low"] > 1000) & (df["close"] > 1000)].copy()
-
     df = df[
         (df["dt"].dt.time >= datetime.time(9, 15))
         & (df["dt"].dt.time <= datetime.time(15, 30))
@@ -169,7 +169,6 @@ def fetch_nifty_candles_live_prioritized(total_chunks=5, chunk_days=6):
     df["cum_vp"] = df.groupby("date")["vol_mult"].cumsum()
     df["vwap"] = df["cum_vp"] / df["cum_vol"]
     df["vwap"] = df["vwap"].fillna(df["tp"])
-    df.loc[df["vwap"] < 1000, "vwap"] = df["tp"]
 
     df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
 
@@ -177,21 +176,20 @@ def fetch_nifty_candles_live_prioritized(total_chunks=5, chunk_days=6):
     high_cp = (df["high"] - df["close"].shift(1)).abs()
     low_cp = (df["low"] - df["close"].shift(1)).abs()
     tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
-    df["atr"] = tr.rolling(window=14, min_periods=1).mean()
-    df["atr"] = df["atr"].fillna(15.0)
+    df["atr"] = tr.rolling(window=14, min_periods=1).mean().fillna(15.0)
 
     return df
 
 
-df = fetch_nifty_candles_live_prioritized(total_chunks=5, chunk_days=6)
+df = fetch_nifty_candles()
 if df is None or len(df) == 0:
-    st.info("Market feed is initializing...")
+    st.info("Market data feed is initializing...")
     st.stop()
 
 curr = df.iloc[-1]
 spot_price = float(curr["close"])
 
-# --- Previous Day Floor Pivot Points ---
+# --- Previous Day Floor Pivots ---
 unique_dates = sorted(df["date"].unique())
 pivot_lines_data = {}
 
@@ -217,14 +215,13 @@ if len(unique_dates) >= 2:
             "PDH": pdh, "PDL": pdl
         }
 
-# Generate 41 strikes (ATM - 1000 to ATM + 1000, step: 50)
+# ATM ± 1000 Strikes
 atm_strike = int(round(spot_price / 50.0) * 50)
 strikes_list = [atm_strike + (x * 50) for x in range(-20, 21)]
 
-# Extract contract expiries
+# Expiry Contract List
 available_expiries = []
 today_dt = datetime.datetime.now(IST).date()
-
 if not nfo_df.empty:
     future_nfo = nfo_df[nfo_df["exp_dt"].dt.date >= today_dt].sort_values("exp_dt")
     if not future_nfo.empty:
@@ -232,47 +229,63 @@ if not nfo_df.empty:
     else:
         available_expiries = nfo_df["expiry"].dropna().drop_duplicates().tolist()
 
-# Read Query Parameters from URL
-params = st.query_params
-active_strike_sel = str(params.get("opt_strike", str(atm_strike)))
-active_exp_sel = str(params.get("opt_exp", available_expiries[0] if available_expiries else "CURRENT"))
-active_type_sel = str(params.get("opt_type", "CE")).upper()
-active_lot_sel = int(params.get("opt_lots", 1))
+# ----------------- NATIVE DYNAMIC INPUT BAR -----------------
+col1, col2, col3, col4, col5 = st.columns([1.5, 1.5, 1, 1, 3])
 
-# Live Order-Book LTP from SmartAPI: Executed only for the selected contract
-live_real_ltp = 0.0
+with col1:
+    default_strike_idx = strikes_list.index(atm_strike) if atm_strike in strikes_list else 20
+    selected_strike = st.selectbox("Strike", strikes_list, index=default_strike_idx)
+
+with col2:
+    selected_expiry = st.selectbox("Expiry", available_expiries if available_expiries else ["CURRENT"])
+
+with col3:
+    selected_type = st.selectbox("Type", ["CE", "PE"])
+
+with col4:
+    selected_lots = st.number_input("Lots", min_value=1, max_value=100, value=1, step=1)
+
+# Fetch Exact Live Market LTP via SmartAPI
+live_option_ltp = 0.0
+target_symbol = ""
+target_token = ""
 
 if not nfo_df.empty:
-    match_scrip = nfo_df[
-        (nfo_df["strike_num"] == float(active_strike_sel))
-        & (nfo_df["symbol"].str.endswith(active_type_sel))
-        & (nfo_df["expiry"] == active_exp_sel)
+    scrip_match = nfo_df[
+        (nfo_df["strike_num"] == float(selected_strike))
+        & (nfo_df["symbol"].str.endswith(selected_type))
+        & (nfo_df["expiry"] == selected_expiry)
     ]
-    if not match_scrip.empty:
-        sym = str(match_scrip.iloc[0]["symbol"])
-        tok = str(match_scrip.iloc[0]["token"])
+    if not scrip_match.empty:
+        target_symbol = str(scrip_match.iloc[0]["symbol"])
+        target_token = str(scrip_match.iloc[0]["token"])
         try:
-            quote_res = api.ltpData("NFO", sym, tok)
-            if isinstance(quote_res, dict) and quote_res.get("status") and quote_res.get("data"):
-                ltp_val = float(quote_res["data"].get("ltp", 0.0))
-                if ltp_val > 0.0:
-                    live_real_ltp = ltp_val
+            res = api.ltpData("NFO", target_symbol, target_token)
+            if isinstance(res, dict) and res.get("status") and res.get("data"):
+                live_option_ltp = float(res["data"].get("ltp", 0.0))
         except Exception:
             pass
 
-if live_real_ltp <= 0.0:
-    stk_f = float(active_strike_sel)
-    diff = (spot_price - stk_f) if active_type_sel == "CE" else (stk_f - spot_price)
-    live_real_ltp = max(1.5, round(max(0.0, diff) + max(20.0, 110.0 - (abs(diff) * 0.15)), 2))
-
-# Dynamic Delta Calculation
-diff_val = (spot_price - float(active_strike_sel)) if active_type_sel == "CE" else (float(active_strike_sel) - spot_price)
+# Delta calculation
+diff_val = (spot_price - float(selected_strike)) if selected_type == "CE" else (float(selected_strike) - spot_price)
 active_delta = round(min(0.95, max(0.05, 0.50 + (diff_val / 800.0))), 2)
 
-strikes_json = json.dumps(strikes_list)
-expiries_json = json.dumps(available_expiries)
+total_qty = selected_lots * LOT_SIZE_QTY
 
-# Strategy Engine
+with col5:
+    st.markdown(
+        f"""
+        <div style="background:#161a25; border:1px solid #2a2e39; border-radius:5px; padding:6px 12px; margin-top:20px; display:flex; gap:16px; align-items:center;">
+            <div>Contract: <b style="color:#00e5ff;">{target_symbol or 'NIFTY OPT'}</b></div>
+            <div>Live LTP: <b style="color:#ffd600; font-size:16px;">₹{live_option_ltp:.2f}</b></div>
+            <div>Qty: <b style="color:#089981;">{total_qty}</b> ({selected_lots}L)</div>
+            <div>Delta: <b style="color:#ab47bc;">{active_delta}</b></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# ----------------- STRATEGY ENGINE & HUD TABLE -----------------
 markers = []
 historical_trade_cards = {}
 latest_trade_for_hud = None
@@ -497,56 +510,36 @@ curr_orb_l = (
 )
 latest_bar_time = curr["dt"].time()
 
-candles_data = []
-volume_data = []
-vol_max = df["calc_vol"].max() if df["calc_vol"].max() > 0 else 1.0
+candles_data = [
+    {
+        "time": int(r["time"]),
+        "open": float(r["open"]),
+        "high": float(r["high"]),
+        "low": float(r["low"]),
+        "close": float(r["close"]),
+    }
+    for _, r in df.iterrows()
+]
 
-for _, r in df.iterrows():
-    candles_data.append(
-        {
-            "time": int(r["time"]),
-            "open": float(r["open"]),
-            "high": float(r["high"]),
-            "low": float(r["low"]),
-            "close": float(r["close"]),
-        }
-    )
-    norm_v = (float(r["calc_vol"]) / vol_max) * 100.0
-    v_color = (
-        "rgba(8, 153, 129, 0.55)"
-        if r["close"] >= r["open"]
-        else "rgba(242, 54, 69, 0.55)"
-    )
-    volume_data.append(
-        {
-            "time": int(r["time"]),
-            "value": round(norm_v, 2),
-            "color": v_color,
-        }
-    )
+vol_max = df["calc_vol"].max() if df["calc_vol"].max() > 0 else 1.0
+volume_data = [
+    {
+        "time": int(r["time"]),
+        "value": round((float(r["calc_vol"]) / vol_max) * 100.0, 2),
+        "color": "rgba(8, 153, 129, 0.55)" if r["close"] >= r["open"] else "rgba(242, 54, 69, 0.55)",
+    }
+    for _, r in df.iterrows()
+]
 
 candles_json = json.dumps(candles_data)
 volume_json = json.dumps(volume_data)
-
-vwap_json = json.dumps(
-    [
-        {"time": int(r["time"]), "value": round(float(r["vwap"]), 2)}
-        for _, r in df.iterrows()
-    ]
-)
-ema_json = json.dumps(
-    [
-        {"time": int(r["time"]), "value": round(float(r["ema9"]), 2)}
-        for _, r in df.iterrows()
-    ]
-)
+vwap_json = json.dumps([{"time": int(r["time"]), "value": round(float(r["vwap"]), 2)} for _, r in df.iterrows()])
+ema_json = json.dumps([{"time": int(r["time"]), "value": round(float(r["ema9"]), 2)} for _, r in df.iterrows()])
 markers_json = json.dumps(markers)
 history_cards_json = json.dumps(historical_trade_cards)
 pivots_json = json.dumps(pivot_lines_data)
 
-# HUD Table Payload
 hud_payload = None
-
 if trade_executed_in_latest_session and latest_trade_for_hud:
     is_ce = latest_trade_for_hud["type"] == "CE"
     entry_p = latest_trade_for_hud["entry"]
@@ -615,13 +608,7 @@ elif latest_trade_for_hud:
 hud_json = json.dumps(hud_payload)
 play_alarm_flag = "true" if alarm_signal_triggered else "false"
 
-day_open = today_df.iloc[0]["open"]
-chg = curr["close"] - day_open
-chg_pct = (chg / day_open) * 100
-chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
-chg_color = "#089981" if chg >= 0 else "#f23645"
-
-# --- Responsive Web Terminal ---
+# ----------------- EMBEDDED JAVASCRIPT TERMINAL -----------------
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -631,70 +618,24 @@ html_code = f"""
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         html, body {{
-            width: 100vw; height: 100vh;
+            width: 100vw; height: 100%;
             background-color: #0b0e14;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             overflow: hidden;
         }}
         #chartArea {{
-            width: 100vw; height: calc(100vh - 35px);
+            width: 100vw; height: 100vh;
             position: absolute; top: 0; left: 0;
         }}
 
-        .fixed-top-box {{
-            position: absolute; top: 6px; left: 8px; z-index: 60;
-            display: flex; flex-direction: column; gap: 4px; pointer-events: none;
-            max-width: calc(100vw - 80px);
-        }}
-        .top-row-1 {{
-            display: flex; align-items: center; gap: 5px; pointer-events: auto; flex-wrap: wrap;
-        }}
-        .sym-group {{
-            display: flex; align-items: center; gap: 5px;
-        }}
-        .badge {{
-            background: #2962ff; color: #fff; font-size: 11px; padding: 2px 5px;
-            border-radius: 3px; font-weight: 700;
-        }}
-        .sym-title {{ font-size: 13px; font-weight: 700; color: #d1d4dc; }}
-        .sym-price {{ font-size: 12px; font-weight: 700; }}
-
-        .tf-bar {{
-            display: flex; gap: 2px; background: rgba(30, 34, 45, 0.95);
-            padding: 2px 4px; border-radius: 4px; border: 1px solid #2a2e39;
-        }}
-        .tf-btn {{
-            background: transparent; border: none; color: #787b86;
-            font-size: 10px; font-weight: 600; padding: 2px 5px;
-            border-radius: 2px; cursor: not-allowed; opacity: 0.45;
-        }}
-        .tf-btn.active {{
-            background: #2962ff; color: #ffffff; font-weight: 700; cursor: default; opacity: 1.0;
-        }}
-
-        .pos-bar {{
-            display: flex; align-items: center; gap: 3px; background: rgba(22, 26, 37, 0.95);
-            padding: 2px 5px; border-radius: 4px; border: 1px solid #363c4e; font-size: 9px;
-            color: #d1d4dc;
-        }}
-        .pos-input {{
-            background: #0b0e14; border: 1px solid #2a2e39; color: #00e5ff;
-            font-size: 9.5px; padding: 1px 3px; border-radius: 2px; text-align: center;
-            font-weight: 700;
-        }}
-        .pos-select {{
-            background: #0b0e14; border: 1px solid #2a2e39; color: #ffd600;
-            font-size: 9.5px; padding: 1px 3px; border-radius: 2px; font-weight: 600;
-            outline: none; cursor: pointer;
-        }}
-
         .tools-bar {{
-            display: flex; align-items: center; gap: 3px; background: rgba(22, 26, 37, 0.95);
-            padding: 2px 5px; border-radius: 4px; border: 1px solid #363c4e; font-size: 9px;
+            position: absolute; top: 8px; left: 12px; z-index: 60;
+            display: flex; align-items: center; gap: 4px; background: rgba(22, 26, 37, 0.95);
+            padding: 3px 6px; border-radius: 4px; border: 1px solid #363c4e;
         }}
         .tool-btn {{
             background: #161a25; border: 1px solid #2a2e39; color: #d1d4dc;
-            font-size: 9px; padding: 2px 5px; border-radius: 3px; cursor: pointer;
+            font-size: 9.5px; padding: 3px 6px; border-radius: 3px; cursor: pointer;
             font-weight: 600;
         }}
         .tool-btn:hover {{ background: #2962ff; color: #ffffff; }}
@@ -720,21 +661,13 @@ html_code = f"""
             to {{ transform: translateX(-50%) scale(1.06); }}
         }}
 
-        .dynamic-ohlc-row {{
-            font-size: 10px; color: #787b86; display: flex; gap: 6px;
-            background: rgba(11, 14, 20, 0.92); padding: 2px 6px;
-            border-radius: 3px; border: 1px solid rgba(42, 46, 57, 0.4);
-            font-family: monospace; width: fit-content;
-        }}
-        .dynamic-ohlc-row b {{ color: #d1d4dc; }}
-
-        /* 3-Column Parallel HUD Table */
+        /* 3-Column Strategy Table */
         .draggable-strategy-box {{
-            position: absolute; bottom: 48px; right: 65px; z-index: 60;
+            position: absolute; bottom: 35px; right: 55px; z-index: 60;
             background: rgba(19, 23, 34, 0.97); border: 1px solid #2a2e39;
             border-radius: 6px; font-size: 9.5px; color: #d1d4dc; overflow: hidden;
             box-shadow: 0 4px 18px rgba(0,0,0,0.9); cursor: grab; user-select: none;
-            touch-action: none; min-width: 330px;
+            touch-action: none; min-width: 320px;
         }}
         .draggable-strategy-box:active {{ cursor: grabbing; }}
         .box-drag-handle {{
@@ -759,7 +692,7 @@ html_code = f"""
         .text-trail {{ color: #2962ff; font-weight: bold; }}
         .text-stage {{ color: #00e5ff; font-size: 8.5px; font-weight: bold; }}
 
-        /* Multi-Instance Floating Tool Item */
+        /* Position Box */
         .tv-widget-item {{
             position: absolute; z-index: 55; user-select: none; touch-action: none;
             font-family: sans-serif; border-radius: 4px; overflow: visible;
@@ -771,7 +704,6 @@ html_code = f"""
         }}
         .tv-pos-green {{ background: rgba(8, 153, 129, 0.40); border: 1.5px solid #089981; }}
         .tv-pos-red {{ background: rgba(242, 54, 69, 0.40); border: 1.5px solid #f23645; }}
-        
         .tv-touch-circle {{
             position: absolute; right: 4px; width: 14px; height: 14px;
             background: #ffffff; border: 2px solid #2962ff; border-radius: 50%;
@@ -782,7 +714,6 @@ html_code = f"""
             background: #2962ff; border: 2px solid #ffffff; border-radius: 50%;
             cursor: move; touch-action: none; z-index: 68; top: -5px;
         }}
-
         .tv-del-btn {{
             position: absolute; top: -9px; right: -9px; z-index: 70;
             background: #1e222d; border: 1px solid #f23645; color: #f23645;
@@ -790,18 +721,8 @@ html_code = f"""
             display: flex; align-items: center; justify-content: center; cursor: pointer;
             box-shadow: 0 2px 6px rgba(0,0,0,0.8); font-weight: 800;
         }}
-        .tv-del-btn:hover {{ background: #f23645; color: #ffffff; }}
 
-        .chart-click-crosshair {{
-            cursor: crosshair !important;
-        }}
-
-        .history-signal-tag {{
-            position: absolute; z-index: 55; pointer-events: none; display: none;
-            background: rgba(22, 26, 37, 0.96); border: 1px solid #363c4e; border-radius: 5px;
-            padding: 5px 8px; font-size: 9.5px; color: #d1d4dc; line-height: 1.4;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.7); transform: translate(-50%, -100%);
-        }}
+        .chart-click-crosshair {{ cursor: crosshair !important; }}
     </style>
 </head>
 <body>
@@ -809,121 +730,26 @@ html_code = f"""
         🚨 SIGNAL CONFIRMED! [TAP TO MUTE] 🔇
     </div>
 
-    <div class="fixed-top-box">
-        <div class="top-row-1">
-            <div class="sym-group">
-                <span class="badge">50</span>
-                <span class="sym-title">NIFTY</span>
-                <span class="sym-price" style="color: {chg_color};">{curr['close']:.2f} <span style="font-size: 10px;">{chg_str}</span></span>
-            </div>
-
-            <div class="tf-bar">
-                <button class="tf-btn" disabled>1m</button>
-                <button class="tf-btn" disabled>3m</button>
-                <button class="tf-btn active">5m</button>
-                <button class="tf-btn" disabled>15m</button>
-                <button class="tf-btn" disabled>30m</button>
-                <button class="tf-btn" disabled>1h</button>
-                <button class="tf-btn" disabled>1D</button>
-            </div>
-
-            <!-- Option Sizing Bar: Strike + Expiry + CE/PE + Lots -->
-            <div class="pos-bar">
-                <span>Strike:</span>
-                <select id="strikeSelect" class="pos-select" onchange="applyOptionContractChange()"></select>
-                <span>Exp:</span>
-                <select id="expirySelect" class="pos-select" onchange="applyOptionContractChange()"></select>
-                <select id="typeSelect" class="pos-select" onchange="applyOptionContractChange()">
-                    <option value="CE" {'selected' if active_type_sel == 'CE' else ''}>CE</option>
-                    <option value="PE" {'selected' if active_type_sel == 'PE' else ''}>PE</option>
-                </select>
-                <span>Live LTP: <b id="dispLTP" style="color: #ffd600;">₹{live_real_ltp:.2f}</b></span>
-                <span>Lots:</span>
-                <input id="lotCount" class="pos-input" type="number" style="width: 32px;" value="{active_lot_sel}" onchange="applyOptionContractChange()" />
-                <span>Qty: <b id="totalQty" style="color:#00bfa5;">{active_lot_sel * LOT_SIZE_QTY}</b></span>
-            </div>
-
-            <!-- Multi-Instance Visual Trading Tools Bar -->
-            <div class="tools-bar">
-                <button id="btnFibR" class="tool-btn" onclick="activateDrawMode('FIB_RETRACE')">+ Fib Retrace</button>
-                <button id="btnFibE" class="tool-btn" onclick="activateDrawMode('FIB_EXT')">+ Fib Ext</button>
-                <button id="btnLong" class="tool-btn" onclick="activateDrawMode('LONG')">+ Long Tool</button>
-                <button id="btnShort" class="tool-btn" onclick="activateDrawMode('SHORT')">+ Short Tool</button>
-            </div>
-
-            <button id="alarmBtn" class="alarm-toggle-btn" onclick="toggleAudioAlarm()">
-                🔔 <span id="alarmTxt">Audio</span>
-            </button>
-        </div>
-
-        <div id="ohlcRow" class="dynamic-ohlc-row">
-            <span>O: <b id="barO">{curr['open']:.2f}</b></span>
-            <span>H: <b id="barH">{curr['high']:.2f}</b></span>
-            <span>L: <b id="barL">{curr['low']:.2f}</b></span>
-            <span>C: <b id="barC">{curr['close']:.2f}</b></span>
-            <span>VWAP: <b id="barVWAP" style="color:#ab47bc;">{curr['vwap']:.2f}</b></span>
-            <span>EMA: <b id="barEMA" style="color:#2962ff;">{curr['ema9']:.2f}</b></span>
-        </div>
+    <!-- Drawing Tools -->
+    <div class="tools-bar">
+        <button id="btnFibR" class="tool-btn" onclick="activateDrawMode('FIB_RETRACE')">+ Fib Retrace</button>
+        <button id="btnFibE" class="tool-btn" onclick="activateDrawMode('FIB_EXT')">+ Fib Ext</button>
+        <button id="btnLong" class="tool-btn" onclick="activateDrawMode('LONG')">+ Long Tool</button>
+        <button id="btnShort" class="tool-btn" onclick="activateDrawMode('SHORT')">+ Short Tool</button>
+        <button id="alarmBtn" class="alarm-toggle-btn" onclick="toggleAudioAlarm()">
+            🔔 <span id="alarmTxt">Audio</span>
+        </button>
     </div>
 
-    <!-- Draggable HUD Strategy Table -->
     <div id="strategyBox" class="draggable-strategy-box" style="display: none;"></div>
-
-    <!-- Container for Multi-Instance Dynamic Overlays -->
     <div id="activeToolsContainer"></div>
-
-    <div id="historyTag" class="history-signal-tag"></div>
     <div id="chartArea"></div>
 
     <script>
-        // 1. Populate Strikes
-        const strikeList = {strikes_json};
-        const activeStrike = "{active_strike_sel}";
-        const strikeDropdown = document.getElementById('strikeSelect');
-        strikeList.forEach(stk => {{
-            const opt = document.createElement('option');
-            opt.value = stk.toString();
-            opt.innerText = stk.toString();
-            if (stk.toString() === activeStrike) opt.selected = true;
-            strikeDropdown.appendChild(opt);
-        }});
-
-        // 2. Populate Expiries
-        const expList = {expiries_json};
-        const activeExp = "{active_exp_sel}";
-        const expDropdown = document.getElementById('expirySelect');
-        if (expList && expList.length > 0) {{
-            expList.forEach(exp => {{
-                const opt = document.createElement('option');
-                opt.value = exp;
-                opt.innerText = exp;
-                if (exp === activeExp) opt.selected = true;
-                expDropdown.appendChild(opt);
-            }});
-        }} else {{
-            const opt = document.createElement('option');
-            opt.value = "CURRENT";
-            opt.innerText = "CURRENT";
-            expDropdown.appendChild(opt);
-        }}
-
-        // Dynamic Reload with Contract Parameters
-        function applyOptionContractChange() {{
-            const stk = document.getElementById('strikeSelect').value;
-            const exp = document.getElementById('expirySelect').value;
-            const typ = document.getElementById('typeSelect').value;
-            const lots = document.getElementById('lotCount').value;
-            const url = new URL(window.parent.location.href);
-            url.searchParams.set('opt_strike', stk);
-            url.searchParams.set('opt_exp', exp);
-            url.searchParams.set('opt_type', typ);
-            url.searchParams.set('opt_lots', lots);
-            window.parent.location.href = url.href;
-        }}
-
-        const LOT_SIZE = {LOT_SIZE_QTY};
         const activeRealLTP = {live_real_ltp};
         const activeDelta = {active_delta};
+        const activeQty = {total_qty};
+        const activeContractLabel = "{selected_strike} {selected_type}";
 
         let audioCtx = null;
         let alarmUnlocked = localStorage.getItem('nifty_alarm_active') === 'true';
@@ -990,9 +816,7 @@ html_code = f"""
 
         const shouldRingAlarm = {play_alarm_flag};
         updateAlarmButtonUI();
-
         const isSilenced = sessionStorage.getItem('alarm_silenced_for_session') === 'true';
-
         if (shouldRingAlarm && alarmUnlocked && !isSilenced) {{
             document.getElementById('ringingBanner').style.display = 'block';
             alarmTimer = setInterval(() => {{
@@ -1004,7 +828,7 @@ html_code = f"""
         const container = document.getElementById('chartArea');
         const chart = LightweightCharts.createChart(container, {{
             width: window.innerWidth,
-            height: window.innerHeight - 35,
+            height: window.innerHeight,
             layout: {{
                 background: {{ color: '#0b0e14' }},
                 textColor: '#787b86',
@@ -1023,8 +847,6 @@ html_code = f"""
                 borderColor: '#2a2e39',
                 autoScale: true,
                 scaleMargins: {{ top: 0.12, bottom: 0.20 }},
-                alignLabels: true,
-                entireTextOnly: true
             }},
             timeScale: {{
                 borderColor: '#2a2e39',
@@ -1058,7 +880,7 @@ html_code = f"""
         }});
         volumeSeries.setData({volume_json});
 
-        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
+        // 2 DOTS REMOVED: crosshairMarkerVisible set to false[cite: 5]
         const vwapSeries = chart.addLineSeries({{
             color: '#ab47bc',
             lineWidth: 2,
@@ -1068,7 +890,7 @@ html_code = f"""
         }});
         vwapSeries.setData({vwap_json});
 
-        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
+        // 2 DOTS REMOVED: crosshairMarkerVisible set to false[cite: 5]
         const emaSeries = chart.addLineSeries({{
             color: '#2962ff',
             lineWidth: 1,
@@ -1080,26 +902,11 @@ html_code = f"""
 
         candleSeries.setMarkers({markers_json});
 
-        // 1. Session ORB Lines
-        candleSeries.createPriceLine({{
-            price: {curr_orb_h:.2f},
-            color: '#089981',
-            lineWidth: 2,
-            lineStyle: LightweightCharts.LineStyle.Dashed,
-            axisLabelVisible: true,
-            title: 'ORB HIGH'
-        }});
+        // ORB Lines
+        candleSeries.createPriceLine({{ price: {curr_orb_h:.2f}, color: '#089981', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'ORB HIGH' }});
+        candleSeries.createPriceLine({{ price: {curr_orb_l:.2f}, color: '#f23645', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'ORB LOW' }});
 
-        candleSeries.createPriceLine({{
-            price: {curr_orb_l:.2f},
-            color: '#f23645',
-            lineWidth: 2,
-            lineStyle: LightweightCharts.LineStyle.Dashed,
-            axisLabelVisible: true,
-            title: 'ORB LOW'
-        }});
-
-        // 2. Full Floor Pivot Points (Strictly Previous Day)
+        // Floor Pivots
         const pv = {pivots_json};
         if (pv && pv.P) {{
             candleSeries.createPriceLine({{ price: pv.P, color: '#ffd600', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: 'PIVOT (P)' }});
@@ -1113,7 +920,7 @@ html_code = f"""
             candleSeries.createPriceLine({{ price: pv.PDL, color: '#fb8c00', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'PDL' }});
         }}
 
-        // --- Interactive Click-to-Anchor Drawing Engine ---
+        // Interactive Drawing Tools
         let toolCounter = 0;
         let currentDrawMode = null;
         let drawPoints = [];
@@ -1123,9 +930,7 @@ html_code = f"""
             currentDrawMode = mode;
             drawPoints = [];
             container.classList.add('chart-click-crosshair');
-            ['btnFibR', 'btnFibE', 'btnLong', 'btnShort'].forEach(b => {{
-                document.getElementById(b).classList.remove('active-draw');
-            }});
+            ['btnFibR', 'btnFibE', 'btnLong', 'btnShort'].forEach(b => document.getElementById(b).classList.remove('active-draw'));
             if (mode === 'FIB_RETRACE') document.getElementById('btnFibR').classList.add('active-draw');
             if (mode === 'FIB_EXT') document.getElementById('btnFibE').classList.add('active-draw');
             if (mode === 'LONG') document.getElementById('btnLong').classList.add('active-draw');
@@ -1136,27 +941,22 @@ html_code = f"""
             currentDrawMode = null;
             drawPoints = [];
             container.classList.remove('chart-click-crosshair');
-            ['btnFibR', 'btnFibE', 'btnLong', 'btnShort'].forEach(b => {{
-                document.getElementById(b).classList.remove('active-draw');
-            }});
+            ['btnFibR', 'btnFibE', 'btnLong', 'btnShort'].forEach(b => document.getElementById(b).classList.remove('active-draw'));
         }}
 
         chart.subscribeClick(param => {{
             if (!currentDrawMode || !param.point) return;
             const price = candleSeries.coordinateToPrice(param.point.y);
             if (!price) return;
-
             drawPoints.push({{ price: price, x: param.point.x, y: param.point.y }});
 
             if (currentDrawMode === 'LONG' || currentDrawMode === 'SHORT') {{
                 spawnInteractivePositionWidget(currentDrawMode, price, param.point.x, param.point.y);
                 cancelDrawMode();
-            }}
-            else if (currentDrawMode === 'FIB_RETRACE' && drawPoints.length === 2) {{
+            }} else if (currentDrawMode === 'FIB_RETRACE' && drawPoints.length === 2) {{
                 spawnTwoPointFibRetrace(drawPoints[0], drawPoints[1]);
                 cancelDrawMode();
-            }}
-            else if (currentDrawMode === 'FIB_EXT' && drawPoints.length === 3) {{
+            }} else if (currentDrawMode === 'FIB_EXT' && drawPoints.length === 3) {{
                 spawnThreePointFibExtension(drawPoints[0], drawPoints[1], drawPoints[2]);
                 cancelDrawMode();
             }}
@@ -1165,15 +965,7 @@ html_code = f"""
         function spawnInteractivePositionWidget(type, entryPrice, clickX, clickY) {{
             toolCounter++;
             const wId = 'pos_w_' + toolCounter;
-            const wObj = {{
-                id: wId,
-                type: type,
-                entryPrice: entryPrice,
-                tgtPts: 60.0,
-                slPts: 25.0,
-                domElem: null
-            }};
-
+            const wObj = {{ id: wId, type: type, entryPrice: entryPrice, tgtPts: 60.0, slPts: 25.0, domElem: null }};
             const wElem = document.createElement('div');
             wElem.className = 'tv-widget-item';
             wElem.style.left = (clickX - 40) + 'px';
@@ -1187,13 +979,10 @@ html_code = f"""
         }}
 
         function renderSinglePosWidget(wObj) {{
-            const lots = parseInt(document.getElementById('lotCount').value) || 1;
-            const totalQty = lots * LOT_SIZE;
-
             const optTgtGain = Math.round((wObj.tgtPts * activeDelta) * 10) / 10;
             const optStopLoss = Math.round((wObj.slPts * activeDelta) * 10) / 10;
-            const expectedProfit = Math.round(optTgtGain * totalQty);
-            const expectedLoss = Math.round(optStopLoss * totalQty);
+            const expectedProfit = Math.round(optTgtGain * activeQty);
+            const expectedLoss = Math.round(optStopLoss * activeQty);
             const rr = (wObj.tgtPts / wObj.slPts).toFixed(2);
 
             const pHeight = Math.max(30, Math.round(wObj.tgtPts * 1.5));
@@ -1208,11 +997,11 @@ html_code = f"""
                         <div class="tv-touch-circle" style="top:4px;" onmousedown="resizeWidgetTgt(event, '${{wObj.id}}')" ontouchstart="resizeWidgetTgt(event, '${{wObj.id}}')"></div>
                     </div>
                     <div style="height:3px; background:#2962ff; position:relative;">
-                        <div class="tv-center-handle" title="Drag to re-center Entry" onmousedown="startMovePosEntry(event, '${{wObj.id}}')" ontouchstart="startMovePosEntry(event, '${{wObj.id}}')"></div>
+                        <div class="tv-center-handle" onmousedown="startMovePosEntry(event, '${{wObj.id}}')" ontouchstart="startMovePosEntry(event, '${{wObj.id}}')"></div>
                     </div>
                     <div class="tv-pos-zone tv-pos-red" style="height:${{lHeight}}px;">
                         <span style="font-weight:700; color:#fff;">Stop: -${{wObj.slPts.toFixed(1)}} pts (₹${{expectedLoss}})</span>
-                        <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, activeRealLTP - optStopLoss).toFixed(2)}} | Qty: ${{totalQty}}</span>
+                        <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, activeRealLTP - optStopLoss).toFixed(2)}} | Qty: ${{activeQty}}</span>
                         <div class="tv-touch-circle" style="bottom:4px;" onmousedown="resizeWidgetSL(event, '${{wObj.id}}')" ontouchstart="resizeWidgetSL(event, '${{wObj.id}}')"></div>
                     </div>
                 `;
@@ -1221,11 +1010,11 @@ html_code = f"""
                     <div class="tv-del-btn" onclick="deletePosWidget('${{wObj.id}}')">✕</div>
                     <div class="tv-pos-zone tv-pos-red" style="height:${{lHeight}}px;">
                         <span style="font-weight:700; color:#fff;">Stop: -${{wObj.slPts.toFixed(1)}} pts (₹${{expectedLoss}})</span>
-                        <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, activeRealLTP - optStopLoss).toFixed(2)}} | Qty: ${{totalQty}}</span>
+                        <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, activeRealLTP - optStopLoss).toFixed(2)}} | Qty: ${{activeQty}}</span>
                         <div class="tv-touch-circle" style="top:4px;" onmousedown="resizeWidgetSL(event, '${{wObj.id}}')" ontouchstart="resizeWidgetSL(event, '${{wObj.id}}')"></div>
                     </div>
                     <div style="height:3px; background:#2962ff; position:relative;">
-                        <div class="tv-center-handle" title="Drag to re-center Entry" onmousedown="startMovePosEntry(event, '${{wObj.id}}')" ontouchstart="startMovePosEntry(event, '${{wObj.id}}')"></div>
+                        <div class="tv-center-handle" onmousedown="startMovePosEntry(event, '${{wObj.id}}')" ontouchstart="startMovePosEntry(event, '${{wObj.id}}')"></div>
                     </div>
                     <div class="tv-pos-zone tv-pos-green" style="height:${{pHeight}}px;">
                         <span style="font-weight:700; color:#fff;">Target: +${{wObj.tgtPts.toFixed(1)}} pts (₹${{expectedProfit}})</span>
@@ -1250,11 +1039,9 @@ html_code = f"""
             if (!wObj) return;
             const startY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
             const origTgt = wObj.tgtPts;
-
             function onMove(ev) {{
                 const curY = ev.type.includes('touch') ? ev.touches[0].clientY : ev.clientY;
-                const diff = (startY - curY) * 0.9;
-                wObj.tgtPts = Math.max(10.0, origTgt + (wObj.type === 'LONG' ? diff : -diff));
+                wObj.tgtPts = Math.max(10.0, origTgt + (wObj.type === 'LONG' ? (startY - curY) * 0.9 : (curY - startY) * 0.9));
                 renderSinglePosWidget(wObj);
             }}
             function onUp() {{
@@ -1275,11 +1062,9 @@ html_code = f"""
             if (!wObj) return;
             const startY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
             const origSL = wObj.slPts;
-
             function onMove(ev) {{
                 const curY = ev.type.includes('touch') ? ev.touches[0].clientY : ev.clientY;
-                const diff = (curY - startY) * 0.9;
-                wObj.slPts = Math.max(8.0, origSL + (wObj.type === 'LONG' ? diff : -diff));
+                wObj.slPts = Math.max(8.0, origSL + (wObj.type === 'LONG' ? (curY - startY) * 0.9 : (startY - curY) * 0.9));
                 renderSinglePosWidget(wObj);
             }}
             function onUp() {{
@@ -1301,7 +1086,6 @@ html_code = f"""
             const startY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
             const elem = wObj.domElem;
             const origTop = parseFloat(elem.style.top);
-
             function onMove(ev) {{
                 const curY = ev.type.includes('touch') ? ev.touches[0].clientY : ev.clientY;
                 elem.style.top = (origTop + (curY - startY)) + 'px';
@@ -1323,23 +1107,16 @@ html_code = f"""
             const pHigh = Math.max(pt1.price, pt2.price);
             const pLow = Math.min(pt1.price, pt2.price);
             const range = pHigh - pLow;
-
             const levels = [
-                {{ r: 0.0, p: pHigh, c: '#787b86', lbl: '0.0% (' + pHigh.toFixed(1) + ')' }},
-                {{ r: 0.236, p: pHigh - (range * 0.236), c: '#f23645', lbl: '23.6%' }},
-                {{ r: 0.382, p: pHigh - (range * 0.382), c: '#ff9800', lbl: '38.2%' }},
-                {{ r: 0.500, p: pHigh - (range * 0.500), c: '#4caf50', lbl: '50.0%' }},
-                {{ r: 0.618, p: pHigh - (range * 0.618), c: '#00bcd4', lbl: '61.8% (Golden)' }},
-                {{ r: 0.786, p: pHigh - (range * 0.786), c: '#2196f3', lbl: '78.6%' }},
-                {{ r: 1.0, p: pLow, c: '#787b86', lbl: '100.0% (' + pLow.toFixed(1) + ')' }}
+                {{ p: pHigh, c: '#787b86', lbl: '0.0%' }},
+                {{ p: pHigh - (range * 0.236), c: '#f23645', lbl: '23.6%' }},
+                {{ p: pHigh - (range * 0.382), c: '#ff9800', lbl: '38.2%' }},
+                {{ p: pHigh - (range * 0.500), c: '#4caf50', lbl: '50.0%' }},
+                {{ p: pHigh - (range * 0.618), c: '#00bcd4', lbl: '61.8%' }},
+                {{ p: pHigh - (range * 0.786), c: '#2196f3', lbl: '78.6%' }},
+                {{ p: pLow, c: '#787b86', lbl: '100.0%' }}
             ];
-
-            const createdLines = [];
-            levels.forEach(lv => {{
-                createdLines.push(candleSeries.createPriceLine({{
-                    price: lv.p, color: lv.c, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.SparseDotted, title: lv.lbl
-                }}));
-            }});
+            const lines = levels.map(lv => candleSeries.createPriceLine({{ price: lv.p, color: lv.c, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.SparseDotted, title: lv.lbl }}));
 
             const anchor = document.createElement('div');
             anchor.className = 'tv-widget-item';
@@ -1349,14 +1126,8 @@ html_code = f"""
             anchor.style.border = '1px solid #ffd600';
             anchor.style.padding = '4px 8px';
             anchor.style.width = '140px';
-            anchor.innerHTML = `
-                <div style="font-size:8.5px; color:#ffd600; font-weight:700;">Fib Retrace #${{toolCounter}}</div>
-                <div class="tv-del-btn" title="Delete">✕</div>
-            `;
-            anchor.querySelector('.tv-del-btn').onclick = () => {{
-                createdLines.forEach(l => candleSeries.removePriceLine(l));
-                anchor.remove();
-            }};
+            anchor.innerHTML = `<div style="font-size:8.5px; color:#ffd600; font-weight:700;">Fib Retrace #${{toolCounter}}</div><div class="tv-del-btn">✕</div>`;
+            anchor.querySelector('.tv-del-btn').onclick = () => {{ lines.forEach(l => candleSeries.removePriceLine(l)); anchor.remove(); }};
             makeDraggable(anchor);
             document.getElementById('activeToolsContainer').appendChild(anchor);
         }}
@@ -1371,13 +1142,7 @@ html_code = f"""
                 {{ p: isUp ? (pt3.price + impulse * 1.272) : (pt3.price - impulse * 1.272), lbl: 'Ext 127.2%', c: '#00bfa5' }},
                 {{ p: isUp ? (pt3.price + impulse * 1.618) : (pt3.price - impulse * 1.618), lbl: 'Ext 161.8%', c: '#ff6d00' }}
             ];
-
-            const createdLines = [];
-            levels.forEach(lv => {{
-                createdLines.push(candleSeries.createPriceLine({{
-                    price: lv.p, color: lv.c, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, title: lv.lbl
-                }}));
-            }});
+            const lines = levels.map(lv => candleSeries.createPriceLine({{ price: lv.p, color: lv.c, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, title: lv.lbl }}));
 
             const anchor = document.createElement('div');
             anchor.className = 'tv-widget-item';
@@ -1387,69 +1152,15 @@ html_code = f"""
             anchor.style.border = '1px solid #00bfa5';
             anchor.style.padding = '4px 8px';
             anchor.style.width = '140px';
-            anchor.innerHTML = `
-                <div style="font-size:8.5px; color:#00bfa5; font-weight:700;">Fib Ext #${{toolCounter}}</div>
-                <div class="tv-del-btn" title="Delete">✕</div>
-            `;
-            anchor.querySelector('.tv-del-btn').onclick = () => {{
-                createdLines.forEach(l => candleSeries.removePriceLine(l));
-                anchor.remove();
-            }};
+            anchor.innerHTML = `<div style="font-size:8.5px; color:#00bfa5; font-weight:700;">Fib Ext #${{toolCounter}}</div><div class="tv-del-btn">✕</div>`;
+            anchor.querySelector('.tv-del-btn').onclick = () => {{ lines.forEach(l => candleSeries.removePriceLine(l)); anchor.remove(); }};
             makeDraggable(anchor);
             document.getElementById('activeToolsContainer').appendChild(anchor);
         }}
 
-        // Dynamic 3-Column Parallel Table Calculation (Index Spot vs Option LTP)
+        // Dynamic 3-Column Parallel Table
         const s = {hud_json};
         const table = document.getElementById('strategyBox');
-
-        function updateLivePL() {{
-            const lots = parseInt(document.getElementById('lotCount').value) || 1;
-            const totalQty = lots * LOT_SIZE;
-            document.getElementById('totalQty').innerText = totalQty;
-
-            if (!s || s.is_no_trade) return;
-
-            const optRiskPts = Math.round((s.raw_risk_pts * activeDelta) * 10) / 10;
-            const optSLPrice = Math.max(0.0, Math.round((activeRealLTP - optRiskPts) * 10) / 10);
-            const totalMaxRisk = Math.round(optRiskPts * totalQty);
-
-            const optT1Pts = Math.round((s.raw_target1_pts * activeDelta) * 10) / 10;
-            const optT1Price = Math.round((activeRealLTP + optT1Pts) * 10) / 10;
-            const totalT1Profit = Math.round(optT1Pts * totalQty);
-
-            const optFinalPts = Math.round((s.raw_target_final_pts * activeDelta) * 10) / 10;
-            const optFinalPrice = Math.round((activeRealLTP + optFinalPts) * 10) / 10;
-
-            const optTrailPts = Math.round((s.raw_secured_pts * activeDelta) * 10) / 10;
-            const optTrailPrice = Math.round((activeRealLTP + optTrailPts) * 10) / 10;
-
-            const currentRunningPts = Math.round((s.current_pts * activeDelta) * 10) / 10;
-            const currentTotalProfit = Math.round(currentRunningPts * totalQty);
-            const currentSign = currentTotalProfit >= 0 ? '+' : '';
-            const pnlColor = currentTotalProfit >= 0 ? '#089981' : '#f23645';
-
-            const cellOptEntry = document.getElementById('cellOptEntry');
-            if (cellOptEntry) cellOptEntry.innerText = `₹${{activeRealLTP.toFixed(2)}}`;
-
-            const cellOptSL = document.getElementById('cellOptSL');
-            if (cellOptSL) cellOptSL.innerText = `₹${{optSLPrice.toFixed(2)}} (-₹${{totalMaxRisk}})`;
-
-            const cellOptT1 = document.getElementById('cellOptT1');
-            if (cellOptT1) cellOptT1.innerText = `₹${{optT1Price.toFixed(2)}} (+₹${{totalT1Profit}})`;
-
-            const cellOptFinal = document.getElementById('cellOptFinal');
-            if (cellOptFinal) cellOptFinal.innerText = `₹${{optFinalPrice.toFixed(2)}}`;
-
-            const cellOptTrail = document.getElementById('cellOptTrail');
-            if (cellOptTrail) cellOptTrail.innerText = `₹${{optTrailPrice.toFixed(2)}}`;
-
-            const cellOptSecured = document.getElementById('cellOptSecured');
-            if (cellOptSecured) {{
-                cellOptSecured.innerText = `${{currentSign}}₹${{currentTotalProfit}}`;
-                cellOptSecured.style.color = pnlColor;
-            }}
-        }}
 
         if (s) {{
             table.style.display = 'block';
@@ -1463,6 +1174,25 @@ html_code = f"""
                     </table>
                 `;
             }} else {{
+                const optRiskPts = Math.round((s.raw_risk_pts * activeDelta) * 10) / 10;
+                const optSLPrice = Math.max(0.0, Math.round((activeRealLTP - optRiskPts) * 10) / 10);
+                const totalMaxRisk = Math.round(optRiskPts * activeQty);
+
+                const optT1Pts = Math.round((s.raw_target1_pts * activeDelta) * 10) / 10;
+                const optT1Price = Math.round((activeRealLTP + optT1Pts) * 10) / 10;
+                const totalT1Profit = Math.round(optT1Pts * activeQty);
+
+                const optFinalPts = Math.round((s.raw_target_final_pts * activeDelta) * 10) / 10;
+                const optFinalPrice = Math.round((activeRealLTP + optFinalPts) * 10) / 10;
+
+                const optTrailPts = Math.round((s.raw_secured_pts * activeDelta) * 10) / 10;
+                const optTrailPrice = Math.round((activeRealLTP + optTrailPts) * 10) / 10;
+
+                const currentRunningPts = Math.round((s.current_pts * activeDelta) * 10) / 10;
+                const currentTotalProfit = Math.round(currentRunningPts * activeQty);
+                const currentSign = currentTotalProfit >= 0 ? '+' : '';
+                const pnlColor = currentTotalProfit >= 0 ? '#089981' : '#f23645';
+
                 table.innerHTML = `
                     <div class="box-drag-handle">::: DRAG STRATEGY HUD :::</div>
                     <table>
@@ -1470,7 +1200,7 @@ html_code = f"""
                             <tr>
                                 <th>Parameter</th>
                                 <th>Index (Spot)</th>
-                                <th>Option ({active_strike_sel} {active_type_sel})</th>
+                                <th>Option (${{activeContractLabel}})</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -1486,27 +1216,27 @@ html_code = f"""
                             <tr>
                                 <td class="label-cell">Entry</td>
                                 <td class="val-cell"><b>${{s.entry}}</b></td>
-                                <td id="cellOptEntry" class="opt-cell">₹{live_real_ltp:.2f}</td>
+                                <td class="opt-cell">₹${{activeRealLTP.toFixed(2)}}</td>
                             </tr>
                             <tr>
                                 <td class="label-cell">SL (risk pts)</td>
                                 <td class="val-cell text-red">${{s.sl_risk}}</td>
-                                <td id="cellOptSL" class="opt-cell text-red">-₹0</td>
+                                <td class="opt-cell text-red">₹${{optSLPrice.toFixed(2)}} (-₹${{totalMaxRisk}})</td>
                             </tr>
                             <tr>
                                 <td class="label-cell">Target 1 (3 ATR)</td>
                                 <td class="val-cell text-green">${{s.target1}}</td>
-                                <td id="cellOptT1" class="opt-cell text-green">+₹0</td>
+                                <td class="opt-cell text-green">₹${{optT1Price.toFixed(2)}} (+₹${{totalT1Profit}})</td>
                             </tr>
                             <tr>
                                 <td class="label-cell">Target Final</td>
                                 <td class="val-cell text-green">${{s.target_final}}</td>
-                                <td id="cellOptFinal" class="opt-cell text-green">₹0</td>
+                                <td class="opt-cell text-green">₹${{optFinalPrice.toFixed(2)}}</td>
                             </tr>
                             <tr>
                                 <td class="label-cell">Trailing SL</td>
                                 <td class="val-cell text-trail">${{s.trailing_sl}}</td>
-                                <td id="cellOptTrail" class="opt-cell text-trail">₹0</td>
+                                <td class="opt-cell text-trail">₹${{optTrailPrice.toFixed(2)}}</td>
                             </tr>
                             <tr>
                                 <td class="label-cell">Trail Mode</td>
@@ -1515,7 +1245,7 @@ html_code = f"""
                             <tr>
                                 <td class="label-cell">Secured / Live P&L</td>
                                 <td class="val-cell text-green"><b>${{s.secured_pts}}</b></td>
-                                <td id="cellOptSecured" class="opt-cell" style="font-weight:800;">₹0</td>
+                                <td class="opt-cell" style="font-weight:800; color:${{pnlColor}};">${{currentSign}}₹${{currentTotalProfit}}</td>
                             </tr>
                         </tbody>
                     </table>
@@ -1542,20 +1272,14 @@ html_code = f"""
                 elem.style.left = initLeft + 'px';
                 elem.style.top = initTop + 'px';
             }}
-
             function onMove(e) {{
                 if (!isDragging) return;
                 const clientX = e.type.includes('touch') ? e.touches[0].clientX : e.clientX;
                 const clientY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
-                const dx = clientX - startX;
-                const dy = clientY - startY;
-                elem.style.left = (initLeft + dx) + 'px';
-                elem.style.top = (initTop + dy) + 'px';
+                elem.style.left = (initLeft + (clientX - startX)) + 'px';
+                elem.style.top = (initTop + (clientY - startY)) + 'px';
             }}
-
-            function onEnd() {{
-                isDragging = false;
-            }}
+            function onEnd() {{ isDragging = false; }}
 
             elem.addEventListener('mousedown', onStart);
             window.addEventListener('mousemove', onMove);
@@ -1566,52 +1290,9 @@ html_code = f"""
         }}
 
         makeDraggable(table);
-        updateLivePL();
-
-        // Crosshair Hover Inspector
-        const historyCards = {history_cards_json};
-        const hTag = document.getElementById('historyTag');
-
-        chart.subscribeCrosshairMove(param => {{
-            if (!param.time || !param.seriesData.get(candleSeries)) {{
-                hTag.style.display = 'none';
-                return;
-            }}
-
-            const bar = param.seriesData.get(candleSeries);
-            document.getElementById('barO').innerText = bar.open.toFixed(2);
-            document.getElementById('barH').innerText = bar.high.toFixed(2);
-            document.getElementById('barL').innerText = bar.low.toFixed(2);
-            document.getElementById('barC').innerText = bar.close.toFixed(2);
-            const vBar = param.seriesData.get(vwapSeries);
-            if (vBar) document.getElementById('barVWAP').innerText = vBar.value.toFixed(2);
-            const eBar = param.seriesData.get(emaSeries);
-            if (eBar) document.getElementById('barEMA').innerText = eBar.value.toFixed(2);
-
-            const sig = historyCards[param.time];
-            if (sig && param.point) {{
-                hTag.style.display = 'block';
-                hTag.style.left = param.point.x + 'px';
-                hTag.style.top = (param.point.y - 12) + 'px';
-                const tagColor = sig.type === 'CE' ? '#00bfa5' : '#f23645';
-                hTag.innerHTML = `
-                    <div style="font-weight:bold; color:${{tagColor}}; border-bottom:1px solid #363c4e; padding-bottom:2px; margin-bottom:3px;">
-                        ${{sig.title}}
-                    </div>
-                    <div><b>Entry:</b> ${{sig.entry.toFixed(1)}}</div>
-                    <div><b>Target:</b> ${{sig.target.toFixed(1)}} (+${{sig.target_pts.toFixed(1)}} pts)</div>
-                    <div><b>Stop Loss:</b> ${{sig.sl.toFixed(1)}} (-${{sig.sl_pts.toFixed(1)}} pts)</div>
-                `;
-            }} else {{
-                hTag.style.display = 'none';
-            }}
-        }});
 
         window.addEventListener('resize', () => {{
-            chart.applyOptions({{
-                width: window.innerWidth,
-                height: window.innerHeight - 35
-            }});
+            chart.applyOptions({{ width: window.innerWidth, height: window.innerHeight }});
         }});
     </script>
 </body>
@@ -1620,7 +1301,6 @@ html_code = f"""
 
 components.html(html_code, height=720, scrolling=False)
 
-# 15s live refresh
 st.markdown(
     """
     <script>
