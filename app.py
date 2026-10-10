@@ -291,7 +291,6 @@ if not nfo_df.empty:
         except Exception:
             pass
 
-# Fallback only if exchange is closed and API returns 0
 if live_real_ltp <= 0.0:
     diff = (spot_price - float(selected_strike)) if selected_type == "CE" else (float(selected_strike) - spot_price)
     live_real_ltp = max(1.5, round(max(0.0, diff) + max(20.0, 110.0 - (abs(diff) * 0.15)), 2))
@@ -636,6 +635,13 @@ elif latest_trade_for_hud:
 hud_json = json.dumps(hud_payload)
 play_alarm_flag = "true" if alarm_signal_triggered else "false"
 
+# Price change calculation
+day_open = today_df.iloc[0]["open"]
+chg = curr["close"] - day_open
+chg_pct = (chg / day_open) * 100
+chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
+chg_color = "#089981" if chg >= 0 else "#f23645"
+
 # ----------------- EMBEDDED JAVASCRIPT TERMINAL -----------------
 html_code = f"""
 <!DOCTYPE html>
@@ -656,14 +662,44 @@ html_code = f"""
             position: absolute; top: 0; left: 0;
         }}
 
+        .fixed-top-box {{
+            position: absolute; top: 6px; left: 8px; z-index: 60;
+            display: flex; flex-direction: column; gap: 4px; pointer-events: none;
+            max-width: calc(100vw - 80px);
+        }}
+        .top-row-1 {{
+            display: flex; align-items: center; gap: 6px; pointer-events: auto; flex-wrap: wrap;
+        }}
+        .sym-group {{
+            display: flex; align-items: center; gap: 5px;
+        }}
+        .badge {{
+            background: #2962ff; color: #fff; font-size: 11px; padding: 2px 5px;
+            border-radius: 3px; font-weight: 700;
+        }}
+        .sym-title {{ font-size: 13px; font-weight: 700; color: #d1d4dc; }}
+        .sym-price {{ font-size: 12px; font-weight: 700; }}
+
+        .tf-bar {{
+            display: flex; gap: 2px; background: rgba(30, 34, 45, 0.95);
+            padding: 2px 4px; border-radius: 4px; border: 1px solid #2a2e39;
+        }}
+        .tf-btn {{
+            background: transparent; border: none; color: #787b86;
+            font-size: 10px; font-weight: 600; padding: 2px 5px;
+            border-radius: 2px; cursor: not-allowed; opacity: 0.45;
+        }}
+        .tf-btn.active {{
+            background: #2962ff; color: #ffffff; font-weight: 700; cursor: default; opacity: 1.0;
+        }}
+
         .tools-bar {{
-            position: absolute; top: 8px; left: 12px; z-index: 60;
-            display: flex; align-items: center; gap: 4px; background: rgba(22, 26, 37, 0.95);
-            padding: 3px 6px; border-radius: 4px; border: 1px solid #363c4e;
+            display: flex; align-items: center; gap: 3px; background: rgba(22, 26, 37, 0.95);
+            padding: 2px 5px; border-radius: 4px; border: 1px solid #363c4e; font-size: 9px;
         }}
         .tool-btn {{
             background: #161a25; border: 1px solid #2a2e39; color: #d1d4dc;
-            font-size: 9.5px; padding: 3px 6px; border-radius: 3px; cursor: pointer;
+            font-size: 9px; padding: 2px 5px; border-radius: 3px; cursor: pointer;
             font-weight: 600;
         }}
         .tool-btn:hover {{ background: #2962ff; color: #ffffff; }}
@@ -688,6 +724,14 @@ html_code = f"""
             from {{ transform: translateX(-50%) scale(1); }}
             to {{ transform: translateX(-50%) scale(1.06); }}
         }}
+
+        .dynamic-ohlc-row {{
+            font-size: 10px; color: #787b86; display: flex; gap: 6px;
+            background: rgba(11, 14, 20, 0.92); padding: 2px 6px;
+            border-radius: 3px; border: 1px solid rgba(42, 46, 57, 0.4);
+            font-family: monospace; width: fit-content;
+        }}
+        .dynamic-ohlc-row b {{ color: #d1d4dc; }}
 
         /* 3-Column Strategy Table */
         .draggable-strategy-box {{
@@ -720,7 +764,7 @@ html_code = f"""
         .text-trail {{ color: #2962ff; font-weight: bold; }}
         .text-stage {{ color: #00e5ff; font-size: 8.5px; font-weight: bold; }}
 
-        /* Position Box */
+        /* Position Tools */
         .tv-widget-item {{
             position: absolute; z-index: 55; user-select: none; touch-action: none;
             font-family: sans-serif; border-radius: 4px; overflow: visible;
@@ -751,6 +795,13 @@ html_code = f"""
         }}
 
         .chart-click-crosshair {{ cursor: crosshair !important; }}
+
+        .history-signal-tag {{
+            position: absolute; z-index: 55; pointer-events: none; display: none;
+            background: rgba(22, 26, 37, 0.96); border: 1px solid #363c4e; border-radius: 5px;
+            padding: 5px 8px; font-size: 9.5px; color: #d1d4dc; line-height: 1.4;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.7); transform: translate(-50%, -100%);
+        }}
     </style>
 </head>
 <body>
@@ -758,19 +809,50 @@ html_code = f"""
         🚨 SIGNAL CONFIRMED! [TAP TO MUTE] 🔇
     </div>
 
-    <!-- Drawing Tools -->
-    <div class="tools-bar">
-        <button id="btnFibR" class="tool-btn" onclick="activateDrawMode('FIB_RETRACE')">+ Fib Retrace</button>
-        <button id="btnFibE" class="tool-btn" onclick="activateDrawMode('FIB_EXT')">+ Fib Ext</button>
-        <button id="btnLong" class="tool-btn" onclick="activateDrawMode('LONG')">+ Long Tool</button>
-        <button id="btnShort" class="tool-btn" onclick="activateDrawMode('SHORT')">+ Short Tool</button>
-        <button id="alarmBtn" class="alarm-toggle-btn" onclick="toggleAudioAlarm()">
-            🔔 <span id="alarmTxt">Audio</span>
-        </button>
+    <!-- Top Status Bar & Drawing Controls -->
+    <div class="fixed-top-box">
+        <div class="top-row-1">
+            <div class="sym-group">
+                <span class="badge">50</span>
+                <span class="sym-title">NIFTY</span>
+                <span class="sym-price" style="color: {chg_color};">{curr['close']:.2f} <span style="font-size: 10px;">{chg_str}</span></span>
+            </div>
+
+            <div class="tf-bar">
+                <button class="tf-btn" disabled>1m</button>
+                <button class="tf-btn" disabled>3m</button>
+                <button class="tf-btn active">5m</button>
+                <button class="tf-btn" disabled>15m</button>
+                <button class="tf-btn" disabled>30m</button>
+                <button class="tf-btn" disabled>1h</button>
+                <button class="tf-btn" disabled>1D</button>
+            </div>
+
+            <div class="tools-bar">
+                <button id="btnFibR" class="tool-btn" onclick="activateDrawMode('FIB_RETRACE')">+ Fib Retrace</button>
+                <button id="btnFibE" class="tool-btn" onclick="activateDrawMode('FIB_EXT')">+ Fib Ext</button>
+                <button id="btnLong" class="tool-btn" onclick="activateDrawMode('LONG')">+ Long Tool</button>
+                <button id="btnShort" class="tool-btn" onclick="activateDrawMode('SHORT')">+ Short Tool</button>
+            </div>
+
+            <button id="alarmBtn" class="alarm-toggle-btn" onclick="toggleAudioAlarm()">
+                🔔 <span id="alarmTxt">Audio</span>
+            </button>
+        </div>
+
+        <div id="ohlcRow" class="dynamic-ohlc-row">
+            <span>O: <b id="barO">{curr['open']:.2f}</b></span>
+            <span>H: <b id="barH">{curr['high']:.2f}</b></span>
+            <span>L: <b id="barL">{curr['low']:.2f}</b></span>
+            <span>C: <b id="barC">{curr['close']:.2f}</b></span>
+            <span>VWAP: <b id="barVWAP" style="color:#ab47bc;">{curr['vwap']:.2f}</b></span>
+            <span>EMA: <b id="barEMA" style="color:#2962ff;">{curr['ema9']:.2f}</b></span>
+        </div>
     </div>
 
     <div id="strategyBox" class="draggable-strategy-box" style="display: none;"></div>
     <div id="activeToolsContainer"></div>
+    <div id="historyTag" class="history-signal-tag"></div>
     <div id="chartArea"></div>
 
     <script>
@@ -1186,7 +1268,7 @@ html_code = f"""
             document.getElementById('activeToolsContainer').appendChild(anchor);
         }}
 
-        // Dynamic 3-Column Parallel Table
+        // Dynamic 3-Column Strategy HUD Table
         const s = {hud_json};
         const table = document.getElementById('strategyBox');
 
@@ -1318,6 +1400,45 @@ html_code = f"""
         }}
 
         makeDraggable(table);
+
+        // Historical Signal Inspector & Dynamic OHLC Inspector
+        const historyCards = {history_cards_json};
+        const hTag = document.getElementById('historyTag');
+
+        chart.subscribeCrosshairMove(param => {{
+            if (!param.time || !param.seriesData.get(candleSeries)) {{
+                hTag.style.display = 'none';
+                return;
+            }}
+
+            const bar = param.seriesData.get(candleSeries);
+            document.getElementById('barO').innerText = bar.open.toFixed(2);
+            document.getElementById('barH').innerText = bar.high.toFixed(2);
+            document.getElementById('barL').innerText = bar.low.toFixed(2);
+            document.getElementById('barC').innerText = bar.close.toFixed(2);
+            const vBar = param.seriesData.get(vwapSeries);
+            if (vBar) document.getElementById('barVWAP').innerText = vBar.value.toFixed(2);
+            const eBar = param.seriesData.get(emaSeries);
+            if (eBar) document.getElementById('barEMA').innerText = eBar.value.toFixed(2);
+
+            const sig = historyCards[param.time];
+            if (sig && param.point) {{
+                hTag.style.display = 'block';
+                hTag.style.left = param.point.x + 'px';
+                hTag.style.top = (param.point.y - 12) + 'px';
+                const tagColor = sig.type === 'CE' ? '#00bfa5' : '#f23645';
+                hTag.innerHTML = `
+                    <div style="font-weight:bold; color:${{tagColor}}; border-bottom:1px solid #363c4e; padding-bottom:2px; margin-bottom:3px;">
+                        ${{sig.title}}
+                    </div>
+                    <div><b>Entry:</b> ${{sig.entry.toFixed(1)}}</div>
+                    <div><b>Target:</b> ${{sig.target.toFixed(1)}} (+${{sig.target_pts.toFixed(1)}} pts)</div>
+                    <div><b>Stop Loss:</b> ${{sig.sl.toFixed(1)}} (-${{sig.sl_pts.toFixed(1)}} pts)</div>
+                `;
+            }} else {{
+                hTag.style.display = 'none';
+            }}
+        }});
 
         window.addEventListener('resize', () => {{
             chart.applyOptions({{ width: window.innerWidth, height: window.innerHeight }});
