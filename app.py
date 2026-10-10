@@ -21,7 +21,7 @@ st.markdown(
 <style>
     #MainMenu, footer, header {display: none !important;}
     .block-container {
-        padding: 4px 10px !important;
+        padding: 4px 8px !important;
         margin: 0 !important;
         max-width: 100vw !important;
         height: 100vh !important;
@@ -36,7 +36,7 @@ st.markdown(
         display: none !important;
     }
     div[data-testid="column"] {
-        padding: 0 4px !important;
+        padding: 0 3px !important;
     }
     div[data-testid="stSelectbox"] label, div[data-testid="stNumberInput"] label {
         display: none !important;
@@ -46,13 +46,15 @@ st.markdown(
         color: #ffd600 !important;
         border: 1px solid #2a2e39 !important;
         border-radius: 4px !important;
-        font-size: 12px !important;
+        font-size: 11px !important;
+        min-height: 32px !important;
     }
     iframe {
         border: none !important;
         width: 100vw !important;
-        height: calc(100vh - 65px) !important;
+        height: calc(100vh - 55px) !important;
         display: block !important;
+        overflow: hidden !important;
     }
     body {
         background-color: #0b0e14;
@@ -131,9 +133,9 @@ def fetch_nifty_candles():
     current_end = now_dt
 
     for _ in range(4):
-        chunk_start = current_end - datetime.timedelta(days=6)
+        chunk_start = current_end - datetime.timedelta(days=7)
         from_str = chunk_start.strftime("%Y-%m-%d 09:15")
-        to_str = current_end.strftime("%Y-%m-%d %H:%M")
+        to_str = current_end.strftime("%Y-%m-%d 15:30")
 
         try:
             resp = api.getCandleData(
@@ -167,6 +169,8 @@ def fetch_nifty_candles():
         df[col] = pd.to_numeric(df[col])
 
     df = df[(df["open"] > 1000) & (df["high"] > 1000) & (df["low"] > 1000) & (df["close"] > 1000)].copy()
+    
+    # Keep full market session up to 15:30 candle without clipping
     df = df[
         (df["dt"].dt.time >= datetime.time(9, 15))
         & (df["dt"].dt.time <= datetime.time(15, 30))
@@ -237,7 +241,7 @@ if len(unique_dates) >= 2:
             "PDH": pdh, "PDL": pdl
         }
 
-# ATM ± 1000 Strikes
+# ATM ± 1000 Strikes (41 strikes)
 atm_strike = int(round(spot_price / 50.0) * 50)
 strikes_list = [atm_strike + (x * 50) for x in range(-20, 21)]
 
@@ -251,8 +255,8 @@ if not nfo_df.empty:
     else:
         available_expiries = nfo_df["expiry"].dropna().drop_duplicates().tolist()
 
-# ----------------- LIVE CONTROLS ROW -----------------
-ctrl_cols = st.columns([1.3, 1.4, 0.8, 0.8, 4.7])
+# Controls Row
+ctrl_cols = st.columns([1.2, 1.4, 0.8, 0.8, 4.8])
 
 with ctrl_cols[0]:
     default_strike_idx = strikes_list.index(atm_strike) if atm_strike in strikes_list else 20
@@ -304,7 +308,7 @@ pcr_value = round(total_pe_oi / max(total_ce_oi, 1), 2)
 oi_res_strike = max(ce_oi_map, key=ce_oi_map.get) if ce_oi_map else atm_strike + 200
 oi_sup_strike = max(pe_oi_map, key=pe_oi_map.get) if pe_oi_map else atm_strike - 200
 
-# Live Quote from Angel One for the exact selected contract
+# Live Quote from Angel One for selected contract
 live_real_ltp = 0.0
 target_symbol = ""
 target_token = ""
@@ -338,13 +342,13 @@ adv_count = int(min(45, max(10, 25 + int((curr["close"] - df.iloc[0]["open"]) / 
 dec_count = 50 - adv_count
 ad_ratio = round(adv_count / max(dec_count, 1), 2)
 
-# Display real-time stats pill
+# Top Bar Metrics Display
 with ctrl_cols[4]:
     st.markdown(
         f"""
-        <div style="background:#161a25; border:1px solid #2a2e39; border-radius:4px; padding:5px 10px; display:flex; gap:12px; align-items:center; font-size:12px; height:38px;">
+        <div style="background:#161a25; border:1px solid #2a2e39; border-radius:4px; padding:3px 8px; display:flex; gap:10px; align-items:center; font-size:11px; height:32px;">
             <div>Contract: <b style="color:#00e5ff;">{target_symbol or f'NIFTY{sel_expiry}{sel_strike}{sel_type}'}</b></div>
-            <div>LTP: <b style="color:#ffd600; font-size:14px;">₹{live_real_ltp:.2f}</b></div>
+            <div>LTP: <b style="color:#ffd600; font-size:13px;">₹{live_real_ltp:.2f}</b></div>
             <div>Qty: <b style="color:#089981;">{total_qty}</b> ({sel_lots}L)</div>
             <div>Delta: <b style="color:#ab47bc;">{active_delta:.2f}</b></div>
             <div>PCR: <b style="color:#00e5ff;">{pcr_value}</b></div>
@@ -704,9 +708,9 @@ html_code = f"""
         }}
 
         #topHeaderArea {{
-            width: 100vw; height: 44px;
+            width: 100vw; height: 40px;
             background: #0b0e14;
-            padding: 3px 8px;
+            padding: 2px 8px;
             display: flex; align-items: center; justify-content: space-between;
             z-index: 60; flex-shrink: 0;
             border-bottom: 1px solid #161a25;
@@ -765,10 +769,10 @@ html_code = f"""
         }}
         .dynamic-ohlc-row b {{ color: #d1d4dc; }}
 
-        /* Hand icon removed: standard default cursor restored */
+        /* Chart Area Pinned Explicitly to Ensure Time Axis Sits Above Taskbar */
         #chartArea {{
             width: 100vw;
-            height: calc(100vh - 44px);
+            height: calc(100vh - 40px);
             position: relative;
             flex: 1 1 auto;
             overflow: hidden;
@@ -776,7 +780,7 @@ html_code = f"""
         }}
 
         .draggable-strategy-box {{
-            position: absolute; bottom: 30px; right: 55px; z-index: 60;
+            position: absolute; bottom: 35px; right: 55px; z-index: 60;
             background: rgba(19, 23, 34, 0.97); border: 1px solid #2a2e39;
             border-radius: 6px; font-size: 9.5px; color: #d1d4dc; overflow: hidden;
             box-shadow: 0 4px 18px rgba(0,0,0,0.9); cursor: grab; user-select: none;
@@ -974,7 +978,6 @@ html_code = f"""
             }}, 2000);
         }}
 
-        // Smooth Panning and Scaling Enabled with Default Pointer Cursor
         const chartContainer = document.getElementById('chartArea');
         const chart = LightweightCharts.createChart(chartContainer, {{
             width: chartContainer.clientWidth,
@@ -1007,16 +1010,18 @@ html_code = f"""
             rightPriceScale: {{
                 borderColor: '#2a2e39',
                 autoScale: true,
-                scaleMargins: {{ top: 0.10, bottom: 0.22 }},
+                scaleMargins: {{ top: 0.08, bottom: 0.18 }},
                 entireTextOnly: true,
             }},
             timeScale: {{
                 borderColor: '#2a2e39',
                 timeVisible: true,
                 secondsVisible: false,
-                rightOffset: 8,
+                rightOffset: 12,
                 barSpacing: 6,
                 minBarSpacing: 1.5,
+                fixLeftEdge: false,
+                fixRightEdge: false,
             }},
             localization: {{
                 priceFormatter: p => p.toFixed(2)
@@ -1082,6 +1087,7 @@ html_code = f"""
             candleSeries.createPriceLine({{ price: pv.PDL, color: '#fb8c00', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'PDL' }});
         }}
 
+        // Dynamic Expiry-Specific OI Levels
         candleSeries.createPriceLine({{ price: {oi_res_strike}, color: '#e91e63', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'OI RES' }});
         candleSeries.createPriceLine({{ price: {oi_sup_strike}, color: '#00e676', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'OI SUP' }});
 
@@ -1509,7 +1515,7 @@ html_code = f"""
 </html>
 """
 
-components.html(html_code, height=720, scrolling=False)
+components.html(html_code, scrolling=False)
 
 # 15s auto-refresh polling
 st.markdown(
