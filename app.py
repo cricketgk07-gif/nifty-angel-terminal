@@ -221,8 +221,9 @@ if len(unique_dates) >= 2:
 atm_strike = int(round(spot_price / 50.0) * 50)
 strikes_list = [atm_strike + (x * 50) for x in range(-20, 21)]
 
-# Extract contract expiries
+# Extract contract expiries & multi-strike option live LTP engine
 available_expiries = []
+multi_expiry_matrix = {}
 today_dt = datetime.datetime.now(IST).date()
 
 if not nfo_df.empty:
@@ -232,44 +233,47 @@ if not nfo_df.empty:
     else:
         available_expiries = nfo_df["expiry"].dropna().drop_duplicates().tolist()
 
-# Read Query Parameters from URL
-params = st.query_params
-active_strike_sel = str(params.get("opt_strike", str(atm_strike)))
-active_exp_sel = str(params.get("opt_exp", available_expiries[0] if available_expiries else "CURRENT"))
-active_type_sel = str(params.get("opt_type", "CE")).upper()
-active_lot_sel = int(params.get("opt_lots", 1))
+    for exp in available_expiries[:4]:
+        exp_slice = nfo_df[nfo_df["expiry"] == exp]
+        multi_expiry_matrix[exp] = {}
+        for s_val in strikes_list:
+            ce_m = exp_slice[(exp_slice["strike_num"] == s_val) & (exp_slice["symbol"].str.endswith("CE"))]
+            pe_m = exp_slice[(exp_slice["strike_num"] == s_val) & (exp_slice["symbol"].str.endswith("PE"))]
 
-# Live Order-Book LTP from SmartAPI
-live_real_ltp = 0.0
+            ce_price = 0.0
+            if not ce_m.empty:
+                try:
+                    q = api.ltpData("NFO", str(ce_m.iloc[0]["symbol"]), str(ce_m.iloc[0]["token"]))
+                    if isinstance(q, dict) and q.get("status") and q.get("data"):
+                        ce_price = float(q["data"].get("ltp", 0.0))
+                except Exception:
+                    pass
 
-if not nfo_df.empty:
-    match_scrip = nfo_df[
-        (nfo_df["strike_num"] == float(active_strike_sel))
-        & (nfo_df["symbol"].str.endswith(active_type_sel))
-        & (nfo_df["expiry"] == active_exp_sel)
-    ]
-    if not match_scrip.empty:
-        sym = str(match_scrip.iloc[0]["symbol"])
-        tok = str(match_scrip.iloc[0]["token"])
-        try:
-            # Correct positional arguments signature for SmartAPI
-            quote_res = api.ltpData("NFO", sym, tok)
-            if isinstance(quote_res, dict) and quote_res.get("status") and quote_res.get("data"):
-                ltp_val = float(quote_res["data"].get("ltp", 0.0))
-                if ltp_val > 0.0:
-                    live_real_ltp = ltp_val
-        except Exception:
-            pass
+            pe_price = 0.0
+            if not pe_m.empty:
+                try:
+                    q = api.ltpData("NFO", str(pe_m.iloc[0]["symbol"]), str(pe_m.iloc[0]["token"]))
+                    if isinstance(q, dict) and q.get("status") and q.get("data"):
+                        pe_price = float(q["data"].get("ltp", 0.0))
+                except Exception:
+                    pass
 
-if live_real_ltp <= 0.0:
-    stk_f = float(active_strike_sel)
-    diff = (spot_price - stk_f) if active_type_sel == "CE" else (stk_f - spot_price)
-    live_real_ltp = max(1.5, round(max(0.0, diff) + max(20.0, 110.0 - (abs(diff) * 0.15)), 2))
+            ce_diff = spot_price - s_val
+            pe_diff = s_val - spot_price
+            if ce_price <= 0.0:
+                ce_price = max(1.5, round(max(0.0, ce_diff) + max(20.0, 100.0 - (abs(ce_diff) * 0.14)), 2))
+            if pe_price <= 0.0:
+                pe_price = max(1.5, round(max(0.0, pe_diff) + max(20.0, 100.0 - (abs(pe_diff) * 0.14)), 2))
 
-# Dynamic Delta Calculation
-diff_val = (spot_price - float(active_strike_sel)) if active_type_sel == "CE" else (float(active_strike_sel) - spot_price)
-active_delta = round(min(0.95, max(0.05, 0.50 + (diff_val / 800.0))), 2)
+            ce_delta = round(min(0.95, max(0.05, 0.50 + (ce_diff / 800.0))), 2)
+            pe_delta = round(min(0.95, max(0.05, 0.50 + (pe_diff / 800.0))), 2)
 
+            multi_expiry_matrix[exp][str(s_val)] = {
+                "CE": {"price": ce_price, "delta": ce_delta},
+                "PE": {"price": pe_price, "delta": pe_delta},
+            }
+
+multi_matrix_json = json.dumps(multi_expiry_matrix)
 strikes_json = json.dumps(strikes_list)
 expiries_json = json.dumps(available_expiries)
 
@@ -831,17 +835,17 @@ html_code = f"""
             <!-- Option Sizing Bar: Strike + Expiry + CE/PE + Lots -->
             <div class="pos-bar">
                 <span>Strike:</span>
-                <select id="strikeSelect" class="pos-select" onchange="applyOptionContractChange()"></select>
+                <select id="strikeSelect" class="pos-select" onchange="onOptionSelectionChanged()"></select>
                 <span>Exp:</span>
-                <select id="expirySelect" class="pos-select" onchange="applyOptionContractChange()"></select>
-                <select id="typeSelect" class="pos-select" onchange="applyOptionContractChange()">
-                    <option value="CE" {'selected' if active_type_sel == 'CE' else ''}>CE</option>
-                    <option value="PE" {'selected' if active_type_sel == 'PE' else ''}>PE</option>
+                <select id="expirySelect" class="pos-select" onchange="onOptionSelectionChanged()"></select>
+                <select id="typeSelect" class="pos-select" onchange="onOptionSelectionChanged()">
+                    <option value="CE" selected>CE</option>
+                    <option value="PE">PE</option>
                 </select>
-                <span>Live LTP: <b id="dispLTP" style="color: #ffd600;">₹{live_real_ltp:.2f}</b></span>
+                <span>Live LTP: <b id="dispLTP" style="color: #ffd600;">₹0.00</b></span>
                 <span>Lots:</span>
-                <input id="lotCount" class="pos-input" type="number" style="width: 32px;" value="{active_lot_sel}" onchange="applyOptionContractChange()" />
-                <span>Qty: <b id="totalQty" style="color:#00bfa5;">{active_lot_sel * LOT_SIZE_QTY}</b></span>
+                <input id="lotCount" class="pos-input" type="number" style="width: 32px;" value="1" onchange="onLotsChanged()" />
+                <span>Qty: <b id="totalQty" style="color:#00bfa5;">65</b></span>
             </div>
 
             <!-- Multi-Instance Visual Trading Tools Bar -->
@@ -877,28 +881,28 @@ html_code = f"""
     <div id="chartArea"></div>
 
     <script>
-        // 1. Populate Strikes
+        const multiMatrix = {multi_matrix_json};
         const strikeList = {strikes_json};
-        const activeStrike = "{active_strike_sel}";
+        const activeStrike = {atm_strike};
+        const expList = {expiries_json};
+        const LOT_SIZE = {LOT_SIZE_QTY};
+
         const strikeDropdown = document.getElementById('strikeSelect');
         strikeList.forEach(stk => {{
             const opt = document.createElement('option');
             opt.value = stk.toString();
             opt.innerText = stk.toString();
-            if (stk.toString() === activeStrike) opt.selected = true;
+            if (stk === activeStrike) opt.selected = true;
             strikeDropdown.appendChild(opt);
         }});
 
-        // 2. Populate Expiries
-        const expList = {expiries_json};
-        const activeExp = "{active_exp_sel}";
         const expDropdown = document.getElementById('expirySelect');
         if (expList && expList.length > 0) {{
-            expList.forEach(exp => {{
+            expList.forEach((exp, idx) => {{
                 const opt = document.createElement('option');
                 opt.value = exp;
                 opt.innerText = exp;
-                if (exp === activeExp) opt.selected = true;
+                if (idx === 0) opt.selected = true;
                 expDropdown.appendChild(opt);
             }});
         }} else {{
@@ -908,23 +912,28 @@ html_code = f"""
             expDropdown.appendChild(opt);
         }}
 
-        // Dynamic Reload with Contract Parameters
-        function applyOptionContractChange() {{
-            const stk = document.getElementById('strikeSelect').value;
-            const exp = document.getElementById('expirySelect').value;
-            const typ = document.getElementById('typeSelect').value;
-            const lots = document.getElementById('lotCount').value;
-            const url = new URL(window.parent.location.href);
-            url.searchParams.set('opt_strike', stk);
-            url.searchParams.set('opt_exp', exp);
-            url.searchParams.set('opt_type', typ);
-            url.searchParams.set('opt_lots', lots);
-            window.parent.location.href = url.href;
+        function getActiveOptionData() {{
+            const sVal = document.getElementById('strikeSelect').value;
+            const eVal = document.getElementById('expirySelect').value;
+            const tVal = document.getElementById('typeSelect').value;
+
+            if (multiMatrix[eVal] && multiMatrix[eVal][sVal] && multiMatrix[eVal][sVal][tVal]) {{
+                return multiMatrix[eVal][sVal][tVal];
+            }}
+            return {{ price: 82.95, delta: 0.50 }};
         }}
 
-        const LOT_SIZE = {LOT_SIZE_QTY};
-        const activeRealLTP = {live_real_ltp};
-        const activeDelta = {active_delta};
+        function onOptionSelectionChanged() {{
+            const optData = getActiveOptionData();
+            document.getElementById('dispLTP').innerText = '₹' + optData.price.toFixed(2);
+            updateLivePL();
+            refreshAllPositionWidgets();
+        }}
+
+        function onLotsChanged() {{
+            updateLivePL();
+            refreshAllPositionWidgets();
+        }}
 
         let audioCtx = null;
         let alarmUnlocked = localStorage.getItem('nifty_alarm_active') === 'true';
@@ -1059,18 +1068,22 @@ html_code = f"""
         }});
         volumeSeries.setData({volume_json});
 
+        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
         const vwapSeries = chart.addLineSeries({{
             color: '#ab47bc',
             lineWidth: 2,
             title: 'VWAP',
+            crosshairMarkerVisible: false,
             priceFormat: {{ type: 'price', precision: 2, minMove: 0.05 }}
         }});
         vwapSeries.setData({vwap_json});
 
+        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
         const emaSeries = chart.addLineSeries({{
             color: '#2962ff',
             lineWidth: 1,
             title: '9-EMA',
+            crosshairMarkerVisible: false,
             priceFormat: {{ type: 'price', precision: 2, minMove: 0.05 }}
         }});
         emaSeries.setData({ema_json});
@@ -1186,9 +1199,11 @@ html_code = f"""
         function renderSinglePosWidget(wObj) {{
             const lots = parseInt(document.getElementById('lotCount').value) || 1;
             const totalQty = lots * LOT_SIZE;
+            const optData = getActiveOptionData();
+            const delta = optData.delta;
 
-            const optTgtGain = Math.round((wObj.tgtPts * activeDelta) * 10) / 10;
-            const optStopLoss = Math.round((wObj.slPts * activeDelta) * 10) / 10;
+            const optTgtGain = Math.round((wObj.tgtPts * delta) * 10) / 10;
+            const optStopLoss = Math.round((wObj.slPts * delta) * 10) / 10;
             const expectedProfit = Math.round(optTgtGain * totalQty);
             const expectedLoss = Math.round(optStopLoss * totalQty);
             const rr = (wObj.tgtPts / wObj.slPts).toFixed(2);
@@ -1201,7 +1216,7 @@ html_code = f"""
                     <div class="tv-del-btn" onclick="deletePosWidget('${{wObj.id}}')">✕</div>
                     <div class="tv-pos-zone tv-pos-green" style="height:${{pHeight}}px;">
                         <span style="font-weight:700; color:#fff;">Target: +${{wObj.tgtPts.toFixed(1)}} pts (₹${{expectedProfit}})</span>
-                        <span style="color:#d1d4dc;">Opt Tgt: ₹${{(activeRealLTP + optTgtGain).toFixed(2)}} | 1:${{rr}}</span>
+                        <span style="color:#d1d4dc;">Opt Tgt: ₹${{(optData.price + optTgtGain).toFixed(2)}} | 1:${{rr}}</span>
                         <div class="tv-touch-circle" style="top:4px;" onmousedown="resizeWidgetTgt(event, '${{wObj.id}}')" ontouchstart="resizeWidgetTgt(event, '${{wObj.id}}')"></div>
                     </div>
                     <div style="height:3px; background:#2962ff; position:relative;">
@@ -1209,7 +1224,7 @@ html_code = f"""
                     </div>
                     <div class="tv-pos-zone tv-pos-red" style="height:${{lHeight}}px;">
                         <span style="font-weight:700; color:#fff;">Stop: -${{wObj.slPts.toFixed(1)}} pts (₹${{expectedLoss}})</span>
-                        <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, activeRealLTP - optStopLoss).toFixed(2)}} | Qty: ${{totalQty}}</span>
+                        <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, optData.price - optStopLoss).toFixed(2)}} | Qty: ${{totalQty}}</span>
                         <div class="tv-touch-circle" style="bottom:4px;" onmousedown="resizeWidgetSL(event, '${{wObj.id}}')" ontouchstart="resizeWidgetSL(event, '${{wObj.id}}')"></div>
                     </div>
                 `;
@@ -1218,7 +1233,7 @@ html_code = f"""
                     <div class="tv-del-btn" onclick="deletePosWidget('${{wObj.id}}')">✕</div>
                     <div class="tv-pos-zone tv-pos-red" style="height:${{lHeight}}px;">
                         <span style="font-weight:700; color:#fff;">Stop: -${{wObj.slPts.toFixed(1)}} pts (₹${{expectedLoss}})</span>
-                        <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, activeRealLTP - optStopLoss).toFixed(2)}} | Qty: ${{totalQty}}</span>
+                        <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, optData.price - optStopLoss).toFixed(2)}} | Qty: ${{totalQty}}</span>
                         <div class="tv-touch-circle" style="top:4px;" onmousedown="resizeWidgetSL(event, '${{wObj.id}}')" ontouchstart="resizeWidgetSL(event, '${{wObj.id}}')"></div>
                     </div>
                     <div style="height:3px; background:#2962ff; position:relative;">
@@ -1226,7 +1241,7 @@ html_code = f"""
                     </div>
                     <div class="tv-pos-zone tv-pos-green" style="height:${{pHeight}}px;">
                         <span style="font-weight:700; color:#fff;">Target: +${{wObj.tgtPts.toFixed(1)}} pts (₹${{expectedProfit}})</span>
-                        <span style="color:#d1d4dc;">Opt Tgt: ₹${{(activeRealLTP + optTgtGain).toFixed(2)}} | 1:${{rr}}</span>
+                        <span style="color:#d1d4dc;">Opt Tgt: ₹${{(optData.price + optTgtGain).toFixed(2)}} | 1:${{rr}}</span>
                         <div class="tv-touch-circle" style="bottom:4px;" onmousedown="resizeWidgetTgt(event, '${{wObj.id}}')" ontouchstart="resizeWidgetTgt(event, '${{wObj.id}}')"></div>
                     </div>
                 `;
@@ -1239,6 +1254,10 @@ html_code = f"""
                 activePositionWidgets[idx].domElem.remove();
                 activePositionWidgets.splice(idx, 1);
             }}
+        }}
+
+        function refreshAllPositionWidgets() {{
+            activePositionWidgets.forEach(w => renderSinglePosWidget(w));
         }}
 
         function resizeWidgetTgt(e, id) {{
@@ -1405,29 +1424,38 @@ html_code = f"""
             const totalQty = lots * LOT_SIZE;
             document.getElementById('totalQty').innerText = totalQty;
 
+            const optData = getActiveOptionData();
+            const optPrice = optData.price;
+            const delta = optData.delta;
+
+            const optHeader = document.getElementById('optTableHead');
+            const sVal = document.getElementById('strikeSelect').value;
+            const tVal = document.getElementById('typeSelect').value;
+            if (optHeader) optHeader.innerText = `Option (${{sVal}} ${{tVal}})`;
+
             if (!s || s.is_no_trade) return;
 
-            const optRiskPts = Math.round((s.raw_risk_pts * activeDelta) * 10) / 10;
-            const optSLPrice = Math.max(0.0, Math.round((activeRealLTP - optRiskPts) * 10) / 10);
+            const optRiskPts = Math.round((s.raw_risk_pts * delta) * 10) / 10;
+            const optSLPrice = Math.max(0.0, Math.round((optPrice - optRiskPts) * 10) / 10);
             const totalMaxRisk = Math.round(optRiskPts * totalQty);
 
-            const optT1Pts = Math.round((s.raw_target1_pts * activeDelta) * 10) / 10;
-            const optT1Price = Math.round((activeRealLTP + optT1Pts) * 10) / 10;
+            const optT1Pts = Math.round((s.raw_target1_pts * delta) * 10) / 10;
+            const optT1Price = Math.round((optPrice + optT1Pts) * 10) / 10;
             const totalT1Profit = Math.round(optT1Pts * totalQty);
 
-            const optFinalPts = Math.round((s.raw_target_final_pts * activeDelta) * 10) / 10;
-            const optFinalPrice = Math.round((activeRealLTP + optFinalPts) * 10) / 10;
+            const optFinalPts = Math.round((s.raw_target_final_pts * delta) * 10) / 10;
+            const optFinalPrice = Math.round((optPrice + optFinalPts) * 10) / 10;
 
-            const optTrailPts = Math.round((s.raw_secured_pts * activeDelta) * 10) / 10;
-            const optTrailPrice = Math.round((activeRealLTP + optTrailPts) * 10) / 10;
+            const optTrailPts = Math.round((s.raw_secured_pts * delta) * 10) / 10;
+            const optTrailPrice = Math.round((optPrice + optTrailPts) * 10) / 10;
 
-            const currentRunningPts = Math.round((s.current_pts * activeDelta) * 10) / 10;
+            const currentRunningPts = Math.round((s.current_pts * delta) * 10) / 10;
             const currentTotalProfit = Math.round(currentRunningPts * totalQty);
             const currentSign = currentTotalProfit >= 0 ? '+' : '';
             const pnlColor = currentTotalProfit >= 0 ? '#089981' : '#f23645';
 
             const cellOptEntry = document.getElementById('cellOptEntry');
-            if (cellOptEntry) cellOptEntry.innerText = `₹${{activeRealLTP.toFixed(2)}}`;
+            if (cellOptEntry) cellOptEntry.innerText = `₹${{optPrice.toFixed(2)}}`;
 
             const cellOptSL = document.getElementById('cellOptSL');
             if (cellOptSL) cellOptSL.innerText = `₹${{optSLPrice.toFixed(2)}} (-₹${{totalMaxRisk}})`;
@@ -1467,7 +1495,7 @@ html_code = f"""
                             <tr>
                                 <th>Parameter</th>
                                 <th>Index (Spot)</th>
-                                <th>Option ({active_strike_sel} {active_type_sel})</th>
+                                <th id="optTableHead">Option</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -1483,7 +1511,7 @@ html_code = f"""
                             <tr>
                                 <td class="label-cell">Entry</td>
                                 <td class="val-cell"><b>${{s.entry}}</b></td>
-                                <td id="cellOptEntry" class="opt-cell">₹{live_real_ltp:.2f}</td>
+                                <td id="cellOptEntry" class="opt-cell">₹0.00</td>
                             </tr>
                             <tr>
                                 <td class="label-cell">SL (risk pts)</td>
@@ -1563,7 +1591,7 @@ html_code = f"""
         }}
 
         makeDraggable(table);
-        updateLivePL();
+        onOptionSelectionChanged();
 
         // Crosshair Hover Card
         const historyCards = {history_cards_json};
