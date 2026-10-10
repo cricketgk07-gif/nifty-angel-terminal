@@ -246,7 +246,7 @@ with col4:
     selected_lots = st.number_input("Lots", min_value=1, max_value=100, value=1, step=1)
 
 # Fetch Exact Live Market LTP via SmartAPI
-live_option_ltp = 0.0
+live_real_ltp = 0.0
 target_symbol = ""
 target_token = ""
 
@@ -262,7 +262,7 @@ if not nfo_df.empty:
         try:
             res = api.ltpData("NFO", target_symbol, target_token)
             if isinstance(res, dict) and res.get("status") and res.get("data"):
-                live_option_ltp = float(res["data"].get("ltp", 0.0))
+                live_real_ltp = float(res["data"].get("ltp", 0.0))
         except Exception:
             pass
 
@@ -277,7 +277,7 @@ with col5:
         f"""
         <div style="background:#161a25; border:1px solid #2a2e39; border-radius:5px; padding:6px 12px; margin-top:20px; display:flex; gap:16px; align-items:center;">
             <div>Contract: <b style="color:#00e5ff;">{target_symbol or 'NIFTY OPT'}</b></div>
-            <div>Live LTP: <b style="color:#ffd600; font-size:16px;">₹{live_option_ltp:.2f}</b></div>
+            <div>Live LTP: <b style="color:#ffd600; font-size:16px;">₹{live_real_ltp:.2f}</b></div>
             <div>Qty: <b style="color:#089981;">{total_qty}</b> ({selected_lots}L)</div>
             <div>Delta: <b style="color:#ab47bc;">{active_delta}</b></div>
         </div>
@@ -880,7 +880,7 @@ html_code = f"""
         }});
         volumeSeries.setData({volume_json});
 
-        // 2 DOTS REMOVED: crosshairMarkerVisible set to false[cite: 5]
+        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
         const vwapSeries = chart.addLineSeries({{
             color: '#ab47bc',
             lineWidth: 2,
@@ -890,7 +890,7 @@ html_code = f"""
         }});
         vwapSeries.setData({vwap_json});
 
-        // 2 DOTS REMOVED: crosshairMarkerVisible set to false[cite: 5]
+        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
         const emaSeries = chart.addLineSeries({{
             color: '#2962ff',
             lineWidth: 1,
