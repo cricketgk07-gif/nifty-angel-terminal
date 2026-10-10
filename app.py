@@ -237,7 +237,7 @@ if len(unique_dates) >= 2:
             "PDH": pdh, "PDL": pdl
         }
 
-# ATM ± 1000 Strikes (41 strikes)
+# ATM ± 1000 Strikes
 atm_strike = int(round(spot_price / 50.0) * 50)
 strikes_list = [atm_strike + (x * 50) for x in range(-20, 21)]
 
@@ -765,17 +765,14 @@ html_code = f"""
         }}
         .dynamic-ohlc-row b {{ color: #d1d4dc; }}
 
-        /* Chart Canvas Area strictly sized for time axis visibility */
+        /* Hand icon removed: standard default cursor restored */
         #chartArea {{
             width: 100vw;
             height: calc(100vh - 44px);
             position: relative;
             flex: 1 1 auto;
             overflow: hidden;
-            cursor: grab;
-        }}
-        #chartArea:active {{
-            cursor: grabbing;
+            cursor: default !important;
         }}
 
         .draggable-strategy-box {{
@@ -977,7 +974,7 @@ html_code = f"""
             }}, 2000);
         }}
 
-        // Full Interactive Dragging and Scaling Enabled
+        // Smooth Panning and Scaling Enabled with Default Pointer Cursor
         const chartContainer = document.getElementById('chartArea');
         const chart = LightweightCharts.createChart(chartContainer, {{
             width: chartContainer.clientWidth,
@@ -1047,6 +1044,7 @@ html_code = f"""
         }});
         volumeSeries.setData({volume_json});
 
+        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
         const vwapSeries = chart.addLineSeries({{
             color: '#ab47bc',
             lineWidth: 2,
@@ -1056,6 +1054,7 @@ html_code = f"""
         }});
         vwapSeries.setData({vwap_json});
 
+        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
         const emaSeries = chart.addLineSeries({{
             color: '#2962ff',
             lineWidth: 1,
