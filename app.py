@@ -190,7 +190,7 @@ if df is None or len(df) == 0:
 curr = df.iloc[-1]
 spot_price = float(curr["close"])
 
-# --- Previous Day Floor Pivots ---
+# Previous Day Floor Pivots
 unique_dates = sorted(df["date"].unique())
 pivot_lines_data = {}
 
@@ -230,7 +230,7 @@ if not nfo_df.empty:
     else:
         available_expiries = nfo_df["expiry"].dropna().drop_duplicates().tolist()
 
-# Normal Cumulative Distribution Function (Black-Scholes Delta)
+# Black-Scholes Greeks Calculation
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
@@ -241,8 +241,8 @@ def compute_dynamic_greeks(s, k, days_to_exp, iv=0.14, r=0.07):
     pe_delta = round(ce_delta - 1.0, 2)
     return ce_delta, abs(pe_delta)
 
-# Pre-compute Dynamic Greeks & Pricing Across Expiries
-pricing_bundle = {}
+# Build Complete Pricing Bundle Across Strikes & Expiries
+option_pricing_bundle = {}
 total_ce_oi = 0
 total_pe_oi = 0
 ce_oi_map = {}
@@ -254,7 +254,7 @@ if not nfo_df.empty:
         exp_dt_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_dt
         days_to_expiry = max((exp_dt_val - today_dt).days, 1)
 
-        pricing_bundle[exp] = {}
+        option_pricing_bundle[exp] = {}
         for s in strikes_list:
             ce_scrip = exp_slice[(exp_slice["strike_num"] == s) & (exp_slice["symbol"].str.endswith("CE"))]
             pe_scrip = exp_slice[(exp_slice["strike_num"] == s) & (exp_slice["symbol"].str.endswith("PE"))]
@@ -264,16 +264,13 @@ if not nfo_df.empty:
             ce_tok = str(ce_scrip.iloc[0]["token"]) if not ce_scrip.empty else ""
             pe_tok = str(pe_scrip.iloc[0]["token"]) if not pe_scrip.empty else ""
 
-            # Dynamic Contract-Specific Black-Scholes Delta
             ce_delta, pe_delta = compute_dynamic_greeks(spot_price, s, days_to_expiry)
 
-            # Intrinsic + Time-decay approximation
             ce_diff = spot_price - s
             pe_diff = s - spot_price
             ce_approx = max(1.5, round(max(0.0, ce_diff) + (math.sqrt(days_to_expiry) * 22.0) - (abs(ce_diff) * 0.08), 2))
             pe_approx = max(1.5, round(max(0.0, pe_diff) + (math.sqrt(days_to_expiry) * 22.0) - (abs(pe_diff) * 0.08), 2))
 
-            # OI distribution weightings
             weight = max(1, 40 - abs(strikes_list.index(s) - strikes_list.index(atm_strike)))
             ce_oi = int(weight * 85000 + (s * 3))
             pe_oi = int(weight * 92000 + (s * 2))
@@ -282,22 +279,22 @@ if not nfo_df.empty:
             ce_oi_map[s] = ce_oi_map.get(s, 0) + ce_oi
             pe_oi_map[s] = pe_oi_map.get(s, 0) + pe_oi
 
-            pricing_bundle[exp][str(s)] = {
+            option_pricing_bundle[exp][str(s)] = {
                 "CE": {"symbol": ce_sym, "token": ce_tok, "delta": ce_delta, "ltp": ce_approx, "oi": ce_oi},
                 "PE": {"symbol": pe_sym, "token": pe_tok, "delta": pe_delta, "ltp": pe_approx, "oi": pe_oi},
             }
 
-# Fetch true order-book quote for ATM contract
+# Order-book query for active ATM CE contract
 primary_exp = available_expiries[0] if available_expiries else "CURRENT"
-if primary_exp in pricing_bundle and str(atm_strike) in pricing_bundle[primary_exp]:
-    atm_ce = pricing_bundle[primary_exp][str(atm_strike)]["CE"]
+if primary_exp in option_pricing_bundle and str(atm_strike) in option_pricing_bundle[primary_exp]:
+    atm_ce = option_pricing_bundle[primary_exp][str(atm_strike)]["CE"]
     if atm_ce["token"]:
         try:
             res = api.ltpData("NFO", atm_ce["symbol"], atm_ce["token"])
             if isinstance(res, dict) and res.get("status") and res.get("data"):
                 q_ltp = float(res["data"].get("ltp", 0.0))
                 if q_ltp > 0.0:
-                    pricing_bundle[primary_exp][str(atm_strike)]["CE"]["ltp"] = q_ltp
+                    option_pricing_bundle[primary_exp][str(atm_strike)]["CE"]["ltp"] = q_ltp
         except Exception:
             pass
 
@@ -306,7 +303,7 @@ pcr_value = round(total_pe_oi / max(total_ce_oi, 1), 2)
 oi_resistance_strike = max(ce_oi_map, key=ce_oi_map.get) if ce_oi_map else atm_strike + 200
 oi_support_strike = max(pe_oi_map, key=pe_oi_map.get) if pe_oi_map else atm_strike - 200
 
-# Market Breadth (Advances / Declines Proxy from Nifty Session Candles)
+# Market Breadth Advances/Declines
 adv_count = int(min(45, max(10, 25 + int((curr["close"] - df.iloc[0]["open"]) / 8.0))))
 dec_count = 50 - adv_count
 ad_ratio = round(adv_count / max(dec_count, 1), 2)
@@ -557,14 +554,6 @@ volume_data = [
     for _, r in df.iterrows()
 ]
 
-candles_json = json.dumps(candles_data)
-volume_json = json.dumps(volume_data)
-vwap_json = json.dumps([{"time": int(r["time"]), "value": round(float(r["vwap"]), 2)} for _, r in df.iterrows()])
-ema_json = json.dumps([{"time": int(r["time"]), "value": round(float(r["ema9"]), 2)} for _, r in df.iterrows()])
-markers_json = json.dumps(markers)
-history_cards_json = json.dumps(historical_trade_cards)
-pivots_json = json.dumps(pivot_lines_data)
-
 hud_payload = None
 if trade_executed_in_latest_session and latest_trade_for_hud:
     is_ce = latest_trade_for_hud["type"] == "CE"
@@ -631,6 +620,17 @@ elif latest_trade_for_hud:
         "theme": "#089981" if is_ce else "#f23645",
     }
 
+# All JSON variables guaranteed to be created before HTML string
+pricing_bundle_json = json.dumps(option_pricing_bundle)
+strikes_json = json.dumps(strikes_list)
+expiries_json = json.dumps(available_expiries)
+candles_json = json.dumps(candles_data)
+volume_json = json.dumps(volume_data)
+vwap_json = json.dumps([{"time": int(r["time"]), "value": round(float(r["vwap"]), 2)} for _, r in df.iterrows()])
+ema_json = json.dumps([{"time": int(r["time"]), "value": round(float(r["ema9"]), 2)} for _, r in df.iterrows()])
+markers_json = json.dumps(markers)
+history_cards_json = json.dumps(historical_trade_cards)
+pivots_json = json.dumps(pivot_lines_data)
 hud_json = json.dumps(hud_payload)
 play_alarm_flag = "true" if alarm_signal_triggered else "false"
 
@@ -641,7 +641,7 @@ chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
-# --- 100% Client-Side Terminal With No Dim/Flicker ---
+# Embedded Web Terminal
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -658,7 +658,6 @@ html_code = f"""
             display: flex; flex-direction: column;
         }}
 
-        /* Header Viewport Constrained */
         #topHeaderArea {{
             width: 100vw; height: 62px;
             background: #0b0e14;
@@ -694,7 +693,6 @@ html_code = f"""
             background: #2962ff; color: #ffffff; font-weight: 700; cursor: default; opacity: 1.0;
         }}
 
-        /* Client-Side Native Controls Strip (NO FLICKER) */
         .client-controls-bar {{
             display: flex; align-items: center; gap: 4px; background: rgba(22, 26, 37, 0.95);
             padding: 2px 5px; border-radius: 4px; border: 1px solid #363c4e; font-size: 9.5px;
@@ -743,14 +741,12 @@ html_code = f"""
         }}
         .dynamic-ohlc-row b {{ color: #d1d4dc; }}
 
-        /* Chart Canvas Constrained - Perfect Time Axis Visibility */
         #chartArea {{
             width: 100vw; height: calc(100vh - 62px);
             position: relative; flex-grow: 1;
             overflow: hidden;
         }}
 
-        /* 3-Column Strategy HUD Table */
         .draggable-strategy-box {{
             position: absolute; bottom: 25px; right: 55px; z-index: 60;
             background: rgba(19, 23, 34, 0.97); border: 1px solid #2a2e39;
@@ -780,7 +776,6 @@ html_code = f"""
         .text-trail {{ color: #2962ff; font-weight: bold; }}
         .text-stage {{ color: #00e5ff; font-size: 8.5px; font-weight: bold; }}
 
-        /* Position Tools */
         .tv-widget-item {{
             position: absolute; z-index: 55; user-select: none; touch-action: none;
             font-family: sans-serif; border-radius: 4px; overflow: visible;
@@ -836,7 +831,6 @@ html_code = f"""
         🚨 SIGNAL CONFIRMED! [TAP TO MUTE] 🔇
     </div>
 
-    <!-- Top Integrated Header -->
     <div id="topHeaderArea">
         <div class="top-row-1">
             <div class="sym-group">
@@ -855,7 +849,7 @@ html_code = f"""
                 <button class="tf-btn" disabled>1D</button>
             </div>
 
-            <!-- Client-Side Controls (Instant Switching, Zero Dull Flicker) -->
+            <!-- Client-Side Controls: Instant switching without dull flicker -->
             <div class="client-controls-bar">
                 <span>Strike:</span>
                 <select id="clientStrike" class="client-select" onchange="onOptionChanged()"></select>
@@ -872,7 +866,6 @@ html_code = f"""
                 <span>Delta: <b id="clientDelta" style="color: #ab47bc;">0.50</b></span>
             </div>
 
-            <!-- Market Breadth & Sentiment Pills -->
             <div class="info-pill">PCR: <b style="color:#00e5ff;">{pcr_value}</b></div>
             <div class="info-pill">A/D: <b style="color:#089981;">{adv_count}:{dec_count}</b> ({ad_ratio})</div>
             <div class="info-pill">OI Res: <b style="color:#f23645;">{oi_resistance_strike}</b></div>
@@ -900,7 +893,6 @@ html_code = f"""
         </div>
     </div>
 
-    <!-- Chart & Dynamic Overlays -->
     <div id="chartArea"></div>
     <div id="strategyBox" class="draggable-strategy-box" style="display: none;"></div>
     <div id="activeToolsContainer"></div>
@@ -1028,7 +1020,6 @@ html_code = f"""
             }}, 2000);
         }}
 
-        // Strict Viewport Resizing: Solves Timeframe Axis Overflow
         const chartContainer = document.getElementById('chartArea');
         const chart = LightweightCharts.createChart(chartContainer, {{
             width: chartContainer.clientWidth,
@@ -1084,7 +1075,6 @@ html_code = f"""
         }});
         volumeSeries.setData({volume_json});
 
-        // 2 DOTS REMOVED: crosshairMarkerVisible: false
         const vwapSeries = chart.addLineSeries({{
             color: '#ab47bc',
             lineWidth: 2,
@@ -1094,7 +1084,6 @@ html_code = f"""
         }});
         vwapSeries.setData({vwap_json});
 
-        // 2 DOTS REMOVED: crosshairMarkerVisible: false
         const emaSeries = chart.addLineSeries({{
             color: '#2962ff',
             lineWidth: 1,
@@ -1109,7 +1098,6 @@ html_code = f"""
         candleSeries.createPriceLine({{ price: {curr_orb_h:.2f}, color: '#089981', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'ORB HIGH' }});
         candleSeries.createPriceLine({{ price: {curr_orb_l:.2f}, color: '#f23645', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'ORB LOW' }});
 
-        // Floor Pivots
         const pv = {pivots_json};
         if (pv && pv.P) {{
             candleSeries.createPriceLine({{ price: pv.P, color: '#ffd600', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: 'PIVOT (P)' }});
@@ -1123,11 +1111,9 @@ html_code = f"""
             candleSeries.createPriceLine({{ price: pv.PDL, color: '#fb8c00', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'PDL' }});
         }}
 
-        // OI Key Resistance & Support Reference Lines
         candleSeries.createPriceLine({{ price: {oi_resistance_strike}, color: '#e91e63', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'OI RESISTANCE' }});
         candleSeries.createPriceLine({{ price: {oi_support_strike}, color: '#00e676', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'OI SUPPORT' }});
 
-        // Interactive Drawing Tools
         let toolCounter = 0;
         let currentDrawMode = null;
         let drawPoints = [];
@@ -1369,7 +1355,6 @@ html_code = f"""
             document.getElementById('activeToolsContainer').appendChild(anchor);
         }}
 
-        // Dynamic Strategy HUD
         const s = {hud_json};
         const table = document.getElementById('strategyBox');
 
@@ -1506,7 +1491,6 @@ html_code = f"""
 
         makeDraggable(table);
 
-        // Historical Signal Inspector & Dynamic OHLC Inspector
         const historyCards = {history_cards_json};
         const hTag = document.getElementById('historyTag');
 
@@ -1545,7 +1529,6 @@ html_code = f"""
             }}
         }});
 
-        // Responsive Resizer to Keep Timeframe Axis in Viewport
         function resizeChartProperly() {{
             const w = chartContainer.clientWidth;
             const h = chartContainer.clientHeight;
@@ -1555,7 +1538,6 @@ html_code = f"""
         window.addEventListener('resize', resizeChartProperly);
         setTimeout(resizeChartProperly, 250);
 
-        // Initial Boot Setup
         onOptionChanged();
     </script>
 </body>
