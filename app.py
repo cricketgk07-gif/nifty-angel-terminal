@@ -16,19 +16,19 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# 1. CSS to completely kill the dull/bright reload flicker and fit taskbar perfectly
+# 1. Eliminate dull grey reload flicker and fix viewport overflow
 st.markdown(
     """
 <style>
     #MainMenu, footer, header {display: none !important;}
     .block-container {
-        padding: 4px 10px !important;
+        padding: 2px 8px !important;
         margin: 0 !important;
         max-width: 100vw !important;
         height: 100vh !important;
         overflow: hidden !important;
     }
-    /* Eliminate dull grey flicker when Streamlit reruns */
+    /* Suppress Streamlit's dull-grey dimming overlay during reloads */
     .stApp[data-test-script-state="running"] {
         opacity: 1 !important;
         filter: none !important;
@@ -37,9 +37,8 @@ st.markdown(
     div[data-testid="stStatusWidget"] {
         display: none !important;
     }
-    /* Clean horizontal controls row */
     div[data-testid="column"] {
-        padding: 0 4px !important;
+        padding: 0 3px !important;
     }
     div[data-testid="stSelectbox"] label, div[data-testid="stNumberInput"] label {
         display: none !important;
@@ -49,13 +48,15 @@ st.markdown(
         color: #ffd600 !important;
         border: 1px solid #2a2e39 !important;
         border-radius: 4px !important;
-        font-size: 12px !important;
+        font-size: 11px !important;
+        min-height: 32px !important;
     }
     iframe {
         border: none !important;
         width: 100vw !important;
-        height: calc(100vh - 65px) !important;
+        height: calc(100vh - 46px) !important;
         display: block !important;
+        overflow: hidden !important;
     }
     body {
         background-color: #0b0e14;
@@ -128,10 +129,9 @@ nfo_df = load_nfo_scrip_master()
 
 
 def fetch_nifty_candles():
-    now_ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
-    now_dt = datetime.datetime.now(now_ist)
+    now_ist = datetime.datetime.now(IST)
     collected_frames = []
-    current_end = now_dt
+    current_end = now_ist
 
     for _ in range(4):
         chunk_start = current_end - datetime.timedelta(days=6)
@@ -255,7 +255,7 @@ if not nfo_df.empty:
         available_expiries = nfo_df["expiry"].dropna().drop_duplicates().tolist()
 
 # ----------------- LIVE PYTHON CONTROLS ROW -----------------
-ctrl_cols = st.columns([1.3, 1.4, 0.8, 0.8, 4.7])
+ctrl_cols = st.columns([1.2, 1.4, 0.8, 0.8, 4.8])
 
 with ctrl_cols[0]:
     default_strike_idx = strikes_list.index(atm_strike) if atm_strike in strikes_list else 20
@@ -280,14 +280,14 @@ def compute_contract_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
     ce_delta = norm_cdf(d1)
     return round(ce_delta if is_ce else (1.0 - ce_delta), 2)
 
-# Expiry Specific Calculations
+# Expiry-Specific Calculation: Delta, Days to Expiry
 exp_slice = nfo_df[nfo_df["expiry"] == sel_expiry] if not nfo_df.empty else pd.DataFrame()
 exp_date_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_dt
 days_to_expiry = max((exp_date_val - today_dt).days, 1)
 
 active_delta = compute_contract_delta(spot_price, float(sel_strike), days_to_expiry, is_ce=(sel_type == "CE"))
 
-# Expiry Specific PCR and OI Max Levels
+# Expiry-Specific PCR and OI Levels
 ce_oi_map = {}
 pe_oi_map = {}
 total_ce_oi = 0
@@ -307,7 +307,7 @@ pcr_value = round(total_pe_oi / max(total_ce_oi, 1), 2)
 oi_res_strike = max(ce_oi_map, key=ce_oi_map.get) if ce_oi_map else atm_strike + 200
 oi_sup_strike = max(pe_oi_map, key=pe_oi_map.get) if pe_oi_map else atm_strike - 200
 
-# Live Quote from Angel One for the exact selected contract
+# Direct Exchange Quote from Angel One for the selected contract
 live_real_ltp = 0.0
 target_symbol = ""
 target_token = ""
@@ -341,13 +341,13 @@ adv_count = int(min(45, max(10, 25 + int((curr["close"] - df.iloc[0]["open"]) / 
 dec_count = 50 - adv_count
 ad_ratio = round(adv_count / max(dec_count, 1), 2)
 
-# Display real-time stats pill
+# Top Metrics Row
 with ctrl_cols[4]:
     st.markdown(
         f"""
-        <div style="background:#161a25; border:1px solid #2a2e39; border-radius:4px; padding:5px 10px; display:flex; gap:12px; align-items:center; font-size:12px; height:38px;">
+        <div style="background:#161a25; border:1px solid #2a2e39; border-radius:4px; padding:3px 8px; display:flex; gap:10px; align-items:center; font-size:11px; height:32px;">
             <div>Contract: <b style="color:#00e5ff;">{target_symbol or f'NIFTY{sel_expiry}{sel_strike}{sel_type}'}</b></div>
-            <div>LTP: <b style="color:#ffd600; font-size:14px;">₹{live_real_ltp:.2f}</b></div>
+            <div>LTP: <b style="color:#ffd600; font-size:13px;">₹{live_real_ltp:.2f}</b></div>
             <div>Qty: <b style="color:#089981;">{total_qty}</b> ({sel_lots}L)</div>
             <div>Delta: <b style="color:#ab47bc;">{active_delta:.2f}</b></div>
             <div>PCR: <b style="color:#00e5ff;">{pcr_value}</b></div>
@@ -689,7 +689,7 @@ chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
-# --- Embedded Web Terminal ---
+# Embedded Web Terminal
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -707,9 +707,9 @@ html_code = f"""
         }}
 
         #topHeaderArea {{
-            width: 100vw; height: 50px;
+            width: 100vw; height: 38px;
             background: #0b0e14;
-            padding: 3px 8px;
+            padding: 2px 8px;
             display: flex; align-items: center; justify-content: space-between;
             z-index: 60; flex-shrink: 0;
             border-bottom: 1px solid #161a25;
@@ -722,19 +722,19 @@ html_code = f"""
             display: flex; align-items: center; gap: 4px; flex-shrink: 0;
         }}
         .badge {{
-            background: #2962ff; color: #fff; font-size: 11px; padding: 2px 5px;
+            background: #2962ff; color: #fff; font-size: 10px; padding: 1px 4px;
             border-radius: 3px; font-weight: 700;
         }}
-        .sym-title {{ font-size: 13px; font-weight: 700; color: #d1d4dc; }}
-        .sym-price {{ font-size: 12px; font-weight: 700; }}
+        .sym-title {{ font-size: 12px; font-weight: 700; color: #d1d4dc; }}
+        .sym-price {{ font-size: 11.5px; font-weight: 700; }}
 
         .tf-bar {{
             display: flex; gap: 2px; background: rgba(30, 34, 45, 0.95);
-            padding: 2px 4px; border-radius: 4px; border: 1px solid #2a2e39; flex-shrink: 0;
+            padding: 1px 3px; border-radius: 3px; border: 1px solid #2a2e39; flex-shrink: 0;
         }}
         .tf-btn {{
             background: transparent; border: none; color: #787b86;
-            font-size: 10px; font-weight: 600; padding: 2px 5px;
+            font-size: 9.5px; font-weight: 600; padding: 1px 4px;
             border-radius: 2px; cursor: not-allowed; opacity: 0.45;
         }}
         .tf-btn.active {{
@@ -756,22 +756,22 @@ html_code = f"""
 
         .alarm-toggle-btn {{
             background: rgba(30, 34, 45, 0.95); border: 1px solid #363c4e; color: #00e5ff;
-            font-size: 10px; font-weight: 700; padding: 2px 5px; border-radius: 4px;
-            cursor: pointer; display: flex; align-items: center; gap: 4px; flex-shrink: 0;
+            font-size: 9.5px; font-weight: 700; padding: 2px 5px; border-radius: 3px;
+            cursor: pointer; display: flex; align-items: center; gap: 3px; flex-shrink: 0;
         }}
         .alarm-toggle-btn.enabled {{ background: #00bfa5; color: #000; border-color: #00bfa5; }}
 
         .dynamic-ohlc-row {{
-            font-size: 9.5px; color: #787b86; display: flex; gap: 6px;
-            background: rgba(11, 14, 20, 0.92); padding: 2px 6px; border-radius: 3px;
+            font-size: 9px; color: #787b86; display: flex; gap: 5px;
+            background: rgba(11, 14, 20, 0.92); padding: 1px 5px; border-radius: 3px;
             font-family: monospace;
         }}
         .dynamic-ohlc-row b {{ color: #d1d4dc; }}
 
-        /* Dedicated Viewport Height to Ensure Bottom Time Axis is 100% Visible Above Taskbar */
+        /* Chart container pinned above taskbar */
         #chartArea {{
             width: 100vw;
-            height: calc(100vh - 50px);
+            height: calc(100vh - 38px);
             position: relative;
             flex: 1 1 auto;
             overflow: hidden;
@@ -976,7 +976,7 @@ html_code = f"""
             }}, 2000);
         }}
 
-        // Strict Element Pixel Measurement: Fixes Missing Bottom Time Axis
+        // Strict Viewport Resizing: Time Axis Always Rendered Above Taskbar
         const chartContainer = document.getElementById('chartArea');
         const chart = LightweightCharts.createChart(chartContainer, {{
             width: chartContainer.clientWidth,
@@ -998,7 +998,7 @@ html_code = f"""
             rightPriceScale: {{
                 borderColor: '#2a2e39',
                 autoScale: true,
-                scaleMargins: {{ top: 0.12, bottom: 0.25 }},
+                scaleMargins: {{ top: 0.10, bottom: 0.20 }},
                 entireTextOnly: true,
             }},
             timeScale: {{
@@ -1188,6 +1188,10 @@ html_code = f"""
                 activePositionWidgets[idx].domElem.remove();
                 activePositionWidgets.splice(idx, 1);
             }}
+        }}
+
+        function refreshAllPositionWidgets() {{
+            activePositionWidgets.forEach(w => renderSinglePosWidget(w));
         }}
 
         function resizeWidgetTgt(e, id) {{
@@ -1498,9 +1502,9 @@ html_code = f"""
 </html>
 """
 
-components.html(html_code, height=800, scrolling=False)
+components.html(html_code, height=830, scrolling=False)
 
-# 15s live refresh
+# 15-second background auto-refresh for live price polling
 st.markdown(
     """
     <script>
