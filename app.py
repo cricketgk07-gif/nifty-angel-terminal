@@ -27,6 +27,14 @@ st.markdown(
         height: 100vh !important;
         overflow: hidden !important;
     }
+    .stApp[data-test-script-state="running"] {
+        opacity: 1 !important;
+        filter: none !important;
+        transition: none !important;
+    }
+    div[data-testid="stStatusWidget"] {
+        display: none !important;
+    }
     iframe {
         border: none !important;
         width: 100vw !important;
@@ -230,7 +238,10 @@ if not nfo_df.empty:
     else:
         available_expiries = nfo_df["expiry"].dropna().drop_duplicates().tolist()
 
-# Black-Scholes Greeks Calculation
+if not available_expiries:
+    available_expiries = ["CURRENT"]
+
+# Normal Cumulative Distribution Function (Black-Scholes Delta)
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
@@ -241,75 +252,73 @@ def compute_dynamic_greeks(s, k, days_to_exp, iv=0.14, r=0.07):
     pe_delta = round(abs(ce_delta - 1.0), 2)
     return ce_delta, pe_delta
 
-# Complete Expiry Matrix with Contract-Specific Greeks and Metrics
-pricing_bundle = {}
+# Complete Expiry Matrix (Guaranteed Initialized)
+option_pricing_bundle = {}
 expiry_metrics = {}
 
-if not nfo_df.empty:
-    for exp in available_expiries[:4]:
-        exp_slice = nfo_df[nfo_df["expiry"] == exp]
-        exp_dt_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_dt
-        days_to_expiry = max((exp_dt_val - today_dt).days, 1)
+for exp in available_expiries[:4]:
+    exp_slice = nfo_df[nfo_df["expiry"] == exp] if not nfo_df.empty else pd.DataFrame()
+    exp_dt_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_dt
+    days_to_expiry = max((exp_dt_val - today_dt).days, 1)
 
-        pricing_bundle[exp] = {}
-        ce_oi_map = {}
-        pe_oi_map = {}
-        exp_ce_oi_total = 0
-        exp_pe_oi_total = 0
+    option_pricing_bundle[exp] = {}
+    ce_oi_map = {}
+    pe_oi_map = {}
+    exp_ce_oi_total = 0
+    exp_pe_oi_total = 0
 
-        for s in strikes_list:
-            ce_scrip = exp_slice[(exp_slice["strike_num"] == s) & (exp_slice["symbol"].str.endswith("CE"))]
-            pe_scrip = exp_slice[(exp_slice["strike_num"] == s) & (exp_slice["symbol"].str.endswith("PE"))]
+    for s in strikes_list:
+        ce_scrip = exp_slice[(exp_slice["strike_num"] == s) & (exp_slice["symbol"].str.endswith("CE"))] if not exp_slice.empty else pd.DataFrame()
+        pe_scrip = exp_slice[(exp_slice["strike_num"] == s) & (exp_slice["symbol"].str.endswith("PE"))] if not exp_slice.empty else pd.DataFrame()
 
-            ce_sym = str(ce_scrip.iloc[0]["symbol"]) if not ce_scrip.empty else f"NIFTY{exp}{s}CE"
-            pe_sym = str(pe_scrip.iloc[0]["symbol"]) if not pe_scrip.empty else f"NIFTY{exp}{s}PE"
-            ce_tok = str(ce_scrip.iloc[0]["token"]) if not ce_scrip.empty else ""
-            pe_tok = str(pe_scrip.iloc[0]["token"]) if not pe_scrip.empty else ""
+        ce_sym = str(ce_scrip.iloc[0]["symbol"]) if not ce_scrip.empty else f"NIFTY{exp}{s}CE"
+        pe_sym = str(pe_scrip.iloc[0]["symbol"]) if not pe_scrip.empty else f"NIFTY{exp}{s}PE"
+        ce_tok = str(ce_scrip.iloc[0]["token"]) if not ce_scrip.empty else ""
+        pe_tok = str(pe_scrip.iloc[0]["token"]) if not pe_scrip.empty else ""
 
-            ce_delta, pe_delta = compute_dynamic_greeks(spot_price, s, days_to_expiry)
+        ce_delta, pe_delta = compute_dynamic_greeks(spot_price, s, days_to_expiry)
 
-            ce_diff = spot_price - s
-            pe_diff = s - spot_price
-            ce_approx = max(1.5, round(max(0.0, ce_diff) + (math.sqrt(days_to_expiry) * 22.0) - (abs(ce_diff) * 0.08), 2))
-            pe_approx = max(1.5, round(max(0.0, pe_diff) + (math.sqrt(days_to_expiry) * 22.0) - (abs(pe_diff) * 0.08), 2))
+        ce_diff = spot_price - s
+        pe_diff = s - spot_price
+        ce_approx = max(1.5, round(max(0.0, ce_diff) + (math.sqrt(days_to_expiry) * 22.0) - (abs(ce_diff) * 0.08), 2))
+        pe_approx = max(1.5, round(max(0.0, pe_diff) + (math.sqrt(days_to_expiry) * 22.0) - (abs(pe_diff) * 0.08), 2))
 
-            dist = abs(strikes_list.index(s) - strikes_list.index(atm_strike))
-            weight = max(1, 40 - dist)
-            ce_oi = int(weight * 85000 + (s * 3) + (days_to_expiry * 1100))
-            pe_oi = int(weight * 92000 + (s * 2) + (days_to_expiry * 1050))
+        dist = abs(strikes_list.index(s) - strikes_list.index(atm_strike))
+        weight = max(1, 40 - dist)
+        ce_oi = int(weight * 85000 + (s * 3) + (days_to_expiry * 1100))
+        pe_oi = int(weight * 92000 + (s * 2) + (days_to_expiry * 1050))
 
-            ce_oi_map[s] = ce_oi
-            pe_oi_map[s] = pe_oi
-            exp_ce_oi_total += ce_oi
-            exp_pe_oi_total += pe_oi
+        ce_oi_map[s] = ce_oi
+        pe_oi_map[s] = pe_oi
+        exp_ce_oi_total += ce_oi
+        exp_pe_oi_total += pe_oi
 
-            pricing_bundle[exp][str(s)] = {
-                "CE": {"symbol": ce_sym, "token": ce_tok, "delta": ce_delta, "ltp": ce_approx, "oi": ce_oi},
-                "PE": {"symbol": pe_sym, "token": pe_tok, "delta": pe_delta, "ltp": pe_approx, "oi": pe_oi},
-            }
-
-        pcr = round(exp_pe_oi_total / max(exp_ce_oi_total, 1), 2)
-        res_strike = max(ce_oi_map, key=ce_oi_map.get) if ce_oi_map else atm_strike + 200
-        sup_strike = max(pe_oi_map, key=pe_oi_map.get) if pe_oi_map else atm_strike - 200
-
-        expiry_metrics[exp] = {
-            "pcr": pcr,
-            "res": res_strike,
-            "sup": sup_strike,
-            "days": days_to_expiry,
+        option_pricing_bundle[exp][str(s)] = {
+            "CE": {"symbol": ce_sym, "token": ce_tok, "delta": ce_delta, "ltp": ce_approx, "oi": ce_oi},
+            "PE": {"symbol": pe_sym, "token": pe_tok, "delta": pe_delta, "ltp": pe_approx, "oi": pe_oi},
         }
 
-# Live quote check for ATM CE of primary expiry
-primary_exp = available_expiries[0] if available_expiries else "CURRENT"
-if primary_exp in pricing_bundle and str(atm_strike) in pricing_bundle[primary_exp]:
-    atm_ce = pricing_bundle[primary_exp][str(atm_strike)]["CE"]
+    pcr = round(exp_pe_oi_total / max(exp_ce_oi_total, 1), 2)
+    res_strike = max(ce_oi_map, key=ce_oi_map.get) if ce_oi_map else atm_strike + 200
+    sup_strike = max(pe_oi_map, key=pe_oi_map.get) if pe_oi_map else atm_strike - 200
+
+    expiry_metrics[exp] = {
+        "pcr": pcr,
+        "res": res_strike,
+        "sup": sup_strike,
+        "days": days_to_expiry,
+    }
+
+primary_exp = available_expiries[0]
+if primary_exp in option_pricing_bundle and str(atm_strike) in option_pricing_bundle[primary_exp]:
+    atm_ce = option_pricing_bundle[primary_exp][str(atm_strike)]["CE"]
     if atm_ce["token"]:
         try:
             res = api.ltpData("NFO", atm_ce["symbol"], atm_ce["token"])
             if isinstance(res, dict) and res.get("status") and res.get("data"):
                 q_ltp = float(res["data"].get("ltp", 0.0))
                 if q_ltp > 0.0:
-                    pricing_bundle[primary_exp][str(atm_strike)]["CE"]["ltp"] = q_ltp
+                    option_pricing_bundle[primary_exp][str(atm_strike)]["CE"]["ltp"] = q_ltp
         except Exception:
             pass
 
@@ -1578,7 +1587,7 @@ html_code = f"""
 </html>
 """
 
-components.html(html_code, height=720, scrolling=False)
+components.html(html_code, height=760, scrolling=False)
 
 # 15s auto-refresh polling
 st.markdown(
