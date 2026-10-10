@@ -16,21 +16,45 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# 1. CSS to completely kill the dull/bright reload flicker and fit taskbar perfectly
 st.markdown(
     """
 <style>
     #MainMenu, footer, header {display: none !important;}
     .block-container {
-        padding: 0 !important;
+        padding: 4px 10px !important;
         margin: 0 !important;
         max-width: 100vw !important;
         height: 100vh !important;
         overflow: hidden !important;
     }
+    /* Eliminate dull grey flicker when Streamlit reruns */
+    .stApp[data-test-script-state="running"] {
+        opacity: 1 !important;
+        filter: none !important;
+        transition: none !important;
+    }
+    div[data-testid="stStatusWidget"] {
+        display: none !important;
+    }
+    /* Clean horizontal controls row */
+    div[data-testid="column"] {
+        padding: 0 4px !important;
+    }
+    div[data-testid="stSelectbox"] label, div[data-testid="stNumberInput"] label {
+        display: none !important;
+    }
+    div[data-testid="stSelectbox"] > div, div[data-testid="stNumberInput"] > div {
+        background-color: #161a25 !important;
+        color: #ffd600 !important;
+        border: 1px solid #2a2e39 !important;
+        border-radius: 4px !important;
+        font-size: 12px !important;
+    }
     iframe {
         border: none !important;
         width: 100vw !important;
-        height: 100vh !important;
+        height: calc(100vh - 65px) !important;
         display: block !important;
     }
     body {
@@ -104,9 +128,10 @@ nfo_df = load_nfo_scrip_master()
 
 
 def fetch_nifty_candles():
-    now_ist = datetime.datetime.now(IST)
+    now_ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    now_dt = datetime.datetime.now(now_ist)
     collected_frames = []
-    current_end = now_ist
+    current_end = now_dt
 
     for _ in range(4):
         chunk_start = current_end - datetime.timedelta(days=6)
@@ -229,95 +254,110 @@ if not nfo_df.empty:
     else:
         available_expiries = nfo_df["expiry"].dropna().drop_duplicates().tolist()
 
+# ----------------- LIVE PYTHON CONTROLS ROW -----------------
+ctrl_cols = st.columns([1.3, 1.4, 0.8, 0.8, 4.7])
+
+with ctrl_cols[0]:
+    default_strike_idx = strikes_list.index(atm_strike) if atm_strike in strikes_list else 20
+    sel_strike = st.selectbox("Strike", strikes_list, index=default_strike_idx)
+
+with ctrl_cols[1]:
+    sel_expiry = st.selectbox("Expiry", available_expiries if available_expiries else ["CURRENT"])
+
+with ctrl_cols[2]:
+    sel_type = st.selectbox("Type", ["CE", "PE"])
+
+with ctrl_cols[3]:
+    sel_lots = st.number_input("Lots", min_value=1, max_value=100, value=1, step=1)
+
 # Black-Scholes Greeks Calculation
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
-def compute_dynamic_greeks(s, k, days_to_exp, iv=0.14, r=0.07):
+def compute_contract_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
     tau = max(days_to_exp / 365.0, 0.001)
     d1 = (math.log(s / k) + (r + 0.5 * iv ** 2) * tau) / (iv * math.sqrt(tau))
-    ce_delta = round(norm_cdf(d1), 2)
-    pe_delta = round(abs(ce_delta - 1.0), 2)
-    return ce_delta, pe_delta
+    ce_delta = norm_cdf(d1)
+    return round(ce_delta if is_ce else (1.0 - ce_delta), 2)
 
-# Build Complete Pricing Bundle Across Expiries & Strikes
-option_pricing_bundle = {}
-expiry_metrics = {}
+# Expiry Specific Calculations
+exp_slice = nfo_df[nfo_df["expiry"] == sel_expiry] if not nfo_df.empty else pd.DataFrame()
+exp_date_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_dt
+days_to_expiry = max((exp_date_val - today_dt).days, 1)
+
+active_delta = compute_contract_delta(spot_price, float(sel_strike), days_to_expiry, is_ce=(sel_type == "CE"))
+
+# Expiry Specific PCR and OI Max Levels
+ce_oi_map = {}
+pe_oi_map = {}
+total_ce_oi = 0
+total_pe_oi = 0
+
+for s in strikes_list:
+    dist = abs(strikes_list.index(s) - strikes_list.index(atm_strike))
+    weight = max(1, 40 - dist)
+    c_oi = int(weight * 85000 + (s * 3) + (days_to_expiry * 1100))
+    p_oi = int(weight * 92000 + (s * 2) + (days_to_expiry * 1050))
+    ce_oi_map[s] = c_oi
+    pe_oi_map[s] = p_oi
+    total_ce_oi += c_oi
+    total_pe_oi += p_oi
+
+pcr_value = round(total_pe_oi / max(total_ce_oi, 1), 2)
+oi_res_strike = max(ce_oi_map, key=ce_oi_map.get) if ce_oi_map else atm_strike + 200
+oi_sup_strike = max(pe_oi_map, key=pe_oi_map.get) if pe_oi_map else atm_strike - 200
+
+# Live Quote from Angel One for the exact selected contract
+live_real_ltp = 0.0
+target_symbol = ""
+target_token = ""
 
 if not nfo_df.empty:
-    for exp in available_expiries[:4]:
-        exp_slice = nfo_df[nfo_df["expiry"] == exp]
-        exp_dt_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_dt
-        days_to_expiry = max((exp_dt_val - today_dt).days, 1)
-
-        option_pricing_bundle[exp] = {}
-        ce_oi_map = {}
-        pe_oi_map = {}
-        exp_ce_oi_total = 0
-        exp_pe_oi_total = 0
-
-        for s in strikes_list:
-            ce_scrip = exp_slice[(exp_slice["strike_num"] == s) & (exp_slice["symbol"].str.endswith("CE"))]
-            pe_scrip = exp_slice[(exp_slice["strike_num"] == s) & (exp_slice["symbol"].str.endswith("PE"))]
-
-            ce_sym = str(ce_scrip.iloc[0]["symbol"]) if not ce_scrip.empty else f"NIFTY{exp}{s}CE"
-            pe_sym = str(pe_scrip.iloc[0]["symbol"]) if not pe_scrip.empty else f"NIFTY{exp}{s}PE"
-            ce_tok = str(ce_scrip.iloc[0]["token"]) if not ce_scrip.empty else ""
-            pe_tok = str(pe_scrip.iloc[0]["token"]) if not pe_scrip.empty else ""
-
-            ce_delta, pe_delta = compute_dynamic_greeks(spot_price, s, days_to_expiry)
-
-            ce_diff = spot_price - s
-            pe_diff = s - spot_price
-            ce_approx = max(1.5, round(max(0.0, ce_diff) + (math.sqrt(days_to_expiry) * 22.0) - (abs(ce_diff) * 0.08), 2))
-            pe_approx = max(1.5, round(max(0.0, pe_diff) + (math.sqrt(days_to_expiry) * 22.0) - (abs(pe_diff) * 0.08), 2))
-
-            # Expiry-specific open interest modeling
-            dist = abs(strikes_list.index(s) - strikes_list.index(atm_strike))
-            weight = max(1, 40 - dist)
-            ce_oi = int(weight * 85000 + (s * 3) + (days_to_expiry * 1200))
-            pe_oi = int(weight * 92000 + (s * 2) + (days_to_expiry * 1100))
-
-            ce_oi_map[s] = ce_oi
-            pe_oi_map[s] = pe_oi
-            exp_ce_oi_total += ce_oi
-            exp_pe_oi_total += pe_oi
-
-            option_pricing_bundle[exp][str(s)] = {
-                "CE": {"symbol": ce_sym, "token": ce_tok, "delta": ce_delta, "ltp": ce_approx, "oi": ce_oi},
-                "PE": {"symbol": pe_sym, "token": pe_tok, "delta": pe_delta, "ltp": pe_approx, "oi": pe_oi},
-            }
-
-        # Per-expiry PCR and Support/Resistance calculation
-        pcr = round(exp_pe_oi_total / max(exp_ce_oi_total, 1), 2)
-        res_strike = max(ce_oi_map, key=ce_oi_map.get) if ce_oi_map else atm_strike + 200
-        sup_strike = max(pe_oi_map, key=pe_oi_map.get) if pe_oi_map else atm_strike - 200
-
-        expiry_metrics[exp] = {
-            "pcr": pcr,
-            "res": res_strike,
-            "sup": sup_strike,
-            "days": days_to_expiry,
-        }
-
-# Live quote check for ATM CE of primary expiry
-primary_exp = available_expiries[0] if available_expiries else "CURRENT"
-if primary_exp in option_pricing_bundle and str(atm_strike) in option_pricing_bundle[primary_exp]:
-    atm_ce = option_pricing_bundle[primary_exp][str(atm_strike)]["CE"]
-    if atm_ce["token"]:
+    scrip_match = nfo_df[
+        (nfo_df["strike_num"] == float(sel_strike))
+        & (nfo_df["symbol"].str.endswith(sel_type))
+        & (nfo_df["expiry"] == sel_expiry)
+    ]
+    if not scrip_match.empty:
+        target_symbol = str(scrip_match.iloc[0]["symbol"])
+        target_token = str(scrip_match.iloc[0]["token"])
         try:
-            res = api.ltpData("NFO", atm_ce["symbol"], atm_ce["token"])
+            res = api.ltpData("NFO", target_symbol, target_token)
             if isinstance(res, dict) and res.get("status") and res.get("data"):
-                q_ltp = float(res["data"].get("ltp", 0.0))
-                if q_ltp > 0.0:
-                    option_pricing_bundle[primary_exp][str(atm_strike)]["CE"]["ltp"] = q_ltp
+                val = float(res["data"].get("ltp", 0.0))
+                if val > 0.0:
+                    live_real_ltp = val
         except Exception:
             pass
+
+if live_real_ltp <= 0.0:
+    diff = (spot_price - float(sel_strike)) if sel_type == "CE" else (float(sel_strike) - spot_price)
+    live_real_ltp = max(1.5, round(max(0.0, diff) + (math.sqrt(days_to_expiry) * 22.0) - (abs(diff) * 0.08), 2))
+
+total_qty = sel_lots * LOT_SIZE_QTY
 
 # Nifty 50 Advance / Decline Ratio
 adv_count = int(min(45, max(10, 25 + int((curr["close"] - df.iloc[0]["open"]) / 8.0))))
 dec_count = 50 - adv_count
 ad_ratio = round(adv_count / max(dec_count, 1), 2)
+
+# Display real-time stats pill
+with ctrl_cols[4]:
+    st.markdown(
+        f"""
+        <div style="background:#161a25; border:1px solid #2a2e39; border-radius:4px; padding:5px 10px; display:flex; gap:12px; align-items:center; font-size:12px; height:38px;">
+            <div>Contract: <b style="color:#00e5ff;">{target_symbol or f'NIFTY{sel_expiry}{sel_strike}{sel_type}'}</b></div>
+            <div>LTP: <b style="color:#ffd600; font-size:14px;">₹{live_real_ltp:.2f}</b></div>
+            <div>Qty: <b style="color:#089981;">{total_qty}</b> ({sel_lots}L)</div>
+            <div>Delta: <b style="color:#ab47bc;">{active_delta:.2f}</b></div>
+            <div>PCR: <b style="color:#00e5ff;">{pcr_value}</b></div>
+            <div>A/D: <b style="color:#089981;">{adv_count}:{dec_count}</b> ({ad_ratio})</div>
+            <div>Res: <b style="color:#f23645;">{oi_res_strike}</b></div>
+            <div>Sup: <b style="color:#089981;">{oi_sup_strike}</b></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # Strategy Engine
 markers = []
@@ -632,10 +672,6 @@ elif latest_trade_for_hud:
     }
 
 # Serialization
-pricing_bundle_json = json.dumps(option_pricing_bundle)
-expiry_metrics_json = json.dumps(expiry_metrics)
-strikes_json = json.dumps(strikes_list)
-expiries_json = json.dumps(available_expiries)
 candles_json = json.dumps(candles_data)
 volume_json = json.dumps(volume_data)
 vwap_json = json.dumps([{"time": int(r["time"]), "value": round(float(r["vwap"]), 2)} for _, r in df.iterrows()])
@@ -653,7 +689,7 @@ chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
-# Embedded Web Terminal
+# --- Embedded Web Terminal ---
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -671,16 +707,16 @@ html_code = f"""
         }}
 
         #topHeaderArea {{
-            width: 100vw; height: 62px;
+            width: 100vw; height: 50px;
             background: #0b0e14;
-            padding: 4px 8px;
-            display: flex; flex-direction: column; gap: 3px;
+            padding: 3px 8px;
+            display: flex; align-items: center; justify-content: space-between;
             z-index: 60; flex-shrink: 0;
             border-bottom: 1px solid #161a25;
         }}
 
         .top-row-1 {{
-            display: flex; align-items: center; gap: 5px; flex-wrap: nowrap; overflow-x: auto;
+            display: flex; align-items: center; gap: 8px;
         }}
         .sym-group {{
             display: flex; align-items: center; gap: 4px; flex-shrink: 0;
@@ -705,22 +741,6 @@ html_code = f"""
             background: #2962ff; color: #ffffff; font-weight: 700; cursor: default; opacity: 1.0;
         }}
 
-        .client-controls-bar {{
-            display: flex; align-items: center; gap: 4px; background: rgba(22, 26, 37, 0.95);
-            padding: 2px 5px; border-radius: 4px; border: 1px solid #363c4e; font-size: 9.5px;
-            color: #d1d4dc; flex-shrink: 0;
-        }}
-        .client-select {{
-            background: #0b0e14; border: 1px solid #2a2e39; color: #ffd600;
-            font-size: 9.5px; padding: 1px 3px; border-radius: 2px; font-weight: 600;
-            outline: none; cursor: pointer;
-        }}
-        .client-input {{
-            background: #0b0e14; border: 1px solid #2a2e39; color: #00e5ff;
-            font-size: 9.5px; padding: 1px 3px; border-radius: 2px; text-align: center;
-            font-weight: 700; width: 34px;
-        }}
-
         .tools-bar {{
             display: flex; align-items: center; gap: 3px; background: rgba(22, 26, 37, 0.95);
             padding: 2px 5px; border-radius: 4px; border: 1px solid #363c4e; font-size: 9px;
@@ -741,22 +761,19 @@ html_code = f"""
         }}
         .alarm-toggle-btn.enabled {{ background: #00bfa5; color: #000; border-color: #00bfa5; }}
 
-        .info-pill {{
-            background: rgba(22, 26, 37, 0.95); border: 1px solid #2a2e39; border-radius: 3px;
-            padding: 1px 4px; font-size: 9px; color: #d1d4dc; flex-shrink: 0;
-        }}
-
         .dynamic-ohlc-row {{
-            font-size: 9px; color: #787b86; display: flex; gap: 5px;
-            background: rgba(11, 14, 20, 0.92); padding: 1px 4px;
-            font-family: monospace; width: fit-content;
+            font-size: 9.5px; color: #787b86; display: flex; gap: 6px;
+            background: rgba(11, 14, 20, 0.92); padding: 2px 6px; border-radius: 3px;
+            font-family: monospace;
         }}
         .dynamic-ohlc-row b {{ color: #d1d4dc; }}
 
-        /* Constrained Chart Area: Guaranteed Visible Time Axis & Volume Bars */
+        /* Dedicated Viewport Height to Ensure Bottom Time Axis is 100% Visible Above Taskbar */
         #chartArea {{
-            width: 100vw; height: calc(100vh - 62px);
-            position: relative; flex: 1 1 auto;
+            width: 100vw;
+            height: calc(100vh - 50px);
+            position: relative;
+            flex: 1 1 auto;
             overflow: hidden;
         }}
 
@@ -862,28 +879,17 @@ html_code = f"""
                 <button class="tf-btn" disabled>1D</button>
             </div>
 
-            <!-- Instant Zero-Flicker Client-Side Controls -->
-            <div class="client-controls-bar">
-                <span>Strike:</span>
-                <select id="clientStrike" class="client-select" onchange="onOptionChanged()"></select>
-                <span>Exp:</span>
-                <select id="clientExp" class="client-select" onchange="onExpiryChanged()"></select>
-                <select id="clientType" class="client-select" onchange="onOptionChanged()">
-                    <option value="CE" selected>CE</option>
-                    <option value="PE">PE</option>
-                </select>
-                <span>LTP: <b id="clientLTP" style="color: #ffd600;">₹0.00</b></span>
-                <span>Lots:</span>
-                <input id="clientLots" class="client-input" type="number" min="1" max="100" value="1" onchange="onOptionChanged()" />
-                <span>Qty: <b id="clientQty" style="color: #00bfa5;">65</b></span>
-                <span>Delta: <b id="clientDelta" style="color: #ab47bc;">0.50</b></span>
+            <div id="ohlcRow" class="dynamic-ohlc-row">
+                <span>O: <b id="barO">{curr['open']:.2f}</b></span>
+                <span>H: <b id="barH">{curr['high']:.2f}</b></span>
+                <span>L: <b id="barL">{curr['low']:.2f}</b></span>
+                <span>C: <b id="barC">{curr['close']:.2f}</b></span>
+                <span>VWAP: <b id="barVWAP" style="color:#ab47bc;">{curr['vwap']:.2f}</b></span>
+                <span>EMA: <b id="barEMA" style="color:#2962ff;">{curr['ema9']:.2f}</b></span>
             </div>
+        </div>
 
-            <div class="info-pill">PCR: <b id="dispPCR" style="color:#00e5ff;">1.00</b></div>
-            <div class="info-pill">A/D: <b style="color:#089981;">{adv_count}:{dec_count}</b> ({ad_ratio})</div>
-            <div class="info-pill">OI Res: <b id="dispRes" style="color:#f23645;">22600</b></div>
-            <div class="info-pill">OI Sup: <b id="dispSup" style="color:#089981;">22400</b></div>
-
+        <div style="display:flex; align-items:center; gap:6px;">
             <div class="tools-bar">
                 <button id="btnFibR" class="tool-btn" onclick="activateDrawMode('FIB_RETRACE')">+ Fib Retrace</button>
                 <button id="btnFibE" class="tool-btn" onclick="activateDrawMode('FIB_EXT')">+ Fib Ext</button>
@@ -895,15 +901,6 @@ html_code = f"""
                 🔔 <span id="alarmTxt">Audio</span>
             </button>
         </div>
-
-        <div id="ohlcRow" class="dynamic-ohlc-row">
-            <span>O: <b id="barO">{curr['open']:.2f}</b></span>
-            <span>H: <b id="barH">{curr['high']:.2f}</b></span>
-            <span>L: <b id="barL">{curr['low']:.2f}</b></span>
-            <span>C: <b id="barC">{curr['close']:.2f}</b></span>
-            <span>VWAP: <b id="barVWAP" style="color:#ab47bc;">{curr['vwap']:.2f}</b></span>
-            <span>EMA: <b id="barEMA" style="color:#2962ff;">{curr['ema9']:.2f}</b></span>
-        </div>
     </div>
 
     <!-- Chart Canvas Container -->
@@ -913,77 +910,11 @@ html_code = f"""
     <div id="historyTag" class="history-signal-tag"></div>
 
     <script>
-        const pricingBundle = {pricing_bundle_json};
-        const expiryMetrics = {expiry_metrics_json};
-        const strikeList = {strikes_json};
-        const activeStrike = "{atm_strike}";
-        const expList = {expiries_json};
+        const activeRealLTP = {live_real_ltp};
+        const activeDelta = {active_delta};
+        const activeLots = {sel_lots};
         const LOT_SIZE = {LOT_SIZE_QTY};
-
-        const strikeSelect = document.getElementById('clientStrike');
-        strikeList.forEach(s => {{
-            const opt = document.createElement('option');
-            opt.value = s.toString();
-            opt.innerText = s.toString();
-            if (s.toString() === activeStrike) opt.selected = true;
-            strikeSelect.appendChild(opt);
-        }});
-
-        const expSelect = document.getElementById('clientExp');
-        if (expList && expList.length > 0) {{
-            expList.forEach((e, idx) => {{
-                const opt = document.createElement('option');
-                opt.value = e;
-                opt.innerText = e;
-                if (idx === 0) opt.selected = true;
-                expSelect.appendChild(opt);
-            }});
-        }} else {{
-            const opt = document.createElement('option');
-            opt.value = "CURRENT";
-            opt.innerText = "CURRENT";
-            expSelect.appendChild(opt);
-        }}
-
-        let activeRealLTP = 83.05;
-        let activeDelta = 0.50;
-        let activeQty = 65;
-
-        function getActiveOptionData() {{
-            const stk = document.getElementById('clientStrike').value;
-            const exp = document.getElementById('clientExp').value;
-            const typ = document.getElementById('clientType').value;
-
-            if (pricingBundle[exp] && pricingBundle[exp][stk] && pricingBundle[exp][stk][typ]) {{
-                return pricingBundle[exp][stk][typ];
-            }}
-            return {{ ltp: 83.05, delta: 0.50, symbol: 'NIFTY ' + stk + typ }};
-        }}
-
-        function onExpiryChanged() {{
-            const exp = document.getElementById('clientExp').value;
-            if (expiryMetrics[exp]) {{
-                document.getElementById('dispPCR').innerText = expiryMetrics[exp].pcr.toFixed(2);
-                document.getElementById('dispRes').innerText = expiryMetrics[exp].res;
-                document.getElementById('dispSup').innerText = expiryMetrics[exp].sup;
-            }}
-            onOptionChanged();
-        }}
-
-        function onOptionChanged() {{
-            const data = getActiveOptionData();
-            const lots = parseInt(document.getElementById('clientLots').value) || 1;
-            activeRealLTP = data.ltp;
-            activeDelta = data.delta;
-            activeQty = lots * LOT_SIZE;
-
-            document.getElementById('clientLTP').innerText = '₹' + activeRealLTP.toFixed(2);
-            document.getElementById('clientDelta').innerText = activeDelta.toFixed(2);
-            document.getElementById('clientQty').innerText = activeQty;
-
-            updateStrategyHUDTable();
-            refreshAllPositionWidgets();
-        }}
+        const activeQty = activeLots * LOT_SIZE;
 
         let audioCtx = null;
         let alarmUnlocked = localStorage.getItem('nifty_alarm_active') === 'true';
@@ -1045,7 +976,7 @@ html_code = f"""
             }}, 2000);
         }}
 
-        // Strict Viewport Resizing: Eliminates Timeframe Axis Overflow
+        // Strict Element Pixel Measurement: Fixes Missing Bottom Time Axis
         const chartContainer = document.getElementById('chartArea');
         const chart = LightweightCharts.createChart(chartContainer, {{
             width: chartContainer.clientWidth,
@@ -1067,13 +998,15 @@ html_code = f"""
             rightPriceScale: {{
                 borderColor: '#2a2e39',
                 autoScale: true,
-                scaleMargins: {{ top: 0.12, bottom: 0.22 }},
+                scaleMargins: {{ top: 0.12, bottom: 0.25 }},
+                entireTextOnly: true,
             }},
             timeScale: {{
                 borderColor: '#2a2e39',
                 timeVisible: true,
                 secondsVisible: false,
                 rightOffset: 8,
+                barSpacing: 6,
                 fixLeftEdge: true,
                 fixRightEdge: true,
             }},
@@ -1141,9 +1074,9 @@ html_code = f"""
             candleSeries.createPriceLine({{ price: pv.PDL, color: '#fb8c00', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'PDL' }});
         }}
 
-        // Dynamic OI Levels Reference Lines
-        let oiResLine = candleSeries.createPriceLine({{ price: {atm_strike + 200}, color: '#e91e63', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'OI RES' }});
-        let oiSupLine = candleSeries.createPriceLine({{ price: {atm_strike - 200}, color: '#00e676', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'OI SUP' }});
+        // Dynamic Expiry-Specific OI Levels
+        candleSeries.createPriceLine({{ price: {oi_res_strike}, color: '#e91e63', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'OI RES' }});
+        candleSeries.createPriceLine({{ price: {oi_sup_strike}, color: '#00e676', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'OI SUP' }});
 
         let toolCounter = 0;
         let currentDrawMode = null;
@@ -1255,10 +1188,6 @@ html_code = f"""
                 activePositionWidgets[idx].domElem.remove();
                 activePositionWidgets.splice(idx, 1);
             }}
-        }}
-
-        function refreshAllPositionWidgets() {{
-            activePositionWidgets.forEach(w => renderSinglePosWidget(w));
         }}
 
         function resizeWidgetTgt(e, id) {{
@@ -1389,8 +1318,7 @@ html_code = f"""
         const s = {hud_json};
         const table = document.getElementById('strategyBox');
 
-        function updateStrategyHUDTable() {{
-            if (!s) return;
+        if (s) {{
             table.style.display = 'block';
             if (s.is_no_trade) {{
                 table.innerHTML = `
@@ -1421,9 +1349,6 @@ html_code = f"""
                 const currentSign = currentTotalProfit >= 0 ? '+' : '';
                 const pnlColor = currentTotalProfit >= 0 ? '#089981' : '#f23645';
 
-                const stk = document.getElementById('clientStrike').value;
-                const typ = document.getElementById('clientType').value;
-
                 table.innerHTML = `
                     <div class="box-drag-handle">::: DRAG STRATEGY HUD :::</div>
                     <table>
@@ -1431,7 +1356,7 @@ html_code = f"""
                             <tr>
                                 <th>Parameter</th>
                                 <th>Index (Spot)</th>
-                                <th>Option (${{stk}} ${{typ}})</th>
+                                <th>Option ({sel_strike} {sel_type})</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -1568,14 +1493,12 @@ html_code = f"""
 
         window.addEventListener('resize', resizeChartProperly);
         setTimeout(resizeChartProperly, 250);
-
-        onExpiryChanged();
     </script>
 </body>
 </html>
 """
 
-components.html(html_code, height=860, scrolling=False)
+components.html(html_code, height=800, scrolling=False)
 
 # 15s live refresh
 st.markdown(
