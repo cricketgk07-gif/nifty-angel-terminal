@@ -21,7 +21,7 @@ st.markdown(
 <style>
     #MainMenu, footer, header {display: none !important;}
     .block-container {
-        padding: 0.25rem 0.5rem !important;
+        padding: 0 !important;
         margin: 0 !important;
         max-width: 100vw !important;
         height: 100vh !important;
@@ -30,16 +30,13 @@ st.markdown(
     iframe {
         border: none !important;
         width: 100vw !important;
-        height: calc(100vh - 65px) !important;
+        height: 100vh !important;
         display: block !important;
     }
     body {
         background-color: #0b0e14;
         margin: 0;
         overflow: hidden;
-    }
-    div[data-testid="stSelectbox"] label, div[data-testid="stNumberInput"] label {
-        display: none !important;
     }
 </style>
 """,
@@ -232,87 +229,52 @@ if not nfo_df.empty:
     else:
         available_expiries = nfo_df["expiry"].dropna().drop_duplicates().tolist()
 
-# ----------------- NATIVE STATE CONTROL BAR -----------------
-bar_cols = st.columns([1.4, 1.4, 0.9, 0.9, 3.8])
-
-with bar_cols[0]:
-    default_strike_idx = strikes_list.index(atm_strike) if atm_strike in strikes_list else 20
-    selected_strike = st.selectbox(
-        "StrikeSelect",
-        strikes_list,
-        index=default_strike_idx,
-        key="selected_strike_key"
-    )
-
-with bar_cols[1]:
-    selected_expiry = st.selectbox(
-        "ExpirySelect",
-        available_expiries if available_expiries else ["CURRENT"],
-        key="selected_expiry_key"
-    )
-
-with bar_cols[2]:
-    selected_type = st.selectbox(
-        "TypeSelect",
-        ["CE", "PE"],
-        key="selected_type_key"
-    )
-
-with bar_cols[3]:
-    selected_lots = st.number_input(
-        "LotsInput",
-        min_value=1,
-        max_value=100,
-        value=1,
-        step=1,
-        key="selected_lots_key"
-    )
-
-# Direct Query to Angel One for the selected strike
-live_real_ltp = 0.0
-target_symbol = ""
-target_token = ""
+# Pre-fetch Top Expiry Strips to serve instant client-side switching without Streamlit reruns
+active_expiry = available_expiries[0] if available_expiries else "CURRENT"
+option_pricing_bundle = {}
 
 if not nfo_df.empty:
-    scrip_match = nfo_df[
-        (nfo_df["strike_num"] == float(selected_strike))
-        & (nfo_df["symbol"].str.endswith(selected_type))
-        & (nfo_df["expiry"] == selected_expiry)
-    ]
-    if not scrip_match.empty:
-        target_symbol = str(scrip_match.iloc[0]["symbol"])
-        target_token = str(scrip_match.iloc[0]["token"])
-        try:
-            res = api.ltpData("NFO", target_symbol, target_token)
-            if isinstance(res, dict) and res.get("status") and res.get("data"):
-                val = float(res["data"].get("ltp", 0.0))
-                if val > 0.0:
-                    live_real_ltp = val
-        except Exception:
-            pass
+    for exp in available_expiries[:3]:
+        exp_slice = nfo_df[nfo_df["expiry"] == exp]
+        option_pricing_bundle[exp] = {}
+        for s in strikes_list:
+            ce_scrip = exp_slice[(exp_slice["strike_num"] == s) & (exp_slice["symbol"].str.endswith("CE"))]
+            pe_scrip = exp_slice[(exp_slice["strike_num"] == s) & (exp_slice["symbol"].str.endswith("PE"))]
 
-if live_real_ltp <= 0.0:
-    diff = (spot_price - float(selected_strike)) if selected_type == "CE" else (float(selected_strike) - spot_price)
-    live_real_ltp = max(1.5, round(max(0.0, diff) + max(20.0, 110.0 - (abs(diff) * 0.15)), 2))
+            ce_sym = str(ce_scrip.iloc[0]["symbol"]) if not ce_scrip.empty else f"NIFTY{exp}{s}CE"
+            pe_sym = str(pe_scrip.iloc[0]["symbol"]) if not pe_scrip.empty else f"NIFTY{exp}{s}PE"
 
-diff_val = (spot_price - float(selected_strike)) if selected_type == "CE" else (float(selected_strike) - spot_price)
-active_delta = round(min(0.95, max(0.05, 0.50 + (diff_val / 800.0))), 2)
-total_qty = selected_lots * LOT_SIZE_QTY
+            ce_diff = spot_price - s
+            pe_diff = s - spot_price
+            ce_d = round(min(0.95, max(0.05, 0.50 + (ce_diff / 800.0))), 2)
+            pe_d = round(min(0.95, max(0.05, 0.50 + (pe_diff / 800.0))), 2)
 
-with bar_cols[4]:
-    st.markdown(
-        f"""
-        <div style="background:#161a25; border:1px solid #2a2e39; border-radius:4px; padding:4px 10px; margin-top:2px; display:flex; gap:14px; align-items:center; font-size:12px;">
-            <div>Contract: <b style="color:#00e5ff;">{target_symbol or 'NIFTY OPT'}</b></div>
-            <div>Live LTP: <b style="color:#ffd600; font-size:15px;">₹{live_real_ltp:.2f}</b></div>
-            <div>Qty: <b style="color:#089981;">{total_qty}</b> ({selected_lots}L)</div>
-            <div>Delta: <b style="color:#ab47bc;">{active_delta}</b></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+            ce_approx = max(1.5, round(max(0.0, ce_diff) + max(20.0, 110.0 - (abs(ce_diff) * 0.15)), 2))
+            pe_approx = max(1.5, round(max(0.0, pe_diff) + max(20.0, 110.0 - (abs(pe_diff) * 0.15)), 2))
 
-# ----------------- STRATEGY ENGINE & HUD TABLE -----------------
+            option_pricing_bundle[exp][str(s)] = {
+                "CE": {"symbol": ce_sym, "delta": ce_d, "ltp": ce_approx},
+                "PE": {"symbol": pe_sym, "delta": pe_d, "ltp": pe_approx},
+            }
+
+# Try real LTP for the default ATM contract
+default_ce_match = nfo_df[
+    (nfo_df["strike_num"] == float(atm_strike))
+    & (nfo_df["symbol"].str.endswith("CE"))
+    & (nfo_df["expiry"] == active_expiry)
+] if not nfo_df.empty else pd.DataFrame()
+
+if not default_ce_match.empty:
+    try:
+        res = api.ltpData("NFO", str(default_ce_match.iloc[0]["symbol"]), str(default_ce_match.iloc[0]["token"]))
+        if isinstance(res, dict) and res.get("status") and res.get("data"):
+            val = float(res["data"].get("ltp", 0.0))
+            if val > 0.0:
+                option_pricing_bundle[active_expiry][str(atm_strike)]["CE"]["ltp"] = val
+    except Exception:
+        pass
+
+# Strategy Engine
 markers = []
 historical_trade_cards = {}
 latest_trade_for_hud = None
@@ -635,14 +597,18 @@ elif latest_trade_for_hud:
 hud_json = json.dumps(hud_payload)
 play_alarm_flag = "true" if alarm_signal_triggered else "false"
 
-# Price change calculation
+# Change stats
 day_open = today_df.iloc[0]["open"]
 chg = curr["close"] - day_open
 chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
-# ----------------- EMBEDDED JAVASCRIPT TERMINAL -----------------
+pricing_bundle_json = json.dumps(option_pricing_bundle)
+strikes_json = json.dumps(strikes_list)
+expiries_json = json.dumps(available_expiries)
+
+# --- 100% Client-Side Terminal With No Dim/Flicker ---
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -652,26 +618,28 @@ html_code = f"""
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         html, body {{
-            width: 100vw; height: 100%;
+            width: 100vw; height: 100vh;
             background-color: #0b0e14;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             overflow: hidden;
-        }}
-        #chartArea {{
-            width: 100vw; height: 100vh;
-            position: absolute; top: 0; left: 0;
+            display: flex; flex-direction: column;
         }}
 
-        .fixed-top-box {{
-            position: absolute; top: 6px; left: 8px; z-index: 60;
-            display: flex; flex-direction: column; gap: 4px; pointer-events: none;
-            max-width: calc(100vw - 80px);
+        /* Header Viewport Constrained */
+        #topHeaderArea {{
+            width: 100vw; height: 56px;
+            background: #0b0e14;
+            padding: 4px 8px;
+            display: flex; flex-direction: column; gap: 4px;
+            z-index: 60; flex-shrink: 0;
+            border-bottom: 1px solid #161a25;
         }}
+
         .top-row-1 {{
-            display: flex; align-items: center; gap: 6px; pointer-events: auto; flex-wrap: wrap;
+            display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; overflow-x: auto;
         }}
         .sym-group {{
-            display: flex; align-items: center; gap: 5px;
+            display: flex; align-items: center; gap: 5px; flex-shrink: 0;
         }}
         .badge {{
             background: #2962ff; color: #fff; font-size: 11px; padding: 2px 5px;
@@ -682,7 +650,7 @@ html_code = f"""
 
         .tf-bar {{
             display: flex; gap: 2px; background: rgba(30, 34, 45, 0.95);
-            padding: 2px 4px; border-radius: 4px; border: 1px solid #2a2e39;
+            padding: 2px 4px; border-radius: 4px; border: 1px solid #2a2e39; flex-shrink: 0;
         }}
         .tf-btn {{
             background: transparent; border: none; color: #787b86;
@@ -693,9 +661,27 @@ html_code = f"""
             background: #2962ff; color: #ffffff; font-weight: 700; cursor: default; opacity: 1.0;
         }}
 
+        /* Client-Side Native Controls Strip (NO FLICKER) */
+        .client-controls-bar {{
+            display: flex; align-items: center; gap: 4px; background: rgba(22, 26, 37, 0.95);
+            padding: 2px 5px; border-radius: 4px; border: 1px solid #363c4e; font-size: 9.5px;
+            color: #d1d4dc; flex-shrink: 0;
+        }}
+        .client-select {{
+            background: #0b0e14; border: 1px solid #2a2e39; color: #ffd600;
+            font-size: 9.5px; padding: 1px 3px; border-radius: 2px; font-weight: 600;
+            outline: none; cursor: pointer;
+        }}
+        .client-input {{
+            background: #0b0e14; border: 1px solid #2a2e39; color: #00e5ff;
+            font-size: 9.5px; padding: 1px 3px; border-radius: 2px; text-align: center;
+            font-weight: 700; width: 34px;
+        }}
+
         .tools-bar {{
             display: flex; align-items: center; gap: 3px; background: rgba(22, 26, 37, 0.95);
             padding: 2px 5px; border-radius: 4px; border: 1px solid #363c4e; font-size: 9px;
+            flex-shrink: 0;
         }}
         .tool-btn {{
             background: #161a25; border: 1px solid #2a2e39; color: #d1d4dc;
@@ -707,35 +693,28 @@ html_code = f"""
 
         .alarm-toggle-btn {{
             background: rgba(30, 34, 45, 0.95); border: 1px solid #363c4e; color: #00e5ff;
-            font-size: 10px; font-weight: 700; padding: 3px 6px; border-radius: 4px;
-            cursor: pointer; display: flex; align-items: center; gap: 4px;
+            font-size: 10px; font-weight: 700; padding: 2px 5px; border-radius: 4px;
+            cursor: pointer; display: flex; align-items: center; gap: 4px; flex-shrink: 0;
         }}
-        .alarm-toggle-btn.enabled {{
-            background: #00bfa5; color: #000; border-color: #00bfa5;
-        }}
-
-        .alarm-ringing-banner {{
-            position: fixed; top: 8px; left: 50%; transform: translateX(-50%); z-index: 100;
-            background: #f23645; color: #ffffff; font-weight: 800; font-size: 11px;
-            padding: 6px 14px; border-radius: 20px; box-shadow: 0 0 20px rgba(242, 54, 69, 0.8);
-            cursor: pointer; display: none; animation: pulseAlarm 0.8s infinite alternate;
-        }}
-        @keyframes pulseAlarm {{
-            from {{ transform: translateX(-50%) scale(1); }}
-            to {{ transform: translateX(-50%) scale(1.06); }}
-        }}
+        .alarm-toggle-btn.enabled {{ background: #00bfa5; color: #000; border-color: #00bfa5; }}
 
         .dynamic-ohlc-row {{
-            font-size: 10px; color: #787b86; display: flex; gap: 6px;
-            background: rgba(11, 14, 20, 0.92); padding: 2px 6px;
-            border-radius: 3px; border: 1px solid rgba(42, 46, 57, 0.4);
+            font-size: 9.5px; color: #787b86; display: flex; gap: 6px;
+            background: rgba(11, 14, 20, 0.92); padding: 1px 4px;
             font-family: monospace; width: fit-content;
         }}
         .dynamic-ohlc-row b {{ color: #d1d4dc; }}
 
-        /* 3-Column Strategy Table */
+        /* Chart Canvas Constrained - Perfect Time Axis Visibility */
+        #chartArea {{
+            width: 100vw; height: calc(100vh - 56px);
+            position: relative; flex-grow: 1;
+            overflow: hidden;
+        }}
+
+        /* 3-Column Strategy HUD Table */
         .draggable-strategy-box {{
-            position: absolute; bottom: 35px; right: 55px; z-index: 60;
+            position: absolute; bottom: 25px; right: 55px; z-index: 60;
             background: rgba(19, 23, 34, 0.97); border: 1px solid #2a2e39;
             border-radius: 6px; font-size: 9.5px; color: #d1d4dc; overflow: hidden;
             box-shadow: 0 4px 18px rgba(0,0,0,0.9); cursor: grab; user-select: none;
@@ -754,7 +733,6 @@ html_code = f"""
         }}
         .draggable-strategy-box th:first-child {{ text-align: left; }}
         .draggable-strategy-box td {{ padding: 3px 6px; border-bottom: 1px solid #222631; white-space: nowrap; }}
-        .draggable-strategy-box tr:last-child td {{ border-bottom: none; }}
         .label-cell {{ color: #787b86; font-weight: 500; text-align: left; }}
         .val-cell {{ font-weight: 700; color: #ffffff; text-align: right; }}
         .opt-cell {{ font-weight: 700; color: #ffd600; text-align: right; }}
@@ -802,6 +780,17 @@ html_code = f"""
             padding: 5px 8px; font-size: 9.5px; color: #d1d4dc; line-height: 1.4;
             box-shadow: 0 4px 12px rgba(0,0,0,0.7); transform: translate(-50%, -100%);
         }}
+
+        .alarm-ringing-banner {{
+            position: fixed; top: 8px; left: 50%; transform: translateX(-50%); z-index: 100;
+            background: #f23645; color: #ffffff; font-weight: 800; font-size: 11px;
+            padding: 6px 14px; border-radius: 20px; box-shadow: 0 0 20px rgba(242, 54, 69, 0.8);
+            cursor: pointer; display: none; animation: pulseAlarm 0.8s infinite alternate;
+        }}
+        @keyframes pulseAlarm {{
+            from {{ transform: translateX(-50%) scale(1); }}
+            to {{ transform: translateX(-50%) scale(1.06); }}
+        }}
     </style>
 </head>
 <body>
@@ -809,8 +798,8 @@ html_code = f"""
         🚨 SIGNAL CONFIRMED! [TAP TO MUTE] 🔇
     </div>
 
-    <!-- Top Status Bar & Drawing Controls -->
-    <div class="fixed-top-box">
+    <!-- Top Integrated Header -->
+    <div id="topHeaderArea">
         <div class="top-row-1">
             <div class="sym-group">
                 <span class="badge">50</span>
@@ -826,6 +815,22 @@ html_code = f"""
                 <button class="tf-btn" disabled>30m</button>
                 <button class="tf-btn" disabled>1h</button>
                 <button class="tf-btn" disabled>1D</button>
+            </div>
+
+            <!-- Client-Side Controls (Instant Switching, Zero Dull Flicker) -->
+            <div class="client-controls-bar">
+                <span>Strike:</span>
+                <select id="clientStrike" class="client-select" onchange="onOptionChanged()"></select>
+                <span>Exp:</span>
+                <select id="clientExp" class="client-select" onchange="onOptionChanged()"></select>
+                <select id="clientType" class="client-select" onchange="onOptionChanged()">
+                    <option value="CE" selected>CE</option>
+                    <option value="PE">PE</option>
+                </select>
+                <span>LTP: <b id="clientLTP" style="color: #ffd600;">₹0.00</b></span>
+                <span>Lots:</span>
+                <input id="clientLots" class="client-input" type="number" min="1" max="100" value="1" onchange="onOptionChanged()" />
+                <span>Qty: <b id="clientQty" style="color: #00bfa5;">65</b></span>
             </div>
 
             <div class="tools-bar">
@@ -850,16 +855,72 @@ html_code = f"""
         </div>
     </div>
 
+    <!-- Chart & Dynamic Overlays -->
+    <div id="chartArea"></div>
     <div id="strategyBox" class="draggable-strategy-box" style="display: none;"></div>
     <div id="activeToolsContainer"></div>
     <div id="historyTag" class="history-signal-tag"></div>
-    <div id="chartArea"></div>
 
     <script>
-        const activeRealLTP = {live_real_ltp};
-        const activeDelta = {active_delta};
-        const activeQty = {total_qty};
-        const activeContractLabel = "{selected_strike} {selected_type}";
+        const pricingBundle = {pricing_bundle_json};
+        const strikeList = {strikes_json};
+        const activeStrike = "{atm_strike}";
+        const expList = {expiries_json};
+        const LOT_SIZE = {LOT_SIZE_QTY};
+
+        const strikeSelect = document.getElementById('clientStrike');
+        strikeList.forEach(s => {{
+            const opt = document.createElement('option');
+            opt.value = s.toString();
+            opt.innerText = s.toString();
+            if (s.toString() === activeStrike) opt.selected = true;
+            strikeSelect.appendChild(opt);
+        }});
+
+        const expSelect = document.getElementById('clientExp');
+        if (expList && expList.length > 0) {{
+            expList.forEach((e, idx) => {{
+                const opt = document.createElement('option');
+                opt.value = e;
+                opt.innerText = e;
+                if (idx === 0) opt.selected = true;
+                expSelect.appendChild(opt);
+            }});
+        }} else {{
+            const opt = document.createElement('option');
+            opt.value = "CURRENT";
+            opt.innerText = "CURRENT";
+            expSelect.appendChild(opt);
+        }}
+
+        let activeRealLTP = 83.05;
+        let activeDelta = 0.50;
+        let activeQty = 65;
+
+        function getActiveOptionData() {{
+            const stk = document.getElementById('clientStrike').value;
+            const exp = document.getElementById('clientExp').value;
+            const typ = document.getElementById('clientType').value;
+
+            if (pricingBundle[exp] && pricingBundle[exp][stk] && pricingBundle[exp][stk][typ]) {{
+                return pricingBundle[exp][stk][typ];
+            }}
+            return {{ ltp: 83.05, delta: 0.50, symbol: 'NIFTY ' + stk + typ }};
+        }}
+
+        function onOptionChanged() {{
+            const data = getActiveOptionData();
+            const lots = parseInt(document.getElementById('clientLots').value) || 1;
+            activeRealLTP = data.ltp;
+            activeDelta = data.delta;
+            activeQty = lots * LOT_SIZE;
+
+            document.getElementById('clientLTP').innerText = '₹' + activeRealLTP.toFixed(2);
+            document.getElementById('clientQty').innerText = activeQty;
+
+            updateStrategyHUDTable();
+            refreshAllPositionWidgets();
+        }}
 
         let audioCtx = null;
         let alarmUnlocked = localStorage.getItem('nifty_alarm_active') === 'true';
@@ -878,39 +939,25 @@ html_code = f"""
         }}
 
         function toggleAudioAlarm() {{
-            if (!audioCtx) {{
-                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            }}
-            if (audioCtx.state === 'suspended') {{
-                audioCtx.resume();
-            }}
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if (audioCtx.state === 'suspended') audioCtx.resume();
             alarmUnlocked = !alarmUnlocked;
             localStorage.setItem('nifty_alarm_active', alarmUnlocked ? 'true' : 'false');
             updateAlarmButtonUI();
-            if (alarmUnlocked) {{
-                playBeepTone(880, 0.15);
-            }} else {{
-                silenceAlarmNow();
-            }}
+            if (alarmUnlocked) playBeepTone(880, 0.15);
+            else silenceAlarmNow();
         }}
 
         function silenceAlarmNow() {{
-            if (alarmTimer) {{
-                clearInterval(alarmTimer);
-                alarmTimer = null;
-            }}
+            if (alarmTimer) {{ clearInterval(alarmTimer); alarmTimer = null; }}
             document.getElementById('ringingBanner').style.display = 'none';
             sessionStorage.setItem('alarm_silenced_for_session', 'true');
         }}
 
         function playBeepTone(freq = 750, duration = 0.3) {{
             try {{
-                if (!audioCtx) {{
-                    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-                }}
-                if (audioCtx.state === 'suspended') {{
-                    audioCtx.resume();
-                }}
+                if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                if (audioCtx.state === 'suspended') audioCtx.resume();
                 const osc = audioCtx.createOscillator();
                 const gain = audioCtx.createGain();
                 osc.type = 'sine';
@@ -935,10 +982,11 @@ html_code = f"""
             }}, 2000);
         }}
 
-        const container = document.getElementById('chartArea');
-        const chart = LightweightCharts.createChart(container, {{
-            width: window.innerWidth,
-            height: window.innerHeight,
+        // Strict Viewport Resizing: Solves Timeframe Axis Overflow
+        const chartContainer = document.getElementById('chartArea');
+        const chart = LightweightCharts.createChart(chartContainer, {{
+            width: chartContainer.clientWidth,
+            height: chartContainer.clientHeight,
             layout: {{
                 background: {{ color: '#0b0e14' }},
                 textColor: '#787b86',
@@ -956,7 +1004,7 @@ html_code = f"""
             rightPriceScale: {{
                 borderColor: '#2a2e39',
                 autoScale: true,
-                scaleMargins: {{ top: 0.12, bottom: 0.20 }},
+                scaleMargins: {{ top: 0.12, bottom: 0.22 }},
             }},
             timeScale: {{
                 borderColor: '#2a2e39',
@@ -990,7 +1038,7 @@ html_code = f"""
         }});
         volumeSeries.setData({volume_json});
 
-        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
+        // 2 DOTS REMOVED: crosshairMarkerVisible: false
         const vwapSeries = chart.addLineSeries({{
             color: '#ab47bc',
             lineWidth: 2,
@@ -1000,7 +1048,7 @@ html_code = f"""
         }});
         vwapSeries.setData({vwap_json});
 
-        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
+        // 2 DOTS REMOVED: crosshairMarkerVisible: false
         const emaSeries = chart.addLineSeries({{
             color: '#2962ff',
             lineWidth: 1,
@@ -1012,11 +1060,9 @@ html_code = f"""
 
         candleSeries.setMarkers({markers_json});
 
-        // ORB Lines
         candleSeries.createPriceLine({{ price: {curr_orb_h:.2f}, color: '#089981', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'ORB HIGH' }});
         candleSeries.createPriceLine({{ price: {curr_orb_l:.2f}, color: '#f23645', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'ORB LOW' }});
 
-        // Floor Pivots
         const pv = {pivots_json};
         if (pv && pv.P) {{
             candleSeries.createPriceLine({{ price: pv.P, color: '#ffd600', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: 'PIVOT (P)' }});
@@ -1039,7 +1085,7 @@ html_code = f"""
         function activateDrawMode(mode) {{
             currentDrawMode = mode;
             drawPoints = [];
-            container.classList.add('chart-click-crosshair');
+            chartContainer.classList.add('chart-click-crosshair');
             ['btnFibR', 'btnFibE', 'btnLong', 'btnShort'].forEach(b => document.getElementById(b).classList.remove('active-draw'));
             if (mode === 'FIB_RETRACE') document.getElementById('btnFibR').classList.add('active-draw');
             if (mode === 'FIB_EXT') document.getElementById('btnFibE').classList.add('active-draw');
@@ -1050,7 +1096,7 @@ html_code = f"""
         function cancelDrawMode() {{
             currentDrawMode = null;
             drawPoints = [];
-            container.classList.remove('chart-click-crosshair');
+            chartContainer.classList.remove('chart-click-crosshair');
             ['btnFibR', 'btnFibE', 'btnLong', 'btnShort'].forEach(b => document.getElementById(b).classList.remove('active-draw'));
         }}
 
@@ -1141,6 +1187,10 @@ html_code = f"""
                 activePositionWidgets[idx].domElem.remove();
                 activePositionWidgets.splice(idx, 1);
             }}
+        }}
+
+        function refreshAllPositionWidgets() {{
+            activePositionWidgets.forEach(w => renderSinglePosWidget(w));
         }}
 
         function resizeWidgetTgt(e, id) {{
@@ -1268,11 +1318,12 @@ html_code = f"""
             document.getElementById('activeToolsContainer').appendChild(anchor);
         }}
 
-        // Dynamic 3-Column Strategy HUD Table
+        // Dynamic Strategy HUD
         const s = {hud_json};
         const table = document.getElementById('strategyBox');
 
-        if (s) {{
+        function updateStrategyHUDTable() {{
+            if (!s) return;
             table.style.display = 'block';
             if (s.is_no_trade) {{
                 table.innerHTML = `
@@ -1303,6 +1354,9 @@ html_code = f"""
                 const currentSign = currentTotalProfit >= 0 ? '+' : '';
                 const pnlColor = currentTotalProfit >= 0 ? '#089981' : '#f23645';
 
+                const stk = document.getElementById('clientStrike').value;
+                const typ = document.getElementById('clientType').value;
+
                 table.innerHTML = `
                     <div class="box-drag-handle">::: DRAG STRATEGY HUD :::</div>
                     <table>
@@ -1310,7 +1364,7 @@ html_code = f"""
                             <tr>
                                 <th>Parameter</th>
                                 <th>Index (Spot)</th>
-                                <th>Option (${{activeContractLabel}})</th>
+                                <th>Option (${{stk}} ${{typ}})</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -1440,9 +1494,18 @@ html_code = f"""
             }}
         }});
 
-        window.addEventListener('resize', () => {{
-            chart.applyOptions({{ width: window.innerWidth, height: window.innerHeight }});
-        }});
+        // Responsive Resizer to Keep Timeframe Axis in Viewport
+        function resizeChartProperly() {{
+            const w = chartContainer.clientWidth;
+            const h = chartContainer.clientHeight;
+            chart.applyOptions({{ width: w, height: h }});
+        }}
+
+        window.addEventListener('resize', resizeChartProperly);
+        setTimeout(resizeChartProperly, 250);
+
+        // Initial Boot Setup
+        onOptionChanged();
     </script>
 </body>
 </html>
@@ -1450,6 +1513,7 @@ html_code = f"""
 
 components.html(html_code, height=720, scrolling=False)
 
+# 15s live refresh
 st.markdown(
     """
     <script>
