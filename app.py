@@ -215,7 +215,7 @@ if len(unique_dates) >= 2:
             "PDH": pdh, "PDL": pdl
         }
 
-# ATM ± 1000 Strikes
+# ATM ± 1000 Strikes (41 strikes)
 atm_strike = int(round(spot_price / 50.0) * 50)
 strikes_list = [atm_strike + (x * 50) for x in range(-20, 21)]
 
@@ -229,80 +229,95 @@ if not nfo_df.empty:
     else:
         available_expiries = nfo_df["expiry"].dropna().drop_duplicates().tolist()
 
-# Read active selection from URL Query Parameters
-params = st.query_params
-active_strike_sel = str(params.get("opt_strike", str(atm_strike)))
-active_exp_sel = str(params.get("opt_exp", available_expiries[0] if available_expiries else "CURRENT"))
-active_type_sel = str(params.get("opt_type", "CE")).upper()
-active_lot_sel = int(params.get("opt_lots", 1))
-
 # Black-Scholes Greeks Calculation
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
-def compute_dynamic_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
+def compute_dynamic_greeks(s, k, days_to_exp, iv=0.14, r=0.07):
     tau = max(days_to_exp / 365.0, 0.001)
     d1 = (math.log(s / k) + (r + 0.5 * iv ** 2) * tau) / (iv * math.sqrt(tau))
-    ce_delta = norm_cdf(d1)
-    return round(ce_delta if is_ce else (1.0 - ce_delta), 2)
+    ce_delta = round(norm_cdf(d1), 2)
+    pe_delta = round(abs(ce_delta - 1.0), 2)
+    return ce_delta, pe_delta
 
-# Expiry Specific PCR and OI Max Levels
-expiry_slice = nfo_df[nfo_df["expiry"] == active_exp_sel] if not nfo_df.empty else pd.DataFrame()
-exp_dt_val = expiry_slice.iloc[0]["exp_dt"].date() if not expiry_slice.empty else today_dt
-days_to_exp = max((exp_dt_val - today_dt).days, 1)
-
-active_delta = compute_dynamic_delta(spot_price, float(active_strike_sel), days_to_exp, is_ce=(active_type_sel == "CE"))
-
-# Calculate PCR and OI Resistance/Support specifically for the chosen expiry
-ce_oi_map = {}
-pe_oi_map = {}
-total_ce_oi = 0
-total_pe_oi = 0
-
-for s in strikes_list:
-    weight = max(1, 40 - abs(strikes_list.index(s) - strikes_list.index(atm_strike)))
-    c_oi = int(weight * 85000 + (s * 3))
-    p_oi = int(weight * 92000 + (s * 2))
-    ce_oi_map[s] = c_oi
-    pe_oi_map[s] = p_oi
-    total_ce_oi += c_oi
-    total_pe_oi += p_oi
-
-pcr_value = round(total_pe_oi / max(total_ce_oi, 1), 2)
-oi_resistance_strike = max(ce_oi_map, key=ce_oi_map.get) if ce_oi_map else atm_strike + 200
-oi_support_strike = max(pe_oi_map, key=pe_oi_map.get) if pe_oi_map else atm_strike - 200
-
-# Market Breadth Advances/Declines
-adv_count = int(min(45, max(10, 25 + int((curr["close"] - df.iloc[0]["open"]) / 8.0))))
-dec_count = 50 - adv_count
-ad_ratio = round(adv_count / max(dec_count, 1), 2)
-
-# Direct Live Quote via SmartAPI for the selected contract
-live_real_ltp = 0.0
-target_symbol = ""
-target_token = ""
+# Build Complete Pricing Bundle Across Expiries & Strikes
+option_pricing_bundle = {}
+expiry_metrics = {}
 
 if not nfo_df.empty:
-    scrip_match = nfo_df[
-        (nfo_df["strike_num"] == float(active_strike_sel))
-        & (nfo_df["symbol"].str.endswith(active_type_sel))
-        & (nfo_df["expiry"] == active_exp_sel)
-    ]
-    if not scrip_match.empty:
-        target_symbol = str(scrip_match.iloc[0]["symbol"])
-        target_token = str(scrip_match.iloc[0]["token"])
+    for exp in available_expiries[:4]:
+        exp_slice = nfo_df[nfo_df["expiry"] == exp]
+        exp_dt_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_dt
+        days_to_expiry = max((exp_dt_val - today_dt).days, 1)
+
+        option_pricing_bundle[exp] = {}
+        ce_oi_map = {}
+        pe_oi_map = {}
+        exp_ce_oi_total = 0
+        exp_pe_oi_total = 0
+
+        for s in strikes_list:
+            ce_scrip = exp_slice[(exp_slice["strike_num"] == s) & (exp_slice["symbol"].str.endswith("CE"))]
+            pe_scrip = exp_slice[(exp_slice["strike_num"] == s) & (exp_slice["symbol"].str.endswith("PE"))]
+
+            ce_sym = str(ce_scrip.iloc[0]["symbol"]) if not ce_scrip.empty else f"NIFTY{exp}{s}CE"
+            pe_sym = str(pe_scrip.iloc[0]["symbol"]) if not pe_scrip.empty else f"NIFTY{exp}{s}PE"
+            ce_tok = str(ce_scrip.iloc[0]["token"]) if not ce_scrip.empty else ""
+            pe_tok = str(pe_scrip.iloc[0]["token"]) if not pe_scrip.empty else ""
+
+            ce_delta, pe_delta = compute_dynamic_greeks(spot_price, s, days_to_expiry)
+
+            ce_diff = spot_price - s
+            pe_diff = s - spot_price
+            ce_approx = max(1.5, round(max(0.0, ce_diff) + (math.sqrt(days_to_expiry) * 22.0) - (abs(ce_diff) * 0.08), 2))
+            pe_approx = max(1.5, round(max(0.0, pe_diff) + (math.sqrt(days_to_expiry) * 22.0) - (abs(pe_diff) * 0.08), 2))
+
+            # Expiry-specific open interest modeling
+            dist = abs(strikes_list.index(s) - strikes_list.index(atm_strike))
+            weight = max(1, 40 - dist)
+            ce_oi = int(weight * 85000 + (s * 3) + (days_to_expiry * 1200))
+            pe_oi = int(weight * 92000 + (s * 2) + (days_to_expiry * 1100))
+
+            ce_oi_map[s] = ce_oi
+            pe_oi_map[s] = pe_oi
+            exp_ce_oi_total += ce_oi
+            exp_pe_oi_total += pe_oi
+
+            option_pricing_bundle[exp][str(s)] = {
+                "CE": {"symbol": ce_sym, "token": ce_tok, "delta": ce_delta, "ltp": ce_approx, "oi": ce_oi},
+                "PE": {"symbol": pe_sym, "token": pe_tok, "delta": pe_delta, "ltp": pe_approx, "oi": pe_oi},
+            }
+
+        # Per-expiry PCR and Support/Resistance calculation
+        pcr = round(exp_pe_oi_total / max(exp_ce_oi_total, 1), 2)
+        res_strike = max(ce_oi_map, key=ce_oi_map.get) if ce_oi_map else atm_strike + 200
+        sup_strike = max(pe_oi_map, key=pe_oi_map.get) if pe_oi_map else atm_strike - 200
+
+        expiry_metrics[exp] = {
+            "pcr": pcr,
+            "res": res_strike,
+            "sup": sup_strike,
+            "days": days_to_expiry,
+        }
+
+# Live quote check for ATM CE of primary expiry
+primary_exp = available_expiries[0] if available_expiries else "CURRENT"
+if primary_exp in option_pricing_bundle and str(atm_strike) in option_pricing_bundle[primary_exp]:
+    atm_ce = option_pricing_bundle[primary_exp][str(atm_strike)]["CE"]
+    if atm_ce["token"]:
         try:
-            res = api.ltpData("NFO", target_symbol, target_token)
+            res = api.ltpData("NFO", atm_ce["symbol"], atm_ce["token"])
             if isinstance(res, dict) and res.get("status") and res.get("data"):
-                val = float(res["data"].get("ltp", 0.0))
-                if val > 0.0:
-                    live_real_ltp = val
+                q_ltp = float(res["data"].get("ltp", 0.0))
+                if q_ltp > 0.0:
+                    option_pricing_bundle[primary_exp][str(atm_strike)]["CE"]["ltp"] = q_ltp
         except Exception:
             pass
 
-if live_real_ltp <= 0.0:
-    diff = (spot_price - float(active_strike_sel)) if active_type_sel == "CE" else (float(active_strike_sel) - spot_price)
-    live_real_ltp = max(1.5, round(max(0.0, diff) + (math.sqrt(days_to_exp) * 22.0) - (abs(diff) * 0.08), 2))
+# Nifty 50 Advance / Decline Ratio
+adv_count = int(min(45, max(10, 25 + int((curr["close"] - df.iloc[0]["open"]) / 8.0))))
+dec_count = 50 - adv_count
+ad_ratio = round(adv_count / max(dec_count, 1), 2)
 
 # Strategy Engine
 markers = []
@@ -617,6 +632,8 @@ elif latest_trade_for_hud:
     }
 
 # Serialization
+pricing_bundle_json = json.dumps(option_pricing_bundle)
+expiry_metrics_json = json.dumps(expiry_metrics)
 strikes_json = json.dumps(strikes_list)
 expiries_json = json.dumps(available_expiries)
 candles_json = json.dumps(candles_data)
@@ -654,7 +671,7 @@ html_code = f"""
         }}
 
         #topHeaderArea {{
-            width: 100vw; height: 60px;
+            width: 100vw; height: 62px;
             background: #0b0e14;
             padding: 4px 8px;
             display: flex; flex-direction: column; gap: 3px;
@@ -736,14 +753,15 @@ html_code = f"""
         }}
         .dynamic-ohlc-row b {{ color: #d1d4dc; }}
 
+        /* Constrained Chart Area: Guaranteed Visible Time Axis & Volume Bars */
         #chartArea {{
-            width: 100vw; height: calc(100vh - 60px);
-            position: relative; flex: 1;
+            width: 100vw; height: calc(100vh - 62px);
+            position: relative; flex: 1 1 auto;
             overflow: hidden;
         }}
 
         .draggable-strategy-box {{
-            position: absolute; bottom: 25px; right: 55px; z-index: 60;
+            position: absolute; bottom: 35px; right: 55px; z-index: 60;
             background: rgba(19, 23, 34, 0.97); border: 1px solid #2a2e39;
             border-radius: 6px; font-size: 9.5px; color: #d1d4dc; overflow: hidden;
             box-shadow: 0 4px 18px rgba(0,0,0,0.9); cursor: grab; user-select: none;
@@ -844,27 +862,27 @@ html_code = f"""
                 <button class="tf-btn" disabled>1D</button>
             </div>
 
-            <!-- Instant Query Parameter Synchronization -->
+            <!-- Instant Zero-Flicker Client-Side Controls -->
             <div class="client-controls-bar">
                 <span>Strike:</span>
-                <select id="clientStrike" class="client-select" onchange="syncSelectionToBackend()"></select>
+                <select id="clientStrike" class="client-select" onchange="onOptionChanged()"></select>
                 <span>Exp:</span>
-                <select id="clientExp" class="client-select" onchange="syncSelectionToBackend()"></select>
-                <select id="clientType" class="client-select" onchange="syncSelectionToBackend()">
-                    <option value="CE" {'selected' if active_type_sel == 'CE' else ''}>CE</option>
-                    <option value="PE" {'selected' if active_type_sel == 'PE' else ''}>PE</option>
+                <select id="clientExp" class="client-select" onchange="onExpiryChanged()"></select>
+                <select id="clientType" class="client-select" onchange="onOptionChanged()">
+                    <option value="CE" selected>CE</option>
+                    <option value="PE">PE</option>
                 </select>
-                <span>LTP: <b id="clientLTP" style="color: #ffd600;">₹{live_real_ltp:.2f}</b></span>
+                <span>LTP: <b id="clientLTP" style="color: #ffd600;">₹0.00</b></span>
                 <span>Lots:</span>
-                <input id="clientLots" class="client-input" type="number" min="1" max="100" value="{active_lot_sel}" onchange="syncSelectionToBackend()" />
-                <span>Qty: <b id="clientQty" style="color: #00bfa5;">{active_lot_sel * LOT_SIZE_QTY}</b></span>
-                <span>Delta: <b id="clientDelta" style="color: #ab47bc;">{active_delta:.2f}</b></span>
+                <input id="clientLots" class="client-input" type="number" min="1" max="100" value="1" onchange="onOptionChanged()" />
+                <span>Qty: <b id="clientQty" style="color: #00bfa5;">65</b></span>
+                <span>Delta: <b id="clientDelta" style="color: #ab47bc;">0.50</b></span>
             </div>
 
-            <div class="info-pill">PCR: <b style="color:#00e5ff;">{pcr_value}</b></div>
+            <div class="info-pill">PCR: <b id="dispPCR" style="color:#00e5ff;">1.00</b></div>
             <div class="info-pill">A/D: <b style="color:#089981;">{adv_count}:{dec_count}</b> ({ad_ratio})</div>
-            <div class="info-pill">OI Res: <b style="color:#f23645;">{oi_resistance_strike}</b></div>
-            <div class="info-pill">OI Sup: <b style="color:#089981;">{oi_support_strike}</b></div>
+            <div class="info-pill">OI Res: <b id="dispRes" style="color:#f23645;">22600</b></div>
+            <div class="info-pill">OI Sup: <b id="dispSup" style="color:#089981;">22400</b></div>
 
             <div class="tools-bar">
                 <button id="btnFibR" class="tool-btn" onclick="activateDrawMode('FIB_RETRACE')">+ Fib Retrace</button>
@@ -888,21 +906,19 @@ html_code = f"""
         </div>
     </div>
 
+    <!-- Chart Canvas Container -->
     <div id="chartArea"></div>
     <div id="strategyBox" class="draggable-strategy-box" style="display: none;"></div>
     <div id="activeToolsContainer"></div>
     <div id="historyTag" class="history-signal-tag"></div>
 
     <script>
+        const pricingBundle = {pricing_bundle_json};
+        const expiryMetrics = {expiry_metrics_json};
         const strikeList = {strikes_json};
-        const activeStrike = "{active_strike_sel}";
+        const activeStrike = "{atm_strike}";
         const expList = {expiries_json};
-        const activeExp = "{active_exp_sel}";
-        const activeRealLTP = {live_real_ltp};
-        const activeDelta = {active_delta};
-        const activeLots = {active_lot_sel};
         const LOT_SIZE = {LOT_SIZE_QTY};
-        const activeQty = activeLots * LOT_SIZE;
 
         const strikeSelect = document.getElementById('clientStrike');
         strikeList.forEach(s => {{
@@ -915,11 +931,11 @@ html_code = f"""
 
         const expSelect = document.getElementById('clientExp');
         if (expList && expList.length > 0) {{
-            expList.forEach(e => {{
+            expList.forEach((e, idx) => {{
                 const opt = document.createElement('option');
                 opt.value = e;
                 opt.innerText = e;
-                if (e === activeExp) opt.selected = true;
+                if (idx === 0) opt.selected = true;
                 expSelect.appendChild(opt);
             }});
         }} else {{
@@ -929,18 +945,44 @@ html_code = f"""
             expSelect.appendChild(opt);
         }}
 
-        function syncSelectionToBackend() {{
+        let activeRealLTP = 83.05;
+        let activeDelta = 0.50;
+        let activeQty = 65;
+
+        function getActiveOptionData() {{
             const stk = document.getElementById('clientStrike').value;
             const exp = document.getElementById('clientExp').value;
             const typ = document.getElementById('clientType').value;
-            const lots = document.getElementById('clientLots').value;
 
-            const url = new URL(window.parent.location.href);
-            url.searchParams.set('opt_strike', stk);
-            url.searchParams.set('opt_exp', exp);
-            url.searchParams.set('opt_type', typ);
-            url.searchParams.set('opt_lots', lots);
-            window.parent.location.href = url.href;
+            if (pricingBundle[exp] && pricingBundle[exp][stk] && pricingBundle[exp][stk][typ]) {{
+                return pricingBundle[exp][stk][typ];
+            }}
+            return {{ ltp: 83.05, delta: 0.50, symbol: 'NIFTY ' + stk + typ }};
+        }}
+
+        function onExpiryChanged() {{
+            const exp = document.getElementById('clientExp').value;
+            if (expiryMetrics[exp]) {{
+                document.getElementById('dispPCR').innerText = expiryMetrics[exp].pcr.toFixed(2);
+                document.getElementById('dispRes').innerText = expiryMetrics[exp].res;
+                document.getElementById('dispSup').innerText = expiryMetrics[exp].sup;
+            }}
+            onOptionChanged();
+        }}
+
+        function onOptionChanged() {{
+            const data = getActiveOptionData();
+            const lots = parseInt(document.getElementById('clientLots').value) || 1;
+            activeRealLTP = data.ltp;
+            activeDelta = data.delta;
+            activeQty = lots * LOT_SIZE;
+
+            document.getElementById('clientLTP').innerText = '₹' + activeRealLTP.toFixed(2);
+            document.getElementById('clientDelta').innerText = activeDelta.toFixed(2);
+            document.getElementById('clientQty').innerText = activeQty;
+
+            updateStrategyHUDTable();
+            refreshAllPositionWidgets();
         }}
 
         let audioCtx = null;
@@ -1003,7 +1045,7 @@ html_code = f"""
             }}, 2000);
         }}
 
-        // Strict Viewport Resizing: Solves Timeframe Axis Overflow
+        // Strict Viewport Resizing: Eliminates Timeframe Axis Overflow
         const chartContainer = document.getElementById('chartArea');
         const chart = LightweightCharts.createChart(chartContainer, {{
             width: chartContainer.clientWidth,
@@ -1031,7 +1073,9 @@ html_code = f"""
                 borderColor: '#2a2e39',
                 timeVisible: true,
                 secondsVisible: false,
-                rightOffset: 8
+                rightOffset: 8,
+                fixLeftEdge: true,
+                fixRightEdge: true,
             }},
             localization: {{
                 priceFormatter: p => p.toFixed(2)
@@ -1059,7 +1103,7 @@ html_code = f"""
         }});
         volumeSeries.setData({volume_json});
 
-        // 2 DOTS REMOVED: crosshairMarkerVisible: false
+        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
         const vwapSeries = chart.addLineSeries({{
             color: '#ab47bc',
             lineWidth: 2,
@@ -1069,7 +1113,7 @@ html_code = f"""
         }});
         vwapSeries.setData({vwap_json});
 
-        // 2 DOTS REMOVED: crosshairMarkerVisible: false
+        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
         const emaSeries = chart.addLineSeries({{
             color: '#2962ff',
             lineWidth: 1,
@@ -1097,8 +1141,9 @@ html_code = f"""
             candleSeries.createPriceLine({{ price: pv.PDL, color: '#fb8c00', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'PDL' }});
         }}
 
-        candleSeries.createPriceLine({{ price: {oi_resistance_strike}, color: '#e91e63', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'OI RESISTANCE' }});
-        candleSeries.createPriceLine({{ price: {oi_support_strike}, color: '#00e676', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'OI SUPPORT' }});
+        // Dynamic OI Levels Reference Lines
+        let oiResLine = candleSeries.createPriceLine({{ price: {atm_strike + 200}, color: '#e91e63', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'OI RES' }});
+        let oiSupLine = candleSeries.createPriceLine({{ price: {atm_strike - 200}, color: '#00e676', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'OI SUP' }});
 
         let toolCounter = 0;
         let currentDrawMode = null;
@@ -1344,7 +1389,8 @@ html_code = f"""
         const s = {hud_json};
         const table = document.getElementById('strategyBox');
 
-        if (s) {{
+        function updateStrategyHUDTable() {{
+            if (!s) return;
             table.style.display = 'block';
             if (s.is_no_trade) {{
                 table.innerHTML = `
@@ -1375,6 +1421,9 @@ html_code = f"""
                 const currentSign = currentTotalProfit >= 0 ? '+' : '';
                 const pnlColor = currentTotalProfit >= 0 ? '#089981' : '#f23645';
 
+                const stk = document.getElementById('clientStrike').value;
+                const typ = document.getElementById('clientType').value;
+
                 table.innerHTML = `
                     <div class="box-drag-handle">::: DRAG STRATEGY HUD :::</div>
                     <table>
@@ -1382,7 +1431,7 @@ html_code = f"""
                             <tr>
                                 <th>Parameter</th>
                                 <th>Index (Spot)</th>
-                                <th>Option (${{activeStrike}} ${{activeExp}})</th>
+                                <th>Option (${{stk}} ${{typ}})</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -1519,12 +1568,14 @@ html_code = f"""
 
         window.addEventListener('resize', resizeChartProperly);
         setTimeout(resizeChartProperly, 250);
+
+        onExpiryChanged();
     </script>
 </body>
 </html>
 """
 
-components.html(html_code, height=720, scrolling=False)
+components.html(html_code, height=860, scrolling=False)
 
 # 15s live refresh
 st.markdown(
