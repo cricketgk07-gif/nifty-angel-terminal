@@ -16,7 +16,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# 1. CSS to completely kill the dull/bright reload flicker and fit taskbar perfectly
 st.markdown(
     """
 <style>
@@ -28,7 +27,6 @@ st.markdown(
         height: 100vh !important;
         overflow: hidden !important;
     }
-    /* Eliminate dull grey flicker when Streamlit reruns */
     .stApp[data-test-script-state="running"] {
         opacity: 1 !important;
         filter: none !important;
@@ -37,7 +35,6 @@ st.markdown(
     div[data-testid="stStatusWidget"] {
         display: none !important;
     }
-    /* Clean horizontal controls row */
     div[data-testid="column"] {
         padding: 0 4px !important;
     }
@@ -254,7 +251,7 @@ if not nfo_df.empty:
     else:
         available_expiries = nfo_df["expiry"].dropna().drop_duplicates().tolist()
 
-# ----------------- LIVE PYTHON CONTROLS ROW -----------------
+# ----------------- LIVE CONTROLS ROW -----------------
 ctrl_cols = st.columns([1.3, 1.4, 0.8, 0.8, 4.7])
 
 with ctrl_cols[0]:
@@ -707,7 +704,7 @@ html_code = f"""
         }}
 
         #topHeaderArea {{
-            width: 100vw; height: 50px;
+            width: 100vw; height: 44px;
             background: #0b0e14;
             padding: 3px 8px;
             display: flex; align-items: center; justify-content: space-between;
@@ -768,17 +765,21 @@ html_code = f"""
         }}
         .dynamic-ohlc-row b {{ color: #d1d4dc; }}
 
-        /* Dedicated Viewport Height to Ensure Bottom Time Axis is 100% Visible Above Taskbar */
+        /* Chart Canvas Area strictly sized for time axis visibility */
         #chartArea {{
             width: 100vw;
-            height: calc(100vh - 50px);
+            height: calc(100vh - 44px);
             position: relative;
             flex: 1 1 auto;
             overflow: hidden;
+            cursor: grab;
+        }}
+        #chartArea:active {{
+            cursor: grabbing;
         }}
 
         .draggable-strategy-box {{
-            position: absolute; bottom: 35px; right: 55px; z-index: 60;
+            position: absolute; bottom: 30px; right: 55px; z-index: 60;
             background: rgba(19, 23, 34, 0.97); border: 1px solid #2a2e39;
             border-radius: 6px; font-size: 9.5px; color: #d1d4dc; overflow: hidden;
             box-shadow: 0 4px 18px rgba(0,0,0,0.9); cursor: grab; user-select: none;
@@ -976,7 +977,7 @@ html_code = f"""
             }}, 2000);
         }}
 
-        // Strict Element Pixel Measurement: Fixes Missing Bottom Time Axis
+        // Full Interactive Dragging and Scaling Enabled
         const chartContainer = document.getElementById('chartArea');
         const chart = LightweightCharts.createChart(chartContainer, {{
             width: chartContainer.clientWidth,
@@ -995,10 +996,21 @@ html_code = f"""
                 vertLine: {{ color: '#758696', width: 1, style: 3 }},
                 horzLine: {{ color: '#758696', width: 1, style: 3 }}
             }},
+            handleScroll: {{
+                mouseWheel: true,
+                pressedMouseMove: true,
+                horzTouchDrag: true,
+                vertTouchDrag: true
+            }},
+            handleScale: {{
+                axisPressedMouseMove: true,
+                mouseWheel: true,
+                pinch: true
+            }},
             rightPriceScale: {{
                 borderColor: '#2a2e39',
                 autoScale: true,
-                scaleMargins: {{ top: 0.12, bottom: 0.25 }},
+                scaleMargins: {{ top: 0.10, bottom: 0.22 }},
                 entireTextOnly: true,
             }},
             timeScale: {{
@@ -1007,8 +1019,7 @@ html_code = f"""
                 secondsVisible: false,
                 rightOffset: 8,
                 barSpacing: 6,
-                fixLeftEdge: true,
-                fixRightEdge: true,
+                minBarSpacing: 1.5,
             }},
             localization: {{
                 priceFormatter: p => p.toFixed(2)
@@ -1036,7 +1047,6 @@ html_code = f"""
         }});
         volumeSeries.setData({volume_json});
 
-        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
         const vwapSeries = chart.addLineSeries({{
             color: '#ab47bc',
             lineWidth: 2,
@@ -1046,7 +1056,6 @@ html_code = f"""
         }});
         vwapSeries.setData({vwap_json});
 
-        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
         const emaSeries = chart.addLineSeries({{
             color: '#2962ff',
             lineWidth: 1,
@@ -1074,7 +1083,6 @@ html_code = f"""
             candleSeries.createPriceLine({{ price: pv.PDL, color: '#fb8c00', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'PDL' }});
         }}
 
-        // Dynamic Expiry-Specific OI Levels
         candleSeries.createPriceLine({{ price: {oi_res_strike}, color: '#e91e63', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'OI RES' }});
         candleSeries.createPriceLine({{ price: {oi_sup_strike}, color: '#00e676', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'OI SUP' }});
 
@@ -1188,6 +1196,10 @@ html_code = f"""
                 activePositionWidgets[idx].domElem.remove();
                 activePositionWidgets.splice(idx, 1);
             }}
+        }}
+
+        function refreshAllPositionWidgets() {{
+            activePositionWidgets.forEach(w => renderSinglePosWidget(w));
         }}
 
         function resizeWidgetTgt(e, id) {{
@@ -1492,15 +1504,15 @@ html_code = f"""
         }}
 
         window.addEventListener('resize', resizeChartProperly);
-        setTimeout(resizeChartProperly, 250);
+        setTimeout(resizeChartProperly, 200);
     </script>
 </body>
 </html>
 """
 
-components.html(html_code, height=800, scrolling=False)
+components.html(html_code, height=720, scrolling=False)
 
-# 15s live refresh
+# 15s auto-refresh polling
 st.markdown(
     """
     <script>
