@@ -52,7 +52,6 @@ st.markdown(
     iframe {
         border: none !important;
         width: 100vw !important;
-        height: calc(100vh - 55px) !important;
         display: block !important;
         overflow: hidden !important;
     }
@@ -135,7 +134,7 @@ def fetch_nifty_candles():
     for _ in range(4):
         chunk_start = current_end - datetime.timedelta(days=7)
         from_str = chunk_start.strftime("%Y-%m-%d 09:15")
-        to_str = current_end.strftime("%Y-%m-%d 15:30")
+        to_str = current_end.strftime("%Y-%m-%d 23:59")
 
         try:
             resp = api.getCandleData(
@@ -169,8 +168,8 @@ def fetch_nifty_candles():
         df[col] = pd.to_numeric(df[col])
 
     df = df[(df["open"] > 1000) & (df["high"] > 1000) & (df["low"] > 1000) & (df["close"] > 1000)].copy()
-    
-    # Keep full market session up to 15:30 candle without clipping
+
+    # Retain full trading window through 15:30
     df = df[
         (df["dt"].dt.time >= datetime.time(9, 15))
         & (df["dt"].dt.time <= datetime.time(15, 30))
@@ -241,7 +240,7 @@ if len(unique_dates) >= 2:
             "PDH": pdh, "PDL": pdl
         }
 
-# ATM ± 1000 Strikes (41 strikes)
+# ATM ± 1000 Strikes
 atm_strike = int(round(spot_price / 50.0) * 50)
 strikes_list = [atm_strike + (x * 50) for x in range(-20, 21)]
 
@@ -308,7 +307,7 @@ pcr_value = round(total_pe_oi / max(total_ce_oi, 1), 2)
 oi_res_strike = max(ce_oi_map, key=ce_oi_map.get) if ce_oi_map else atm_strike + 200
 oi_sup_strike = max(pe_oi_map, key=pe_oi_map.get) if pe_oi_map else atm_strike - 200
 
-# Live Quote from Angel One for selected contract
+# Live Quote from Angel One
 live_real_ltp = 0.0
 target_symbol = ""
 target_token = ""
@@ -337,7 +336,7 @@ if live_real_ltp <= 0.0:
 
 total_qty = sel_lots * LOT_SIZE_QTY
 
-# Nifty 50 Advance / Decline Ratio
+# Nifty 50 Advance / Decline Calculation
 adv_count = int(min(45, max(10, 25 + int((curr["close"] - df.iloc[0]["open"]) / 8.0))))
 dec_count = 50 - adv_count
 ad_ratio = round(adv_count / max(dec_count, 1), 2)
@@ -708,7 +707,7 @@ html_code = f"""
         }}
 
         #topHeaderArea {{
-            width: 100vw; height: 40px;
+            width: 100vw; height: 38px;
             background: #0b0e14;
             padding: 2px 8px;
             display: flex; align-items: center; justify-content: space-between;
@@ -769,13 +768,14 @@ html_code = f"""
         }}
         .dynamic-ohlc-row b {{ color: #d1d4dc; }}
 
-        /* Chart Area Pinned Explicitly to Ensure Time Axis Sits Above Taskbar */
+        /* Strict margin budget so that time scale is 100% visible above Manage App button */
         #chartArea {{
             width: 100vw;
-            height: calc(100vh - 40px);
+            height: calc(100vh - 105px);
             position: relative;
             flex: 1 1 auto;
             overflow: hidden;
+            margin-bottom: 25px;
             cursor: default !important;
         }}
 
@@ -978,6 +978,7 @@ html_code = f"""
             }}, 2000);
         }}
 
+        // Direct Sizing: Pins time axis cleanly inside frame
         const chartContainer = document.getElementById('chartArea');
         const chart = LightweightCharts.createChart(chartContainer, {{
             width: chartContainer.clientWidth,
@@ -1010,18 +1011,20 @@ html_code = f"""
             rightPriceScale: {{
                 borderColor: '#2a2e39',
                 autoScale: true,
-                scaleMargins: {{ top: 0.08, bottom: 0.18 }},
+                scaleMargins: {{ top: 0.08, bottom: 0.20 }},
                 entireTextOnly: true,
             }},
             timeScale: {{
                 borderColor: '#2a2e39',
                 timeVisible: true,
                 secondsVisible: false,
-                rightOffset: 12,
+                rightOffset: 8,
                 barSpacing: 6,
                 minBarSpacing: 1.5,
                 fixLeftEdge: false,
                 fixRightEdge: false,
+                visible: true,
+                borderVisible: true,
             }},
             localization: {{
                 priceFormatter: p => p.toFixed(2)
@@ -1042,10 +1045,10 @@ html_code = f"""
         const volumeSeries = chart.addHistogramSeries({{
             priceFormat: {{ type: 'volume' }},
             priceScaleId: 'vol_scale',
-            scaleMargins: {{ top: 0.82, bottom: 0.02 }}
+            scaleMargins: {{ top: 0.80, bottom: 0.04 }}
         }});
         chart.priceScale('vol_scale').applyOptions({{
-            scaleMargins: {{ top: 0.82, bottom: 0.02 }}
+            scaleMargins: {{ top: 0.80, bottom: 0.04 }}
         }});
         volumeSeries.setData({volume_json});
 
@@ -1515,7 +1518,7 @@ html_code = f"""
 </html>
 """
 
-components.html(html_code, scrolling=False)
+components.html(html_code, height=650, scrolling=False)
 
 # 15s auto-refresh polling
 st.markdown(
