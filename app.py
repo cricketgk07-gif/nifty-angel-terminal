@@ -1708,3 +1708,4 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
+send_telegram_alert("✅ <b>TEST SUCCESS:</b> Nifty Terminal Alert Engine is Connected!")
