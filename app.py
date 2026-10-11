@@ -21,7 +21,7 @@ st.markdown(
 <style>
     #MainMenu, footer, header {display: none !important;}
     .block-container {
-        padding: 4px 10px !important;
+        padding: 4px 8px !important;
         margin: 0 !important;
         max-width: 100vw !important;
         height: 100vh !important;
@@ -36,7 +36,7 @@ st.markdown(
         display: none !important;
     }
     div[data-testid="column"] {
-        padding: 0 4px !important;
+        padding: 0 3px !important;
     }
     div[data-testid="stSelectbox"] label, div[data-testid="stNumberInput"] label {
         display: none !important;
@@ -46,13 +46,14 @@ st.markdown(
         color: #ffd600 !important;
         border: 1px solid #2a2e39 !important;
         border-radius: 4px !important;
-        font-size: 12px !important;
+        font-size: 11px !important;
+        min-height: 32px !important;
     }
     iframe {
         border: none !important;
         width: 100vw !important;
-        height: calc(100vh - 65px) !important;
         display: block !important;
+        overflow: hidden !important;
     }
     body {
         background-color: #0b0e14;
@@ -131,9 +132,9 @@ def fetch_nifty_candles():
     current_end = now_dt
 
     for _ in range(4):
-        chunk_start = current_end - datetime.timedelta(days=6)
+        chunk_start = current_end - datetime.timedelta(days=7)
         from_str = chunk_start.strftime("%Y-%m-%d 09:15")
-        to_str = current_end.strftime("%Y-%m-%d %H:%M")
+        to_str = current_end.strftime("%Y-%m-%d 23:59")
 
         try:
             resp = api.getCandleData(
@@ -167,6 +168,8 @@ def fetch_nifty_candles():
         df[col] = pd.to_numeric(df[col])
 
     df = df[(df["open"] > 1000) & (df["high"] > 1000) & (df["low"] > 1000) & (df["close"] > 1000)].copy()
+
+    # Retain full trading window through 15:30
     df = df[
         (df["dt"].dt.time >= datetime.time(9, 15))
         & (df["dt"].dt.time <= datetime.time(15, 30))
@@ -251,8 +254,8 @@ if not nfo_df.empty:
     else:
         available_expiries = nfo_df["expiry"].dropna().drop_duplicates().tolist()
 
-# ----------------- LIVE CONTROLS ROW -----------------
-ctrl_cols = st.columns([1.3, 1.4, 0.8, 0.8, 4.7])
+# Top Controls Row
+ctrl_cols = st.columns([1.2, 1.4, 0.8, 0.8, 4.8])
 
 with ctrl_cols[0]:
     default_strike_idx = strikes_list.index(atm_strike) if atm_strike in strikes_list else 20
@@ -304,7 +307,7 @@ pcr_value = round(total_pe_oi / max(total_ce_oi, 1), 2)
 oi_res_strike = max(ce_oi_map, key=ce_oi_map.get) if ce_oi_map else atm_strike + 200
 oi_sup_strike = max(pe_oi_map, key=pe_oi_map.get) if pe_oi_map else atm_strike - 200
 
-# Live Quote from Angel One for the exact selected contract
+# Live Quote from Angel One
 live_real_ltp = 0.0
 target_symbol = ""
 target_token = ""
@@ -338,13 +341,12 @@ adv_count = int(min(45, max(10, 25 + int((curr["close"] - df.iloc[0]["open"]) / 
 dec_count = 50 - adv_count
 ad_ratio = round(adv_count / max(dec_count, 1), 2)
 
-# Display real-time stats pill
 with ctrl_cols[4]:
     st.markdown(
         f"""
-        <div style="background:#161a25; border:1px solid #2a2e39; border-radius:4px; padding:5px 10px; display:flex; gap:12px; align-items:center; font-size:12px; height:38px;">
+        <div style="background:#161a25; border:1px solid #2a2e39; border-radius:4px; padding:3px 8px; display:flex; gap:10px; align-items:center; font-size:11px; height:32px;">
             <div>Contract: <b style="color:#00e5ff;">{target_symbol or f'NIFTY{sel_expiry}{sel_strike}{sel_type}'}</b></div>
-            <div>LTP: <b style="color:#ffd600; font-size:14px;">₹{live_real_ltp:.2f}</b></div>
+            <div>LTP: <b style="color:#ffd600; font-size:13px;">₹{live_real_ltp:.2f}</b></div>
             <div>Qty: <b style="color:#089981;">{total_qty}</b> ({sel_lots}L)</div>
             <div>Delta: <b style="color:#ab47bc;">{active_delta:.2f}</b></div>
             <div>PCR: <b style="color:#00e5ff;">{pcr_value}</b></div>
@@ -356,11 +358,80 @@ with ctrl_cols[4]:
         unsafe_allow_html=True,
     )
 
-# Strategy Engine
+
+# --- DYNAMIC SHELF RUNNER ENGINE WITH FIB EXTENSIONS ---
+def extract_intraday_swings(day_data, current_idx, window=2):
+    """Identifies fractal swing highs and lows prior to the breakout candle."""
+    swings_h = []
+    swings_l = []
+    for i in range(window, max(window, current_idx)):
+        h = day_data.iloc[i]["high"]
+        l = day_data.iloc[i]["low"]
+        if (i - window >= 0) and (i + window < len(day_data)):
+            if all(day_data.iloc[i - k]["high"] <= h for k in range(1, window + 1)) and \
+               all(day_data.iloc[i + k]["high"] <= h for k in range(1, window + 1)):
+                swings_h.append(round(float(h), 1))
+            if all(day_data.iloc[i - k]["low"] >= l for k in range(1, window + 1)) and \
+               all(day_data.iloc[i + k]["low"] >= l for k in range(1, window + 1)):
+                swings_l.append(round(float(l), 1))
+    return swings_h, swings_l
+
+
+def build_dynamic_shelves(entry_p, t_type, pv_dict, oi_target, atr_v, sw_h, sw_l, orb_h, orb_l):
+    """
+    Combines Major Swings, Floor Pivots, PDH/PDL, Max OI, 3*ATR, and Fibonacci ORB Extensions
+    (100%, 161.8%, 261.8%) into directionally sorted shelves. Sets farthest as Max Run target.
+    """
+    orb_range = max(10.0, orb_h - orb_l)
+    atr_3x = entry_p + (3.0 * atr_v) if t_type == "CE" else entry_p - (3.0 * atr_v)
+    
+    # Calculate Fibonacci ORB Extensions
+    fib_100 = round(orb_h + (1.000 * orb_range), 1) if t_type == "CE" else round(orb_l - (1.000 * orb_range), 1)
+    fib_161 = round(orb_h + (1.618 * orb_range), 1) if t_type == "CE" else round(orb_l - (1.618 * orb_range), 1)
+    fib_261 = round(orb_h + (2.618 * orb_range), 1) if t_type == "CE" else round(orb_l - (2.618 * orb_range), 1)
+
+    candidates = []
+
+    if t_type == "CE":
+        pool = [
+            pv_dict.get("R1"), pv_dict.get("R2"), pv_dict.get("R3"),
+            pv_dict.get("PDH"),
+            oi_target,
+            atr_3x,
+            fib_100, fib_161, fib_261
+        ] + sw_h
+        raw = sorted(list(set([round(float(x), 1) for x in pool if x and float(x) > (entry_p + 4.0)])))
+        for level in raw:
+            if not candidates or (level - candidates[-1]) >= 6.0:
+                candidates.append(level)
+            else:
+                candidates[-1] = max(candidates[-1], level)
+    else:
+        pool = [
+            pv_dict.get("S1"), pv_dict.get("S2"), pv_dict.get("S3"),
+            pv_dict.get("PDL"),
+            oi_target,
+            atr_3x,
+            fib_100, fib_161, fib_261
+        ] + sw_l
+        raw = sorted(list(set([round(float(x), 1) for x in pool if x and float(x) < (entry_p - 4.0)])), reverse=True)
+        for level in raw:
+            if not candidates or (candidates[-1] - level) >= 6.0:
+                candidates.append(level)
+            else:
+                candidates[-1] = min(candidates[-1], level)
+
+    if not candidates:
+        candidates = [round(atr_3x, 1)]
+    return candidates, {"fib_100": fib_100, "fib_161": fib_161, "fib_261": fib_261}
+
+
+# Strategy Processing Loop
 markers = []
 historical_trade_cards = {}
 latest_trade_for_hud = None
 alarm_signal_triggered = False
+active_fib_lines = {}
 
 grouped = df.groupby("date")
 latest_session_date = df["date"].iloc[-1]
@@ -385,45 +456,31 @@ for session_date, day_df in grouped:
         vwap_val = row["vwap"]
         atr_val = row["atr"]
 
+        # Trailing Step-Ladder Engine
         if session_trade and not session_trade["closed"]:
             t_type = session_trade["type"]
             entry = session_trade["entry"]
-            base_atr = session_trade["entry_atr"]
-            tp1_target = session_trade["tp1"]
-
-            wide_buffer = min(max(round(atr_val * 1.0, 1), 7.0), 12.0)
-            tight_buffer = min(max(round(atr_val * 0.35, 1), 3.0), 5.0)
+            shelves = session_trade["shelves"]
+            pullback_buffer = min(max(round(atr_val * 0.75, 1), 7.0), 14.0)
 
             if t_type == "CE":
-                nearby_threshold = entry + (2.4 * base_atr)
-                is_nearby_tp1 = h >= nearby_threshold
-                has_crossed_tp1 = h >= tp1_target
+                for s_idx, s_level in enumerate(shelves):
+                    if h >= s_level and s_idx >= session_trade["current_shelf_idx"]:
+                        session_trade["current_shelf_idx"] = s_idx + 1
+                        if s_idx == 0:
+                            session_trade["current_sl"] = max(session_trade["current_sl"], round(entry + 3.0, 1))
+                            session_trade["trail_stage"] = f"SHELF 1 CLEARED ({s_level:.1f}) -> BE LOCKED"
+                        else:
+                            prev_shelf = shelves[s_idx - 1]
+                            target_sl = round(prev_shelf - pullback_buffer, 1)
+                            session_trade["current_sl"] = max(session_trade["current_sl"], target_sl)
+                            session_trade["trail_stage"] = f"SHELF {s_idx+1} CLEARED ({s_level:.1f}) -> TRAIL LOCK"
 
-                if has_crossed_tp1:
-                    session_trade["tp1_hit"] = True
-                    session_trade["trail_stage"] = "TP1 CROSSED (Tightened Buffer)"
-                elif is_nearby_tp1 and not session_trade["tp1_hit"]:
-                    session_trade["trail_stage"] = "NEARBY TP1 (Tightening Trail)"
-
-                if h >= (entry + (1.5 * base_atr)) and not session_trade["be_locked"]:
-                    session_trade["be_locked"] = True
-                    session_trade["current_sl"] = max(session_trade["current_sl"], round(entry + 3.0, 1))
-
-                if session_trade["tp1_hit"] or is_nearby_tp1:
-                    tight_trail = max(round(ema - tight_buffer, 1), round(l - 1.5, 1))
-                    min_locked = round(entry + (1.8 * base_atr), 1) if session_trade["tp1_hit"] else round(entry + 3.0, 1)
-                    target_sl = max(tight_trail, min_locked)
-                    if target_sl > session_trade["current_sl"]:
-                        session_trade["current_sl"] = target_sl
-                else:
-                    wide_trail = round(ema - wide_buffer, 1)
-                    if session_trade["be_locked"]:
-                        session_trade["current_sl"] = max(session_trade["current_sl"], wide_trail)
-                    elif wide_trail > session_trade["current_sl"]:
-                        session_trade["current_sl"] = wide_trail
-
-                if h > session_trade["tp_final"]:
-                    session_trade["tp_final"] = round(h + (session_trade["risk"] * 1.0), 1)
+                # Runner Mode: Trail 5-minute bar lows after all major shelves are crossed
+                if session_trade["current_shelf_idx"] >= len(shelves):
+                    bar_trail = round(l - 3.0, 1)
+                    session_trade["current_sl"] = max(session_trade["current_sl"], bar_trail)
+                    session_trade["trail_stage"] = f"MAX RUNNER MODE (Bar Low Trail: {session_trade['current_sl']:.1f})"
 
                 if l <= session_trade["current_sl"] or (c < ema and c < o and c < (day_orb_h - 3.0)):
                     exit_p = min(c, session_trade["current_sl"])
@@ -435,35 +492,23 @@ for session_date, day_df in grouped:
                     latest_trade_for_hud = session_trade.copy()
 
             elif t_type == "PE":
-                nearby_threshold = entry - (2.4 * base_atr)
-                is_nearby_tp1 = l <= nearby_threshold
-                has_crossed_tp1 = l <= tp1_target
+                for s_idx, s_level in enumerate(shelves):
+                    if l <= s_level and s_idx >= session_trade["current_shelf_idx"]:
+                        session_trade["current_shelf_idx"] = s_idx + 1
+                        if s_idx == 0:
+                            session_trade["current_sl"] = min(session_trade["current_sl"], round(entry - 3.0, 1))
+                            session_trade["trail_stage"] = f"SHELF 1 CLEARED ({s_level:.1f}) -> BE LOCKED"
+                        else:
+                            prev_shelf = shelves[s_idx - 1]
+                            target_sl = round(prev_shelf + pullback_buffer, 1)
+                            session_trade["current_sl"] = min(session_trade["current_sl"], target_sl)
+                            session_trade["trail_stage"] = f"SHELF {s_idx+1} CLEARED ({s_level:.1f}) -> TRAIL LOCK"
 
-                if has_crossed_tp1:
-                    session_trade["tp1_hit"] = True
-                    session_trade["trail_stage"] = "TP1 CROSSED (Tightened Buffer)"
-                elif is_nearby_tp1 and not session_trade["tp1_hit"]:
-                    session_trade["trail_stage"] = "NEARBY TP1 (Tightening Trail)"
-
-                if l <= (entry - (1.5 * base_atr)) and not session_trade["be_locked"]:
-                    session_trade["be_locked"] = True
-                    session_trade["current_sl"] = min(session_trade["current_sl"], round(entry - 3.0, 1))
-
-                if session_trade["tp1_hit"] or is_nearby_tp1:
-                    tight_trail = min(round(ema + tight_buffer, 1), round(h + 1.5, 1))
-                    min_locked = round(entry - (1.8 * base_atr), 1) if session_trade["tp1_hit"] else round(entry - 3.0, 1)
-                    target_sl = min(tight_trail, min_locked)
-                    if target_sl < session_trade["current_sl"]:
-                        session_trade["current_sl"] = target_sl
-                else:
-                    wide_trail = round(ema + wide_buffer, 1)
-                    if session_trade["be_locked"]:
-                        session_trade["current_sl"] = min(session_trade["current_sl"], wide_trail)
-                    elif wide_trail < session_trade["current_sl"]:
-                        session_trade["current_sl"] = wide_trail
-
-                if l < session_trade["tp_final"]:
-                    session_trade["tp_final"] = round(l - (session_trade["risk"] * 1.0), 1)
+                # Runner Mode: Trail 5-minute bar highs after all major shelves are crossed
+                if session_trade["current_shelf_idx"] >= len(shelves):
+                    bar_trail = round(h + 3.0, 1)
+                    session_trade["current_sl"] = min(session_trade["current_sl"], bar_trail)
+                    session_trade["trail_stage"] = f"MAX RUNNER MODE (Bar High Trail: {session_trade['current_sl']:.1f})"
 
                 if h >= session_trade["current_sl"] or (c > ema and c > o and c > (day_orb_l + 3.0)):
                     exit_p = max(c, session_trade["current_sl"])
@@ -476,11 +521,15 @@ for session_date, day_df in grouped:
 
         # Breakout Entry Window: 09:30 to 10:30 AM
         if datetime.time(9, 30) < t <= datetime.time(10, 30) and not trade_executed_today:
+            sw_h, sw_l = extract_intraday_swings(day_df, idx, window=2)
+
             if c > day_orb_h and c > vwap_val and c > ema:
                 init_sl = round(l - 5.0, 1)
                 risk = round(c - init_sl, 1)
-                tp1 = round(c + (atr_val * 3.0), 1)
-                tp_final = round(c + (risk * 3.0), 1)
+                shelves, fibs = build_dynamic_shelves(c, "CE", pivot_lines_data, oi_res_strike, atr_val, sw_h, sw_l, day_orb_h, day_orb_l)
+                if session_date == latest_session_date:
+                    active_fib_lines = fibs
+
                 session_trade = {
                     "call_or_put": "CALL (CE)",
                     "type": "CE",
@@ -488,11 +537,12 @@ for session_date, day_df in grouped:
                     "entry_atr": atr_val,
                     "init_sl": init_sl,
                     "current_sl": init_sl,
-                    "tp1": tp1,
-                    "tp_final": tp_final,
-                    "be_locked": False,
-                    "tp1_hit": False,
-                    "trail_stage": "PULLBACK ROOM (Wide Trail)",
+                    "shelves": shelves,
+                    "tp1": shelves[0],
+                    "tp_mid": shelves[len(shelves)//2] if len(shelves) > 2 else shelves[0],
+                    "tp_final": shelves[-1],
+                    "current_shelf_idx": 0,
+                    "trail_stage": f"RISK ON (Max Target: {shelves[-1]:.1f})",
                     "risk": risk,
                     "closed": False,
                     "reason": "Close > ORB High & VWAP",
@@ -509,8 +559,8 @@ for session_date, day_df in grouped:
                 historical_trade_cards[int(row["time"])] = {
                     "title": "BUY CE (ORB BREAKOUT)",
                     "entry": round(c, 1),
-                    "target": round(tp1, 1),
-                    "target_pts": round(tp1 - c, 1),
+                    "target": round(shelves[-1], 1),
+                    "target_pts": round(shelves[-1] - c, 1),
                     "sl": round(init_sl, 1),
                     "sl_pts": round(c - init_sl, 1),
                     "type": "CE",
@@ -524,8 +574,10 @@ for session_date, day_df in grouped:
             elif c < day_orb_l and c < vwap_val and c < ema:
                 init_sl = round(h + 5.0, 1)
                 risk = round(init_sl - c, 1)
-                tp1 = round(c - (atr_val * 3.0), 1)
-                tp_final = round(c - (risk * 3.0), 1)
+                shelves, fibs = build_dynamic_shelves(c, "PE", pivot_lines_data, oi_sup_strike, atr_val, sw_h, sw_l, day_orb_h, day_orb_l)
+                if session_date == latest_session_date:
+                    active_fib_lines = fibs
+
                 session_trade = {
                     "call_or_put": "PUT (PE)",
                     "type": "PE",
@@ -533,11 +585,12 @@ for session_date, day_df in grouped:
                     "entry_atr": atr_val,
                     "init_sl": init_sl,
                     "current_sl": init_sl,
-                    "tp1": tp1,
-                    "tp_final": tp_final,
-                    "be_locked": False,
-                    "tp1_hit": False,
-                    "trail_stage": "PULLBACK ROOM (Wide Trail)",
+                    "shelves": shelves,
+                    "tp1": shelves[0],
+                    "tp_mid": shelves[len(shelves)//2] if len(shelves) > 2 else shelves[0],
+                    "tp_final": shelves[-1],
+                    "current_shelf_idx": 0,
+                    "trail_stage": f"RISK ON (Max Target: {shelves[-1]:.1f})",
                     "risk": risk,
                     "closed": False,
                     "reason": "Close < ORB Low & VWAP",
@@ -554,8 +607,8 @@ for session_date, day_df in grouped:
                 historical_trade_cards[int(row["time"])] = {
                     "title": "BUY PE (ORB BREAKDOWN)",
                     "entry": round(c, 1),
-                    "target": round(tp1, 1),
-                    "target_pts": round(c - tp1, 1),
+                    "target": round(shelves[-1], 1),
+                    "target_pts": round(c - shelves[-1], 1),
                     "sl": round(init_sl, 1),
                     "sl_pts": round(init_sl - c, 1),
                     "type": "PE",
@@ -610,6 +663,7 @@ if trade_executed_in_latest_session and latest_trade_for_hud:
     secured_pts = round(trail_p - entry_p, 1) if is_ce else round(entry_p - trail_p, 1)
     risk_pts = latest_trade_for_hud["risk"]
     target1_pts = round(abs(latest_trade_for_hud["tp1"] - entry_p), 1)
+    target_mid_pts = round(abs(latest_trade_for_hud["tp_mid"] - entry_p), 1)
     target_final_pts = round(abs(latest_trade_for_hud["tp_final"] - entry_p), 1)
     current_pts = round(curr["close"] - entry_p, 1) if is_ce else round(entry_p - curr["close"], 1)
 
@@ -620,6 +674,7 @@ if trade_executed_in_latest_session and latest_trade_for_hud:
         "entry": f"{entry_p:.1f}",
         "sl_risk": f"{latest_trade_for_hud['init_sl']:.1f} (-{risk_pts:.1f} pts)",
         "target1": f"{latest_trade_for_hud['tp1']:.1f} (+{target1_pts:.1f} pts)",
+        "target_mid": f"{latest_trade_for_hud['tp_mid']:.1f} (+{target_mid_pts:.1f} pts)",
         "target_final": f"{latest_trade_for_hud['tp_final']:.1f} (+{target_final_pts:.1f} pts)",
         "trailing_sl": f"{trail_p:.1f}",
         "trail_stage": latest_trade_for_hud["trail_stage"],
@@ -627,6 +682,7 @@ if trade_executed_in_latest_session and latest_trade_for_hud:
         "current_pts": current_pts,
         "raw_risk_pts": risk_pts,
         "raw_target1_pts": target1_pts,
+        "raw_target_mid_pts": target_mid_pts,
         "raw_target_final_pts": target_final_pts,
         "raw_secured_pts": secured_pts,
         "theme": "#089981" if is_ce else "#f23645",
@@ -646,6 +702,7 @@ elif latest_trade_for_hud:
     secured_pts = round(trail_p - entry_p, 1) if is_ce else round(entry_p - trail_p, 1)
     risk_pts = latest_trade_for_hud["risk"]
     target1_pts = round(abs(latest_trade_for_hud["tp1"] - entry_p), 1)
+    target_mid_pts = round(abs(latest_trade_for_hud["tp_mid"] - entry_p), 1)
     target_final_pts = round(abs(latest_trade_for_hud["tp_final"] - entry_p), 1)
     current_pts = round(curr["close"] - entry_p, 1) if is_ce else round(entry_p - curr["close"], 1)
 
@@ -656,6 +713,7 @@ elif latest_trade_for_hud:
         "entry": f"{entry_p:.1f}",
         "sl_risk": f"{latest_trade_for_hud['init_sl']:.1f} (-{risk_pts:.1f} pts)",
         "target1": f"{latest_trade_for_hud['tp1']:.1f} (+{target1_pts:.1f} pts)",
+        "target_mid": f"{latest_trade_for_hud['tp_mid']:.1f} (+{target_mid_pts:.1f} pts)",
         "target_final": f"{latest_trade_for_hud['tp_final']:.1f} (+{target_final_pts:.1f} pts)",
         "trailing_sl": f"{trail_p:.1f}",
         "trail_stage": latest_trade_for_hud["trail_stage"],
@@ -663,6 +721,7 @@ elif latest_trade_for_hud:
         "current_pts": current_pts,
         "raw_risk_pts": risk_pts,
         "raw_target1_pts": target1_pts,
+        "raw_target_mid_pts": target_mid_pts,
         "raw_target_final_pts": target_final_pts,
         "raw_secured_pts": secured_pts,
         "theme": "#089981" if is_ce else "#f23645",
@@ -676,6 +735,7 @@ ema_json = json.dumps([{"time": int(r["time"]), "value": round(float(r["ema9"]),
 markers_json = json.dumps(markers)
 history_cards_json = json.dumps(historical_trade_cards)
 pivots_json = json.dumps(pivot_lines_data)
+fibs_json = json.dumps(active_fib_lines)
 hud_json = json.dumps(hud_payload)
 play_alarm_flag = "true" if alarm_signal_triggered else "false"
 
@@ -704,9 +764,9 @@ html_code = f"""
         }}
 
         #topHeaderArea {{
-            width: 100vw; height: 44px;
+            width: 100vw; height: 38px;
             background: #0b0e14;
-            padding: 3px 8px;
+            padding: 2px 8px;
             display: flex; align-items: center; justify-content: space-between;
             z-index: 60; flex-shrink: 0;
             border-bottom: 1px solid #161a25;
@@ -765,22 +825,23 @@ html_code = f"""
         }}
         .dynamic-ohlc-row b {{ color: #d1d4dc; }}
 
-        /* Hand icon removed: standard default cursor restored */
+        /* Precise Viewport Height: Time Scale Fully Preserved Above Screen Edge */
         #chartArea {{
             width: 100vw;
-            height: calc(100vh - 44px);
+            height: calc(100vh - 80px);
             position: relative;
             flex: 1 1 auto;
             overflow: hidden;
+            margin-bottom: 24px;
             cursor: default !important;
         }}
 
         .draggable-strategy-box {{
-            position: absolute; bottom: 30px; right: 55px; z-index: 60;
+            position: absolute; bottom: 35px; right: 55px; z-index: 60;
             background: rgba(19, 23, 34, 0.97); border: 1px solid #2a2e39;
             border-radius: 6px; font-size: 9.5px; color: #d1d4dc; overflow: hidden;
             box-shadow: 0 4px 18px rgba(0,0,0,0.9); cursor: grab; user-select: none;
-            touch-action: none; min-width: 320px;
+            touch-action: none; min-width: 330px;
         }}
         .draggable-strategy-box:active {{ cursor: grabbing; }}
         .box-drag-handle {{
@@ -974,7 +1035,7 @@ html_code = f"""
             }}, 2000);
         }}
 
-        // Smooth Panning and Scaling Enabled with Default Pointer Cursor
+        // Smooth Panning and Scalable Lightweight Chart
         const chartContainer = document.getElementById('chartArea');
         const chart = LightweightCharts.createChart(chartContainer, {{
             width: chartContainer.clientWidth,
@@ -1007,16 +1068,20 @@ html_code = f"""
             rightPriceScale: {{
                 borderColor: '#2a2e39',
                 autoScale: true,
-                scaleMargins: {{ top: 0.10, bottom: 0.22 }},
+                scaleMargins: {{ top: 0.08, bottom: 0.20 }},
                 entireTextOnly: true,
             }},
             timeScale: {{
                 borderColor: '#2a2e39',
                 timeVisible: true,
                 secondsVisible: false,
-                rightOffset: 8,
+                rightOffset: 10,
                 barSpacing: 6,
                 minBarSpacing: 1.5,
+                fixLeftEdge: false,
+                fixRightEdge: false,
+                visible: true,
+                borderVisible: true,
             }},
             localization: {{
                 priceFormatter: p => p.toFixed(2)
@@ -1037,14 +1102,13 @@ html_code = f"""
         const volumeSeries = chart.addHistogramSeries({{
             priceFormat: {{ type: 'volume' }},
             priceScaleId: 'vol_scale',
-            scaleMargins: {{ top: 0.82, bottom: 0.02 }}
+            scaleMargins: {{ top: 0.80, bottom: 0.04 }}
         }});
         chart.priceScale('vol_scale').applyOptions({{
-            scaleMargins: {{ top: 0.82, bottom: 0.02 }}
+            scaleMargins: {{ top: 0.80, bottom: 0.04 }}
         }});
         volumeSeries.setData({volume_json});
 
-        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
         const vwapSeries = chart.addLineSeries({{
             color: '#ab47bc',
             lineWidth: 2,
@@ -1054,7 +1118,6 @@ html_code = f"""
         }});
         vwapSeries.setData({vwap_json});
 
-        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
         const emaSeries = chart.addLineSeries({{
             color: '#2962ff',
             lineWidth: 1,
@@ -1082,6 +1145,15 @@ html_code = f"""
             candleSeries.createPriceLine({{ price: pv.PDL, color: '#fb8c00', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'PDL' }});
         }}
 
+        // Dynamic Fibonacci ORB Extension Reference Lines
+        const fibs = {fibs_json};
+        if (fibs && fibs.fib_100) {{
+            candleSeries.createPriceLine({{ price: fibs.fib_100, color: '#ffd600', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'EXT 100%' }});
+            candleSeries.createPriceLine({{ price: fibs.fib_161, color: '#00e5ff', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'EXT 161.8%' }});
+            candleSeries.createPriceLine({{ price: fibs.fib_261, color: '#ff6d00', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: 'EXT 261.8% (MAX)' }});
+        }}
+
+        // Expiry Specific OI Resistance & Support Lines
         candleSeries.createPriceLine({{ price: {oi_res_strike}, color: '#e91e63', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'OI RES' }});
         candleSeries.createPriceLine({{ price: {oi_sup_strike}, color: '#00e676', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'OI SUP' }});
 
@@ -1349,6 +1421,9 @@ html_code = f"""
                 const optT1Price = Math.round((activeRealLTP + optT1Pts) * 10) / 10;
                 const totalT1Profit = Math.round(optT1Pts * activeQty);
 
+                const optMidPts = Math.round((s.raw_target_mid_pts * activeDelta) * 10) / 10;
+                const optMidPrice = Math.round((activeRealLTP + optMidPts) * 10) / 10;
+
                 const optFinalPts = Math.round((s.raw_target_final_pts * activeDelta) * 10) / 10;
                 const optFinalPrice = Math.round((activeRealLTP + optFinalPts) * 10) / 10;
 
@@ -1391,14 +1466,19 @@ html_code = f"""
                                 <td class="opt-cell text-red">₹${{optSLPrice.toFixed(2)}} (-₹${{totalMaxRisk}})</td>
                             </tr>
                             <tr>
-                                <td class="label-cell">Target 1 (3 ATR)</td>
+                                <td class="label-cell">Target 1 (Nearest Shelf)</td>
                                 <td class="val-cell text-green">${{s.target1}}</td>
                                 <td class="opt-cell text-green">₹${{optT1Price.toFixed(2)}} (+₹${{totalT1Profit}})</td>
                             </tr>
                             <tr>
-                                <td class="label-cell">Target Final</td>
-                                <td class="val-cell text-green">${{s.target_final}}</td>
-                                <td class="opt-cell text-green">₹${{optFinalPrice.toFixed(2)}}</td>
+                                <td class="label-cell">Target Mid (Pivot/Fib)</td>
+                                <td class="val-cell text-green">${{s.target_mid}}</td>
+                                <td class="opt-cell text-green">₹${{optMidPrice.toFixed(2)}}</td>
+                            </tr>
+                            <tr>
+                                <td class="label-cell">Target Final (Max Run)</td>
+                                <td class="val-cell text-green"><b>${{s.target_final}}</b></td>
+                                <td class="opt-cell text-green"><b>₹${{optFinalPrice.toFixed(2)}}</b></td>
                             </tr>
                             <tr>
                                 <td class="label-cell">Trailing SL</td>
@@ -1509,7 +1589,7 @@ html_code = f"""
 </html>
 """
 
-components.html(html_code, height=720, scrolling=False)
+components.html(html_code, height=650, scrolling=False)
 
 # 15s auto-refresh polling
 st.markdown(
