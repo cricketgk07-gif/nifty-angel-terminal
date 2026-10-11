@@ -80,7 +80,7 @@ LOT_SIZE_QTY = 65
 
 
 def send_telegram_alert(message: str):
-    """Sends immediate push notifications directly to Telegram."""
+    """Dispatches immediate push notification directly to Telegram."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -259,42 +259,45 @@ if len(unique_dates) >= 2:
             "PDH": pdh, "PDL": pdl
         }
 
-# ATM ± 1000 Strikes
+# Base Strike Anchor
 atm_strike = int(round(spot_price / 50.0) * 50)
 strikes_list = [atm_strike + (x * 50) for x in range(-20, 21)]
 
-# Expiry Filter: Excludes same-day expiry to eliminate excessive theta decay
+# Expiry Filter: Automatically skip current day's expiry to avoid rapid theta bleed
 today_dt = datetime.datetime.now(IST).date()
-available_expiries = []
+auto_expiry = "CURRENT"
 
 if not nfo_df.empty:
     all_future = nfo_df[nfo_df["exp_dt"].dt.date >= today_dt].sort_values("exp_dt")
     safe_future = all_future[all_future["exp_dt"].dt.date > today_dt]
     if not safe_future.empty:
-        available_expiries = safe_future["expiry"].dropna().drop_duplicates().tolist()
-    else:
-        available_expiries = all_future["expiry"].dropna().drop_duplicates().tolist()
+        auto_expiry = safe_future["expiry"].iloc[0]
+    elif not all_future.empty:
+        auto_expiry = all_future["expiry"].iloc[0]
 
-if not available_expiries:
-    available_expiries = ["CURRENT"]
-
-# Top Header Layout
-ctrl_cols = st.columns([1.1, 1.2, 1.3, 0.7, 0.7, 4.0])
+# --- STREAMLINED TOP CONTROLS ---
+# Manual Strike and Expiry dropdowns are removed to eliminate conflicts
+ctrl_cols = st.columns([2.0, 0.9, 0.9, 6.2])
 
 with ctrl_cols[0]:
-    mode_selection = st.selectbox("Mode", ["Budget (< ₹80)", "ATM"], index=0)
+    mode_selection = st.selectbox(
+        "Mode / Budget",
+        [
+            "Budget (< ₹50)",
+            "Budget (< ₹60)",
+            "Budget (< ₹70)",
+            "Budget (< ₹80)",
+            "Budget (< ₹90)",
+            "Budget (< ₹100)",
+            "ATM (At-The-Money)",
+        ],
+        index=3,  # Defaults to < ₹80
+    )
 
 with ctrl_cols[1]:
-    sel_expiry = st.selectbox("Expiry", available_expiries)
-
-with ctrl_cols[2]:
-    default_strike_idx = strikes_list.index(atm_strike) if atm_strike in strikes_list else 20
-    sel_strike = st.selectbox("Strike", strikes_list, index=default_strike_idx)
-
-with ctrl_cols[3]:
     sel_type = st.selectbox("Type", ["CE", "PE"])
 
-with ctrl_cols[4]:
+with ctrl_cols[2]:
     sel_lots = st.number_input("Lots", min_value=1, max_value=100, value=1, step=1)
 
 # Black-Scholes Greeks Calculation
@@ -307,12 +310,28 @@ def compute_contract_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
     ce_delta = norm_cdf(d1)
     return round(ce_delta if is_ce else (1.0 - ce_delta), 2)
 
-exp_slice = nfo_df[nfo_df["expiry"] == sel_expiry] if not nfo_df.empty else pd.DataFrame()
+exp_slice = nfo_df[nfo_df["expiry"] == auto_expiry] if not nfo_df.empty else pd.DataFrame()
 exp_date_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_dt
 days_to_expiry = max((exp_date_val - today_dt).days, 1)
 
-# Single-Call Option Quote Resolver
-active_strike = sel_strike
+# Dynamic Budget to Strike Offset Map
+budget_offset_map = {
+    "Budget (< ₹50)": 4,   # 200 pts OTM
+    "Budget (< ₹60)": 3,   # 150 pts OTM
+    "Budget (< ₹70)": 3,   # 150 pts OTM
+    "Budget (< ₹80)": 2,   # 100 pts OTM
+    "Budget (< ₹90)": 2,   # 100 pts OTM
+    "Budget (< ₹100)": 1,  # 50 pts OTM
+    "ATM (At-The-Money)": 0 # 0 pts (ATM)
+}
+
+step_offset = budget_offset_map.get(mode_selection, 2)
+if sel_type == "CE":
+    active_strike = atm_strike + (step_offset * 50)
+else:
+    active_strike = atm_strike - (step_offset * 50)
+
+# Single Fast API LTP Fetch
 live_real_ltp = 0.0
 target_symbol = ""
 target_token = ""
@@ -329,33 +348,15 @@ def fetch_option_ltp(sym, tok):
     return 0.0
 
 if not nfo_df.empty:
-    if mode_selection == "Budget (< ₹80)":
-        offset_steps = 2 if days_to_expiry <= 2 else 3
-        if sel_type == "CE":
-            active_strike = atm_strike + (offset_steps * 50)
-        else:
-            active_strike = atm_strike - (offset_steps * 50)
-
-        match = nfo_df[
-            (nfo_df["strike_num"] == float(active_strike)) &
-            (nfo_df["symbol"].str.endswith(sel_type)) &
-            (nfo_df["expiry"] == sel_expiry)
-        ]
-        if not match.empty:
-            target_symbol = str(match.iloc[0]["symbol"])
-            target_token = str(match.iloc[0]["token"])
-            live_real_ltp = fetch_option_ltp(target_symbol, target_token)
-    else:
-        active_strike = sel_strike
-        match = nfo_df[
-            (nfo_df["strike_num"] == float(active_strike)) &
-            (nfo_df["symbol"].str.endswith(sel_type)) &
-            (nfo_df["expiry"] == sel_expiry)
-        ]
-        if not match.empty:
-            target_symbol = str(match.iloc[0]["symbol"])
-            target_token = str(match.iloc[0]["token"])
-            live_real_ltp = fetch_option_ltp(target_symbol, target_token)
+    match = nfo_df[
+        (nfo_df["strike_num"] == float(active_strike)) &
+        (nfo_df["symbol"].str.endswith(sel_type)) &
+        (nfo_df["expiry"] == auto_expiry)
+    ]
+    if not match.empty:
+        target_symbol = str(match.iloc[0]["symbol"])
+        target_token = str(match.iloc[0]["token"])
+        live_real_ltp = fetch_option_ltp(target_symbol, target_token)
 
 if live_real_ltp <= 0.0:
     diff = (spot_price - float(active_strike)) if sel_type == "CE" else (float(active_strike) - spot_price)
@@ -364,7 +365,7 @@ if live_real_ltp <= 0.0:
 active_delta = compute_contract_delta(spot_price, float(active_strike), days_to_expiry, is_ce=(sel_type == "CE"))
 total_qty = sel_lots * LOT_SIZE_QTY
 
-# PCR and OI Levels
+# PCR & OI Levels
 ce_oi_map = {}
 pe_oi_map = {}
 total_ce_oi = 0
@@ -384,16 +385,16 @@ pcr_value = round(total_pe_oi / max(total_ce_oi, 1), 2)
 oi_res_strike = max(ce_oi_map, key=ce_oi_map.get) if ce_oi_map else atm_strike + 200
 oi_sup_strike = max(pe_oi_map, key=pe_oi_map.get) if pe_oi_map else atm_strike - 200
 
-with ctrl_cols[5]:
+with ctrl_cols[3]:
     st.markdown(
         f"""
-        <div style="background:#161a25; border:1px solid #2a2e39; border-radius:4px; padding:3px 8px; display:flex; gap:10px; align-items:center; font-size:11px; height:32px;">
+        <div style="background:#161a25; border:1px solid #2a2e39; border-radius:4px; padding:3px 8px; display:flex; gap:12px; align-items:center; font-size:11px; height:32px;">
             <div>Contract: <b style="color:#00e5ff;">{target_symbol or f'NIFTY {active_strike} {sel_type}'}</b></div>
             <div>LTP: <b style="color:#ffd600; font-size:13px;">₹{live_real_ltp:.2f}</b></div>
             <div>Mode: <b style="color:#ab47bc;">{mode_selection}</b></div>
             <div>Qty: <b style="color:#089981;">{total_qty}</b> ({sel_lots}L)</div>
             <div>Delta: <b style="color:#00e5ff;">{active_delta:.2f}</b></div>
-            <div>PCR: <b>{pcr_value}</b></div>
+            <div>Expiry: <b style="color:#d1d4dc;">{auto_expiry}</b></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -499,7 +500,7 @@ def format_telegram_table_card(header_title, trade, spot_c, opt_ltp, delta_val, 
         f"{header_title}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>CONTRACT:</b> {contract_name}\n"
-        f"<b>QUANTITY:</b> {qty} (Delta: {delta_val:.2f})\n"
+        f"<b>MODE:</b> {mode_selection} | <b>QTY:</b> {qty}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Parameter | Spot | Option (₹)</b>\n"
         f"• <b>Entry:</b> {entry_p:.1f} | <b>₹{opt_ltp:.2f}</b>\n"
