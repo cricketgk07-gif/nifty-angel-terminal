@@ -1,6 +1,9 @@
 import datetime
 import json
 import math
+import os
+import threading
+import time
 import pandas as pd
 import numpy as np
 import pyotp
@@ -80,7 +83,7 @@ LOT_SIZE_QTY = 65
 
 
 def send_telegram_alert(message: str):
-    """Dispatches immediate push notification directly to Telegram."""
+    """Dispatches push notification directly to Telegram."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -145,7 +148,7 @@ def load_nfo_scrip_master():
 nfo_df = load_nfo_scrip_master()
 
 
-def fetch_nifty_candles():
+def fetch_nifty_candles_raw(api_client):
     now_dt = datetime.datetime.now(IST)
     collected_frames = []
     current_end = now_dt
@@ -156,7 +159,7 @@ def fetch_nifty_candles():
         to_str = current_end.strftime("%Y-%m-%d 23:59")
 
         try:
-            resp = api.getCandleData(
+            resp = api_client.getCandleData(
                 {
                     "exchange": "NSE",
                     "symboltoken": INDEX_TOKEN,
@@ -224,110 +227,15 @@ def fetch_nifty_candles():
     return df
 
 
-df = fetch_nifty_candles()
-if df is None or len(df) == 0:
-    st.info("Market data feed is initializing...")
-    st.stop()
-
-curr = df.iloc[-1]
-spot_price = float(curr["close"])
-
-# Previous Day Floor Pivots
-unique_dates = sorted(df["date"].unique())
-pivot_lines_data = {}
-
-if len(unique_dates) >= 2:
-    prev_date = unique_dates[-2]
-    prev_day_df = df[df["date"] == prev_date]
-    if len(prev_day_df) > 0:
-        pdh = round(float(prev_day_df["high"].max()), 2)
-        pdl = round(float(prev_day_df["low"].min()), 2)
-        pdc = round(float(prev_day_df["close"].iloc[-1]), 2)
-
-        P = round((pdh + pdl + pdc) / 3.0, 2)
-        R1 = round((2.0 * P) - pdl, 2)
-        S1 = round((2.0 * P) - pdh, 2)
-        R2 = round(P + (pdh - pdl), 2)
-        S2 = round(P - (pdh - pdl), 2)
-        R3 = round(pdh + 2.0 * (P - pdl), 2)
-        S3 = round(pdl - 2.0 * (pdh - P), 2)
-
-        pivot_lines_data = {
-            "P": P, "R1": R1, "R2": R2, "R3": R3,
-            "S1": S1, "S2": S2, "S3": S3,
-            "PDH": pdh, "PDL": pdl
-        }
-
-# Base Strike Anchor
-atm_strike = int(round(spot_price / 50.0) * 50)
-today_dt = datetime.datetime.now(IST).date()
-auto_expiry = "CURRENT"
-
-if not nfo_df.empty:
-    all_future = nfo_df[nfo_df["exp_dt"].dt.date >= today_dt].sort_values("exp_dt")
-    safe_future = all_future[all_future["exp_dt"].dt.date > today_dt]
-    if not safe_future.empty:
-        auto_expiry = safe_future["expiry"].iloc[0]
-    elif not all_future.empty:
-        auto_expiry = all_future["expiry"].iloc[0]
-
-# --- CLEAN HEADER CONTROLS ---
-ctrl_cols = st.columns([2.2, 0.9, 6.9])
-
-with ctrl_cols[0]:
-    mode_selection = st.selectbox(
-        "Budget",
-        [
-            "Budget (< ₹50)",
-            "Budget (< ₹60)",
-            "Budget (< ₹70)",
-            "Budget (< ₹80)",
-            "Budget (< ₹90)",
-            "Budget (< ₹100)",
-            "ATM (At-The-Money)",
-        ],
-        index=3,
-    )
-
-with ctrl_cols[1]:
-    sel_lots = st.number_input("Lots", min_value=1, max_value=100, value=1, step=1)
-
-# Helper Functions
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
 
 def compute_contract_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
     tau = max(days_to_exp / 365.0, 0.001)
     d1 = (math.log(s / k) + (r + 0.5 * iv ** 2) * tau) / (iv * math.sqrt(tau))
     ce_delta = norm_cdf(d1)
     return round(ce_delta if is_ce else (1.0 - ce_delta), 2)
-
-exp_slice = nfo_df[nfo_df["expiry"] == auto_expiry] if not nfo_df.empty else pd.DataFrame()
-exp_date_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_dt
-days_to_expiry = max((exp_date_val - today_dt).days, 1)
-
-budget_offset_map = {
-    "Budget (< ₹50)": 4,
-    "Budget (< ₹60)": 3,
-    "Budget (< ₹70)": 3,
-    "Budget (< ₹80)": 2,
-    "Budget (< ₹90)": 2,
-    "Budget (< ₹100)": 1,
-    "ATM (At-The-Money)": 0,
-}
-step_offset = budget_offset_map.get(mode_selection, 2)
-
-
-def fetch_option_ltp(sym, tok):
-    try:
-        res = api.ltpData("NFO", sym, tok)
-        if isinstance(res, dict) and res.get("status") and res.get("data"):
-            val = float(res["data"].get("ltp", 0.0))
-            if val > 0.0:
-                return val
-    except Exception:
-        pass
-    return 0.0
 
 
 def extract_intraday_swings(day_data, current_idx, window=2):
@@ -389,109 +297,373 @@ def build_dynamic_shelves(entry_p, t_type, pv_dict, oi_target, atr_v, sw_h, sw_l
     return candidates, {"fib_100": fib_100, "fib_161": fib_161, "fib_261": fib_261}
 
 
-# Dual Alert Templates (Spot Points + Option ₹)
-def format_full_entry_table_card(trade, opt_symbol, opt_ltp, delta_val, qty):
-    is_ce = trade["type"] == "CE"
-    t_type = trade["type"]
-    entry_p = trade["entry"]
-    risk_pts = trade["risk"]
-    t1_pts = round(abs(trade["tp1"] - entry_p), 1)
-    tmid_pts = round(abs(trade["tp_mid"] - entry_p), 1)
-    tfinal_pts = round(abs(trade["tp_final"] - entry_p), 1)
+# --- OPTION 2: BACKGROUND DAEMON THREAD FOR LIVE TELEGRAM ALERTS ---
+# This background thread runs 24/7 on the server, completely independent of Chrome being open or closed.
+@st.cache_resource
+def start_background_trader():
+    state = {
+        "active_date": None,
+        "entry_sent": False,
+        "last_sl": None,
+        "exit_sent": False,
+        "running": True,
+    }
 
-    opt_risk_rs = round(risk_pts * delta_val, 1)
-    opt_sl_price = max(0.5, round(opt_ltp - opt_risk_rs, 1))
-    max_risk_inr = int(opt_risk_rs * qty)
+    def daemon_loop():
+        while state["running"]:
+            try:
+                now_ist = datetime.datetime.now(IST)
+                today_dt = now_ist.date()
+                curr_t = now_ist.time()
 
-    opt_t1_gain = round(t1_pts * delta_val, 1)
-    opt_t1_price = round(opt_ltp + opt_t1_gain, 1)
-    t1_profit_inr = int(opt_t1_gain * qty)
+                # Only run active strategy during live market hours (09:15 - 15:30 IST)
+                if now_ist.weekday() < 5 and (datetime.time(9, 15) <= curr_t <= datetime.time(15, 30)):
+                    if state["active_date"] != today_dt:
+                        state["active_date"] = today_dt
+                        state["entry_sent"] = False
+                        state["last_sl"] = None
+                        state["exit_sent"] = False
 
-    opt_tmid_gain = round(tmid_pts * delta_val, 1)
-    opt_tmid_price = round(opt_ltp + opt_tmid_gain, 1)
+                    api_worker = get_authenticated_api()
+                    if api_worker:
+                        df_live = fetch_nifty_candles_raw(api_worker)
+                        if df_live is not None and len(df_live) > 0:
+                            today_candles = df_live[df_live["date"] == today_dt]
+                            orb_win = today_candles[today_candles["dt"].dt.time <= datetime.time(9, 30)]
 
-    opt_final_gain = round(tfinal_pts * delta_val, 1)
-    opt_final_price = round(opt_ltp + opt_final_gain, 1)
-    final_profit_inr = int(opt_final_gain * qty)
+                            if len(orb_win) > 0:
+                                orb_h = orb_win["high"].max()
+                                orb_l = orb_win["low"].min()
 
-    time_str = datetime.datetime.now(IST).strftime("%H:%M:%S")
+                                # Scan trades sequentially
+                                active_trade = None
+                                for i in range(len(today_candles)):
+                                    r = today_candles.iloc[i]
+                                    t_val = r["dt"].time()
+                                    o_val, h_val, l_val, c_val = r["open"], r["high"], r["low"], r["close"]
+                                    ema_val = r["ema9"]
+                                    vwap_v = r["vwap"]
+                                    atr_v = r["atr"]
 
-    msg = (
-        f"🚀 <b>ORB BREAKOUT TRIGGERED: BUY {t_type}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>CONTRACT:</b> {opt_symbol}\n"
-        f"<b>MODE:</b> {mode_selection} | <b>QTY:</b> {qty} (Δ: {delta_val:.2f})\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>LEVEL | INDEX (SPOT) | OPTION (₹)</b>\n"
-        f"• <b>ENTRY:</b> {entry_p:.1f} | <b>₹{opt_ltp:.2f}</b>\n"
-        f"• <b>STOP LOSS:</b> {trade['init_sl']:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl_price:.2f}</b> (-₹{max_risk_inr})\n"
-        f"• <b>TARGET 1:</b> {trade['tp1']:.1f} (+{t1_pts:.1f} pts) | <b>₹{opt_t1_price:.2f}</b> (+₹{t1_profit_inr})\n"
-        f"• <b>TARGET MID:</b> {trade['tp_mid']:.1f} (+{tmid_pts:.1f} pts) | <b>₹{opt_tmid_price:.2f}</b>\n"
-        f"• <b>TARGET MAX:</b> {trade['tp_final']:.1f} (+{tfinal_pts:.1f} pts) | <b>₹{opt_final_price:.2f}</b> (+₹{final_profit_inr})\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🛡️ <b>Initial SL:</b> Spot: {trade['init_sl']:.1f} | Option: ₹{opt_sl_price:.2f}\n"
-        f"⏰ <b>Trigger Time:</b> {time_str}"
+                                    # Trailing stop management
+                                    if active_trade and not active_trade["closed"]:
+                                        t_type = active_trade["type"]
+                                        entry_p = active_trade["entry"]
+                                        shelves = active_trade["shelves"]
+                                        pb_buf = min(max(round(atr_v * 0.75, 1), 7.0), 14.0)
+
+                                        if t_type == "CE":
+                                            for s_idx, s_level in enumerate(shelves):
+                                                if h_val >= s_level and s_idx >= active_trade["current_shelf_idx"]:
+                                                    active_trade["current_shelf_idx"] = s_idx + 1
+                                                    if s_idx == 0:
+                                                        active_trade["current_sl"] = max(active_trade["current_sl"], round(entry_p + 3.0, 1))
+                                                    else:
+                                                        active_trade["current_sl"] = max(active_trade["current_sl"], round(shelves[s_idx - 1] - pb_buf, 1))
+
+                                            if active_trade["current_shelf_idx"] >= len(shelves):
+                                                active_trade["current_sl"] = max(active_trade["current_sl"], round(l_val - 3.0, 1))
+
+                                            # Send Trailing Alert if SL updated
+                                            if active_trade["current_sl"] != state["last_sl"] and not state["exit_sent"]:
+                                                state["last_sl"] = active_trade["current_sl"]
+                                                sec_pts = round(active_trade["current_sl"] - entry_p, 1)
+                                                opt_diff = round(sec_pts * active_trade["delta"], 1)
+                                                opt_trail_p = max(0.5, round(active_trade["opt_entry_ltp"] + opt_diff, 1))
+                                                sec_inr = int(opt_diff * active_trade["qty"])
+
+                                                t_msg = (
+                                                    f"🔔 <b>NIFTY CE TRAILING SL UPDATED</b>\n"
+                                                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                    f"<b>CONTRACT:</b> {active_trade['opt_symbol']} (Qty: {active_trade['qty']})\n"
+                                                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                    f"🛡️ <b>SET STOP LOSS TO:</b>\n"
+                                                    f"   • <b>INDEX (SPOT):</b> <b>{active_trade['current_sl']:.1f}</b>\n"
+                                                    f"   • <b>OPTION (GTT ₹):</b> <b>₹{opt_trail_p:.2f}</b>\n"
+                                                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                    f"🔒 <b>LOCKED PROFIT:</b> <b>{sec_pts:+.1f} pts (₹{sec_inr:+})</b>\n"
+                                                    f"⏰ <b>Time:</b> {now_ist.strftime('%H:%M:%S')}"
+                                                )
+                                                send_telegram_alert(t_msg)
+
+                                            # Check Exit
+                                            if l_val <= active_trade["current_sl"]:
+                                                active_trade["closed"] = True
+                                                if not state["exit_sent"]:
+                                                    state["exit_sent"] = True
+                                                    ex_p = active_trade["current_sl"]
+                                                    net_pts = round(ex_p - entry_p, 1)
+                                                    e_msg = (
+                                                        f"🏁 <b>TRADE CLOSED (NIFTY CE - STOP HIT)</b>\n"
+                                                        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                        f"🚪 <b>Exit Price (Spot):</b> <b>{ex_p:.1f}</b>\n"
+                                                        f"💰 <b>Final Net Spot:</b> <b>{net_pts:+.1f} pts</b>\n"
+                                                        f"💵 <b>Final Net Option:</b> <b>₹{round(net_pts * active_trade['delta'] * active_trade['qty']):+}</b>\n"
+                                                        f"⏰ <b>Exit Time:</b> {r['dt'].strftime('%H:%M')}"
+                                                    )
+                                                    send_telegram_alert(e_msg)
+
+                                            elif c_val < ema_val and c_val < o_val and c_val < (orb_h - 3.0):
+                                                active_trade["closed"] = True
+                                                if not state["exit_sent"]:
+                                                    state["exit_sent"] = True
+                                                    ex_p = c_val
+                                                    net_pts = round(ex_p - entry_p, 1)
+                                                    e_msg = (
+                                                        f"🏁 <b>TRADE CLOSED (NIFTY CE - EMA REVERSAL)</b>\n"
+                                                        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                        f"🚪 <b>Exit Price (Spot):</b> <b>{ex_p:.1f}</b>\n"
+                                                        f"💰 <b>Final Net Spot:</b> <b>{net_pts:+.1f} pts</b>\n"
+                                                        f"💵 <b>Final Net Option:</b> <b>₹{round(net_pts * active_trade['delta'] * active_trade['qty']):+}</b>\n"
+                                                        f"⏰ <b>Exit Time:</b> {r['dt'].strftime('%H:%M')}"
+                                                    )
+                                                    send_telegram_alert(e_msg)
+
+                                        elif t_type == "PE":
+                                            for s_idx, s_level in enumerate(shelves):
+                                                if l_val <= s_level and s_idx >= active_trade["current_shelf_idx"]:
+                                                    active_trade["current_shelf_idx"] = s_idx + 1
+                                                    if s_idx == 0:
+                                                        active_trade["current_sl"] = min(active_trade["current_sl"], round(entry_p - 3.0, 1))
+                                                    else:
+                                                        active_trade["current_sl"] = min(active_trade["current_sl"], round(shelves[s_idx - 1] + pb_buf, 1))
+
+                                            if active_trade["current_shelf_idx"] >= len(shelves):
+                                                active_trade["current_sl"] = min(active_trade["current_sl"], round(h_val + 3.0, 1))
+
+                                            # Send Trailing Alert if SL updated
+                                            if active_trade["current_sl"] != state["last_sl"] and not state["exit_sent"]:
+                                                state["last_sl"] = active_trade["current_sl"]
+                                                sec_pts = round(entry_p - active_trade["current_sl"], 1)
+                                                opt_diff = round(sec_pts * active_trade["delta"], 1)
+                                                opt_trail_p = max(0.5, round(active_trade["opt_entry_ltp"] + opt_diff, 1))
+                                                sec_inr = int(opt_diff * active_trade["qty"])
+
+                                                t_msg = (
+                                                    f"🔔 <b>NIFTY PE TRAILING SL UPDATED</b>\n"
+                                                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                    f"<b>CONTRACT:</b> {active_trade['opt_symbol']} (Qty: {active_trade['qty']})\n"
+                                                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                    f"🛡️ <b>SET STOP LOSS TO:</b>\n"
+                                                    f"   • <b>INDEX (SPOT):</b> <b>{active_trade['current_sl']:.1f}</b>\n"
+                                                    f"   • <b>OPTION (GTT ₹):</b> <b>₹{opt_trail_p:.2f}</b>\n"
+                                                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                    f"🔒 <b>LOCKED PROFIT:</b> <b>{sec_pts:+.1f} pts (₹{sec_inr:+})</b>\n"
+                                                    f"⏰ <b>Time:</b> {now_ist.strftime('%H:%M:%S')}"
+                                                )
+                                                send_telegram_alert(t_msg)
+
+                                            # Check Exit
+                                            if h_val >= active_trade["current_sl"]:
+                                                active_trade["closed"] = True
+                                                if not state["exit_sent"]:
+                                                    state["exit_sent"] = True
+                                                    ex_p = active_trade["current_sl"]
+                                                    net_pts = round(entry_p - ex_p, 1)
+                                                    e_msg = (
+                                                        f"🏁 <b>TRADE CLOSED (NIFTY PE - STOP HIT)</b>\n"
+                                                        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                        f"🚪 <b>Exit Price (Spot):</b> <b>{ex_p:.1f}</b>\n"
+                                                        f"💰 <b>Final Net Spot:</b> <b>{net_pts:+.1f} pts</b>\n"
+                                                        f"💵 <b>Final Net Option:</b> <b>₹{round(net_pts * active_trade['delta'] * active_trade['qty']):+}</b>\n"
+                                                        f"⏰ <b>Exit Time:</b> {r['dt'].strftime('%H:%M')}"
+                                                    )
+                                                    send_telegram_alert(e_msg)
+
+                                            elif c_val > ema_val and c_val > o_val and c_val > (orb_l + 3.0):
+                                                active_trade["closed"] = True
+                                                if not state["exit_sent"]:
+                                                    state["exit_sent"] = True
+                                                    ex_p = c_val
+                                                    net_pts = round(entry_p - ex_p, 1)
+                                                    e_msg = (
+                                                        f"🏁 <b>TRADE CLOSED (NIFTY PE - EMA REVERSAL)</b>\n"
+                                                        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                        f"🚪 <b>Exit Price (Spot):</b> <b>{ex_p:.1f}</b>\n"
+                                                        f"💰 <b>Final Net Spot:</b> <b>{net_pts:+.1f} pts</b>\n"
+                                                        f"💵 <b>Final Net Option:</b> <b>₹{round(net_pts * active_trade['delta'] * active_trade['qty']):+}</b>\n"
+                                                        f"⏰ <b>Exit Time:</b> {r['dt'].strftime('%H:%M')}"
+                                                    )
+                                                    send_telegram_alert(e_msg)
+
+                                    # Entry Window: 09:30 - 10:30 strictly
+                                    if datetime.time(9, 30) < t_val <= datetime.time(10, 30) and not active_trade:
+                                        if c_val > orb_h and c_val > vwap_v and c_val > ema_val:
+                                            init_sl = round(l_val - 5.0, 1)
+                                            risk = round(c_val - init_sl, 1)
+                                            atm_s = int(round(c_val / 50.0) * 50)
+                                            shelves, _ = build_dynamic_shelves(c_val, "CE", {}, atm_s + 200, atr_v, [], [], orb_h, orb_l)
+
+                                            opt_s = atm_s + 100
+                                            opt_sym = f"NIFTY {opt_s} CE"
+                                            trade_d = compute_contract_delta(c_val, opt_s, 3, is_ce=True)
+
+                                            active_trade = {
+                                                "type": "CE", "entry": round(c_val, 1), "init_sl": init_sl,
+                                                "current_sl": init_sl, "shelves": shelves, "current_shelf_idx": 0,
+                                                "risk": risk, "closed": False, "delta": trade_d, "qty": LOT_SIZE_QTY,
+                                                "opt_symbol": opt_sym, "opt_entry_ltp": 80.0
+                                            }
+
+                                            if not state["entry_sent"]:
+                                                state["entry_sent"] = True
+                                                state["last_sl"] = init_sl
+                                                t1_pts = round(shelves[0] - c_val, 1)
+                                                en_msg = (
+                                                    f"🚀 <b>ORB BREAKOUT TRIGGERED: BUY CE</b>\n"
+                                                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                    f"<b>CONTRACT:</b> {opt_sym} (Qty: {LOT_SIZE_QTY})\n"
+                                                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                    f"• <b>ENTRY:</b> {c_val:.1f}\n"
+                                                    f"• <b>STOP LOSS:</b> {init_sl:.1f} (-{risk:.1f} pts)\n"
+                                                    f"• <b>TARGET 1:</b> {shelves[0]:.1f} (+{t1_pts:.1f} pts)\n"
+                                                    f"• <b>TARGET MAX:</b> {shelves[-1]:.1f}\n"
+                                                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                    f"⏰ <b>Trigger Time:</b> {r['dt'].strftime('%H:%M:%S')}"
+                                                )
+                                                send_telegram_alert(en_msg)
+
+                                        elif c_val < orb_l and c_val < vwap_v and c_val < ema_val:
+                                            init_sl = round(h_val + 5.0, 1)
+                                            risk = round(init_sl - c_val, 1)
+                                            atm_s = int(round(c_val / 50.0) * 50)
+                                            shelves, _ = build_dynamic_shelves(c_val, "PE", {}, atm_s - 200, atr_v, [], [], orb_h, orb_l)
+
+                                            opt_s = atm_s - 100
+                                            opt_sym = f"NIFTY {opt_s} PE"
+                                            trade_d = compute_contract_delta(c_val, opt_s, 3, is_ce=False)
+
+                                            active_trade = {
+                                                "type": "PE", "entry": round(c_val, 1), "init_sl": init_sl,
+                                                "current_sl": init_sl, "shelves": shelves, "current_shelf_idx": 0,
+                                                "risk": risk, "closed": False, "delta": trade_d, "qty": LOT_SIZE_QTY,
+                                                "opt_symbol": opt_sym, "opt_entry_ltp": 80.0
+                                            }
+
+                                            if not state["entry_sent"]:
+                                                state["entry_sent"] = True
+                                                state["last_sl"] = init_sl
+                                                t1_pts = round(c_val - shelves[0], 1)
+                                                en_msg = (
+                                                    f"🚀 <b>ORB BREAKDOWN TRIGGERED: BUY PE</b>\n"
+                                                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                    f"<b>CONTRACT:</b> {opt_sym} (Qty: {LOT_SIZE_QTY})\n"
+                                                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                    f"• <b>ENTRY:</b> {c_val:.1f}\n"
+                                                    f"• <b>STOP LOSS:</b> {init_sl:.1f} (-{risk:.1f} pts)\n"
+                                                    f"• <b>TARGET 1:</b> {shelves[0]:.1f} (+{t1_pts:.1f} pts)\n"
+                                                    f"• <b>TARGET MAX:</b> {shelves[-1]:.1f}\n"
+                                                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                    f"⏰ <b>Trigger Time:</b> {r['dt'].strftime('%H:%M:%S')}"
+                                                )
+                                                send_telegram_alert(en_msg)
+
+            except Exception:
+                pass
+            time.sleep(15)
+
+    thread = threading.Thread(target=daemon_loop, daemon=True)
+    thread.start()
+    return thread
+
+# Start server daemon immediately
+start_background_trader()
+
+
+# --- FRONTEND UI RENDERING (PURE VISUAL - NO ALERTS FIRED FROM UI) ---
+df = fetch_nifty_candles_raw(api)
+if df is None or len(df) == 0:
+    st.info("Market data feed is initializing...")
+    st.stop()
+
+curr = df.iloc[-1]
+spot_price = float(curr["close"])
+
+unique_dates = sorted(df["date"].unique())
+pivot_lines_data = {}
+
+if len(unique_dates) >= 2:
+    prev_date = unique_dates[-2]
+    prev_day_df = df[df["date"] == prev_date]
+    if len(prev_day_df) > 0:
+        pdh = round(float(prev_day_df["high"].max()), 2)
+        pdl = round(float(prev_day_df["low"].min()), 2)
+        pdc = round(float(prev_day_df["close"].iloc[-1]), 2)
+
+        P = round((pdh + pdl + pdc) / 3.0, 2)
+        R1 = round((2.0 * P) - pdl, 2)
+        S1 = round((2.0 * P) - pdh, 2)
+        R2 = round(P + (pdh - pdl), 2)
+        S2 = round(P - (pdh - pdl), 2)
+        R3 = round(pdh + 2.0 * (P - pdl), 2)
+        S3 = round(pdl - 2.0 * (pdh - P), 2)
+
+        pivot_lines_data = {
+            "P": P, "R1": R1, "R2": R2, "R3": R3,
+            "S1": S1, "S2": S2, "S3": S3,
+            "PDH": pdh, "PDL": pdl
+        }
+
+atm_strike = int(round(spot_price / 50.0) * 50)
+today_dt = datetime.datetime.now(IST).date()
+auto_expiry = "CURRENT"
+
+if not nfo_df.empty:
+    all_future = nfo_df[nfo_df["exp_dt"].dt.date >= today_dt].sort_values("exp_dt")
+    safe_future = all_future[all_future["exp_dt"].dt.date > today_dt]
+    if not safe_future.empty:
+        auto_expiry = safe_future["expiry"].iloc[0]
+    elif not all_future.empty:
+        auto_expiry = all_future["expiry"].iloc[0]
+
+ctrl_cols = st.columns([2.2, 0.9, 6.9])
+
+with ctrl_cols[0]:
+    mode_selection = st.selectbox(
+        "Budget",
+        [
+            "Budget (< ₹50)",
+            "Budget (< ₹60)",
+            "Budget (< ₹70)",
+            "Budget (< ₹80)",
+            "Budget (< ₹90)",
+            "Budget (< ₹100)",
+            "ATM (At-The-Money)",
+        ],
+        index=3,
     )
-    return msg
 
+with ctrl_cols[1]:
+    sel_lots = st.number_input("Lots", min_value=1, max_value=100, value=1, step=1)
 
-def format_step_trailing_alert(trade, opt_symbol, opt_ltp, delta_val, qty, current_shelf_idx, pullback_buffer):
-    is_ce = trade["type"] == "CE"
-    t_type = trade["type"]
-    entry_p = trade["entry"]
-    trail_p = trade["current_sl"]
-    shelves = trade["shelves"]
-
-    secured_pts = round(trail_p - entry_p, 1) if is_ce else round(entry_p - trail_p, 1)
-    opt_trail_diff = round(secured_pts * delta_val, 1)
-    opt_trail_price = max(0.5, round(opt_ltp + opt_trail_diff, 1))
-    secured_pnl_inr = int(opt_trail_diff * qty)
-
-    if current_shelf_idx < len(shelves):
-        next_target_spot = shelves[current_shelf_idx]
-        next_target_shelf_num = current_shelf_idx + 1
-        next_pts = round(next_target_spot - entry_p, 1) if is_ce else round(entry_p - next_target_spot, 1)
-        next_opt_price = max(0.5, round(opt_ltp + (next_pts * delta_val), 1))
-        target_info = (
-            f"🎯 <b>NEXT TARGET (Shelf {next_target_shelf_num}):</b>\n"
-            f"   • <b>Index Spot:</b> <b>{next_target_spot:.1f}</b> (+{abs(next_pts):.1f} pts)\n"
-            f"   • <b>Option Price:</b> <b>₹{next_opt_price:.2f}</b>"
-        )
-    else:
-        target_info = f"🏆 <b>MAX RUNNER MODE:</b> Trail 5-minute candle extremes"
-
-    time_str = datetime.datetime.now(IST).strftime("%H:%M:%S")
-
-    msg = (
-        f"🔔 <b>NIFTY {t_type} TRAILING SL UPDATED</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>CONTRACT:</b> {opt_symbol} (Qty: {qty})\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🛡️ <b>SET STOP LOSS TO:</b>\n"
-        f"   • <b>INDEX (SPOT):</b> <b>{trail_p:.1f}</b>\n"
-        f"   • <b>OPTION (GTT ₹):</b> <b>₹{opt_trail_price:.2f}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔒 <b>LOCKED PROFIT:</b> <b>{secured_pts:+.1f} pts (₹{secured_pnl_inr:+})</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{target_info}\n"
-        f"📍 <b>Status:</b> {trade['trail_stage']}\n"
-        f"⏰ <b>Time:</b> {time_str}"
-    )
-    return msg
-
-
-# --- MULTI-DAY ENGINE EVALUATION ---
+budget_offset_map = {
+    "Budget (< ₹50)": 4, "Budget (< ₹60)": 3, "Budget (< ₹70)": 3,
+    "Budget (< ₹80)": 2, "Budget (< ₹90)": 2, "Budget (< ₹100)": 1,
+    "ATM (At-The-Money)": 0,
+}
+step_offset = budget_offset_map.get(mode_selection, 2)
 total_qty = sel_lots * LOT_SIZE_QTY
 
-if "notified_sl_map" not in st.session_state:
-    st.session_state.notified_sl_map = {}
+exp_slice = nfo_df[nfo_df["expiry"] == auto_expiry] if not nfo_df.empty else pd.DataFrame()
+exp_date_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_dt
+days_to_expiry = max((exp_date_val - today_dt).days, 1)
+
+def fetch_option_ltp(sym, tok):
+    try:
+        res = api.ltpData("NFO", sym, tok)
+        if isinstance(res, dict) and res.get("status") and res.get("data"):
+            val = float(res["data"].get("ltp", 0.0))
+            if val > 0.0:
+                return val
+    except Exception:
+        pass
+    return 0.0
 
 markers = []
 historical_trade_cards = {}
 active_fib_lines = {}
 latest_trade_for_hud = None
 trade_executed_in_latest_session = False
-alarm_signal_triggered = False
 
 grouped = df.groupby("date")
 latest_session_date = df["date"].iloc[-1]
@@ -515,7 +687,6 @@ for session_date, day_df in grouped:
         vwap_val = row["vwap"]
         atr_val = row["atr"]
 
-        # Trailing Step-Ladder Engine
         if session_trade and not session_trade["closed"]:
             t_type = session_trade["type"]
             entry = session_trade["entry"]
@@ -531,26 +702,13 @@ for session_date, day_df in grouped:
                             session_trade["trail_stage"] = f"SHELF 1 CLEARED ({s_level:.1f}) -> BE LOCKED"
                         else:
                             prev_shelf = shelves[s_idx - 1]
-                            target_sl = round(prev_shelf - pullback_buffer, 1)
-                            session_trade["current_sl"] = max(session_trade["current_sl"], target_sl)
+                            session_trade["current_sl"] = max(session_trade["current_sl"], round(prev_shelf - pullback_buffer, 1))
                             session_trade["trail_stage"] = f"SHELF {s_idx+1} CLEARED ({s_level:.1f}) -> TRAIL LOCK"
 
                 if session_trade["current_shelf_idx"] >= len(shelves):
-                    bar_trail = round(l - 3.0, 1)
-                    session_trade["current_sl"] = max(session_trade["current_sl"], bar_trail)
+                    session_trade["current_sl"] = max(session_trade["current_sl"], round(l - 3.0, 1))
                     session_trade["trail_stage"] = f"MAX RUNNER MODE (Bar Low Trail: {session_trade['current_sl']:.1f})"
 
-                if session_date == latest_session_date:
-                    last_alerted = st.session_state.notified_sl_map.get("current_sl")
-                    if session_trade["current_sl"] != last_alerted:
-                        trail_msg = format_step_trailing_alert(
-                            session_trade, session_trade["opt_symbol"], session_trade["opt_entry_ltp"],
-                            session_trade["delta"], total_qty, session_trade["current_shelf_idx"], pullback_buffer
-                        )
-                        send_telegram_alert(trail_msg)
-                        st.session_state.notified_sl_map["current_sl"] = session_trade["current_sl"]
-
-                # Precise Stop-Loss Fill Assignment
                 if l <= session_trade["current_sl"]:
                     exit_p = session_trade["current_sl"]
                     pts = round(exit_p - entry, 1)
@@ -559,18 +717,6 @@ for session_date, day_df in grouped:
                     session_trade["exit_pts"] = pts
                     session_trade["trail_stage"] = f"STOP HIT ({pts:+.1f} pts)"
                     latest_trade_for_hud = session_trade.copy()
-
-                    if session_date == latest_session_date and not st.session_state.notified_sl_map.get("exit_sent"):
-                        exit_msg = (
-                            f"🏁 <b>TRADE CLOSED (NIFTY CE - STOP HIT)</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"🚪 <b>Exit Price (Spot):</b> <b>{exit_p:.1f}</b>\n"
-                            f"💰 <b>Final Net Spot:</b> <b>{pts:+.1f} pts</b>\n"
-                            f"💵 <b>Final Net Option:</b> <b>₹{round(pts * session_trade['delta'] * total_qty):+}</b>\n"
-                            f"⏰ <b>Exit Time:</b> {row['dt'].strftime('%H:%M')}"
-                        )
-                        send_telegram_alert(exit_msg)
-                        st.session_state.notified_sl_map["exit_sent"] = True
 
                 elif c < ema and c < o and c < (day_orb_h - 3.0):
                     exit_p = c
@@ -581,18 +727,6 @@ for session_date, day_df in grouped:
                     session_trade["trail_stage"] = f"EMA REVERSAL ({pts:+.1f} pts)"
                     latest_trade_for_hud = session_trade.copy()
 
-                    if session_date == latest_session_date and not st.session_state.notified_sl_map.get("exit_sent"):
-                        exit_msg = (
-                            f"🏁 <b>TRADE CLOSED (NIFTY CE - EMA REVERSAL)</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"🚪 <b>Exit Price (Spot):</b> <b>{exit_p:.1f}</b>\n"
-                            f"💰 <b>Final Net Spot:</b> <b>{pts:+.1f} pts</b>\n"
-                            f"💵 <b>Final Net Option:</b> <b>₹{round(pts * session_trade['delta'] * total_qty):+}</b>\n"
-                            f"⏰ <b>Exit Time:</b> {row['dt'].strftime('%H:%M')}"
-                        )
-                        send_telegram_alert(exit_msg)
-                        st.session_state.notified_sl_map["exit_sent"] = True
-
             elif t_type == "PE":
                 for s_idx, s_level in enumerate(shelves):
                     if l <= s_level and s_idx >= session_trade["current_shelf_idx"]:
@@ -602,26 +736,13 @@ for session_date, day_df in grouped:
                             session_trade["trail_stage"] = f"SHELF 1 CLEARED ({s_level:.1f}) -> BE LOCKED"
                         else:
                             prev_shelf = shelves[s_idx - 1]
-                            target_sl = round(prev_shelf + pullback_buffer, 1)
-                            session_trade["current_sl"] = min(session_trade["current_sl"], target_sl)
+                            session_trade["current_sl"] = min(session_trade["current_sl"], round(prev_shelf + pullback_buffer, 1))
                             session_trade["trail_stage"] = f"SHELF {s_idx+1} CLEARED ({s_level:.1f}) -> TRAIL LOCK"
 
                 if session_trade["current_shelf_idx"] >= len(shelves):
-                    bar_trail = round(h + 3.0, 1)
-                    session_trade["current_sl"] = min(session_trade["current_sl"], bar_trail)
+                    session_trade["current_sl"] = min(session_trade["current_sl"], round(h + 3.0, 1))
                     session_trade["trail_stage"] = f"MAX RUNNER MODE (Bar High Trail: {session_trade['current_sl']:.1f})"
 
-                if session_date == latest_session_date:
-                    last_alerted = st.session_state.notified_sl_map.get("current_sl")
-                    if session_trade["current_sl"] != last_alerted:
-                        trail_msg = format_step_trailing_alert(
-                            session_trade, session_trade["opt_symbol"], session_trade["opt_entry_ltp"],
-                            session_trade["delta"], total_qty, session_trade["current_shelf_idx"], pullback_buffer
-                        )
-                        send_telegram_alert(trail_msg)
-                        st.session_state.notified_sl_map["current_sl"] = session_trade["current_sl"]
-
-                # Precise Stop-Loss Fill Assignment
                 if h >= session_trade["current_sl"]:
                     exit_p = session_trade["current_sl"]
                     pts = round(entry - exit_p, 1)
@@ -630,18 +751,6 @@ for session_date, day_df in grouped:
                     session_trade["exit_pts"] = pts
                     session_trade["trail_stage"] = f"STOP HIT ({pts:+.1f} pts)"
                     latest_trade_for_hud = session_trade.copy()
-
-                    if session_date == latest_session_date and not st.session_state.notified_sl_map.get("exit_sent"):
-                        exit_msg = (
-                            f"🏁 <b>TRADE CLOSED (NIFTY PE - STOP HIT)</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"🚪 <b>Exit Price (Spot):</b> <b>{exit_p:.1f}</b>\n"
-                            f"💰 <b>Final Net Spot:</b> <b>{pts:+.1f} pts</b>\n"
-                            f"💵 <b>Final Net Option:</b> <b>₹{round(pts * session_trade['delta'] * total_qty):+}</b>\n"
-                            f"⏰ <b>Exit Time:</b> {row['dt'].strftime('%H:%M')}"
-                        )
-                        send_telegram_alert(exit_msg)
-                        st.session_state.notified_sl_map["exit_sent"] = True
 
                 elif c > ema and c > o and c > (day_orb_l + 3.0):
                     exit_p = c
@@ -652,23 +761,10 @@ for session_date, day_df in grouped:
                     session_trade["trail_stage"] = f"EMA REVERSAL ({pts:+.1f} pts)"
                     latest_trade_for_hud = session_trade.copy()
 
-                    if session_date == latest_session_date and not st.session_state.notified_sl_map.get("exit_sent"):
-                        exit_msg = (
-                            f"🏁 <b>TRADE CLOSED (NIFTY PE - EMA REVERSAL)</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"🚪 <b>Exit Price (Spot):</b> <b>{exit_p:.1f}</b>\n"
-                            f"💰 <b>Final Net Spot:</b> <b>{pts:+.1f} pts</b>\n"
-                            f"💵 <b>Final Net Option:</b> <b>₹{round(pts * session_trade['delta'] * total_qty):+}</b>\n"
-                            f"⏰ <b>Exit Time:</b> {row['dt'].strftime('%H:%M')}"
-                        )
-                        send_telegram_alert(exit_msg)
-                        st.session_state.notified_sl_map["exit_sent"] = True
-
         # Breakout Entry Window: 09:30 to 10:30 AM
         if datetime.time(9, 30) < t <= datetime.time(10, 30) and not trade_executed_today:
             sw_h, sw_l = extract_intraday_swings(day_df, idx, window=2)
 
-            # Original Rule: Close > ORB High, VWAP, 9-EMA
             if c > day_orb_h and c > vwap_val and c > ema:
                 init_sl = round(l - 5.0, 1)
                 risk = round(c - init_sl, 1)
@@ -734,12 +830,7 @@ for session_date, day_df in grouped:
                 latest_trade_for_hud = session_trade.copy()
                 if session_date == latest_session_date:
                     trade_executed_in_latest_session = True
-                    alarm_signal_triggered = True
 
-                    entry_msg = format_full_entry_table_card(session_trade, opt_sym, opt_ltp, trade_delta, total_qty)
-                    send_telegram_alert(entry_msg)
-
-            # Original Rule: Close < ORB Low, VWAP, 9-EMA
             elif c < day_orb_l and c < vwap_val and c < ema:
                 init_sl = round(h + 5.0, 1)
                 risk = round(init_sl - c, 1)
@@ -805,12 +896,7 @@ for session_date, day_df in grouped:
                 latest_trade_for_hud = session_trade.copy()
                 if session_date == latest_session_date:
                     trade_executed_in_latest_session = True
-                    alarm_signal_triggered = True
 
-                    entry_msg = format_full_entry_table_card(session_trade, opt_sym, opt_ltp, trade_delta, total_qty)
-                    send_telegram_alert(entry_msg)
-
-# Active Contract Selection for HUD & Header
 if latest_trade_for_hud:
     active_type = latest_trade_for_hud["type"]
     active_strike = latest_trade_for_hud["strike"]
@@ -875,7 +961,6 @@ volume_data = [
     for _, r in df.iterrows()
 ]
 
-# --- STRATEGY HUD PAYLOAD (Accurate Realized/Secured P&L) ---
 hud_payload = None
 if trade_executed_in_latest_session and latest_trade_for_hud:
     is_ce = latest_trade_for_hud["type"] == "CE"
@@ -980,7 +1065,6 @@ elif latest_trade_for_hud:
         "theme": "#089981" if is_ce else "#f23645",
     }
 
-# Serialization
 candles_json = json.dumps(candles_data)
 volume_json = json.dumps(volume_data)
 vwap_json = json.dumps([{"time": int(r["time"]), "value": round(float(r["vwap"]), 2)} for _, r in df.iterrows()])
@@ -990,16 +1074,13 @@ history_cards_json = json.dumps(historical_trade_cards)
 pivots_json = json.dumps(pivot_lines_data)
 fibs_json = json.dumps(active_fib_lines)
 hud_json = json.dumps(hud_payload)
-play_alarm_flag = "true" if alarm_signal_triggered else "false"
 
-# Price Change
 day_open = today_df.iloc[0]["open"]
 chg = curr["close"] - day_open
 chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
-# --- Embedded Lightweight Charts Web Terminal ---
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -1063,13 +1144,6 @@ html_code = f"""
         }}
         .tool-btn:hover {{ background: #2962ff; color: #ffffff; }}
         .tool-btn.active-draw {{ background: #00e5ff; color: #000; font-weight: 800; }}
-
-        .alarm-toggle-btn {{
-            background: rgba(30, 34, 45, 0.95); border: 1px solid #363c4e; color: #00e5ff;
-            font-size: 10px; font-weight: 700; padding: 2px 5px; border-radius: 4px;
-            cursor: pointer; display: flex; align-items: center; gap: 4px; flex-shrink: 0;
-        }}
-        .alarm-toggle-btn.enabled {{ background: #00bfa5; color: #000; border-color: #00bfa5; }}
 
         .dynamic-ohlc-row {{
             font-size: 9.5px; color: #787b86; display: flex; gap: 6px;
@@ -1154,24 +1228,9 @@ html_code = f"""
             padding: 5px 8px; font-size: 9.5px; color: #d1d4dc; line-height: 1.4;
             box-shadow: 0 4px 12px rgba(0,0,0,0.7); transform: translate(-50%, -100%);
         }}
-
-        .alarm-ringing-banner {{
-            position: fixed; top: 8px; left: 50%; transform: translateX(-50%); z-index: 100;
-            background: #f23645; color: #ffffff; font-weight: 800; font-size: 11px;
-            padding: 6px 14px; border-radius: 20px; box-shadow: 0 0 20px rgba(242, 54, 69, 0.8);
-            cursor: pointer; display: none; animation: pulseAlarm 0.8s infinite alternate;
-        }}
-        @keyframes pulseAlarm {{
-            from {{ transform: translateX(-50%) scale(1); }}
-            to {{ transform: translateX(-50%) scale(1.06); }}
-        }}
     </style>
 </head>
 <body>
-    <div id="ringingBanner" class="alarm-ringing-banner" onclick="silenceAlarmNow()">
-        🚨 SIGNAL CONFIRMED! [TAP TO MUTE] 🔇
-    </div>
-
     <div id="topHeaderArea">
         <div class="top-row-1">
             <div class="sym-group">
@@ -1207,10 +1266,6 @@ html_code = f"""
                 <button id="btnLong" class="tool-btn" onclick="activateDrawMode('LONG')">+ Long Tool</button>
                 <button id="btnShort" class="tool-btn" onclick="activateDrawMode('SHORT')">+ Short Tool</button>
             </div>
-
-            <button id="alarmBtn" class="alarm-toggle-btn" onclick="toggleAudioAlarm()">
-                🔔 <span id="alarmTxt">Audio</span>
-            </button>
         </div>
     </div>
 
@@ -1225,66 +1280,6 @@ html_code = f"""
         const activeLots = {sel_lots};
         const LOT_SIZE = {LOT_SIZE_QTY};
         const activeQty = activeLots * LOT_SIZE;
-
-        let audioCtx = null;
-        let alarmUnlocked = localStorage.getItem('nifty_alarm_active') === 'true';
-        let alarmTimer = null;
-
-        function updateAlarmButtonUI() {{
-            const btn = document.getElementById('alarmBtn');
-            const txt = document.getElementById('alarmTxt');
-            if (alarmUnlocked) {{
-                btn.className = 'alarm-toggle-btn enabled';
-                txt.innerText = 'Audio 🔔';
-            }} else {{
-                btn.className = 'alarm-toggle-btn';
-                txt.innerText = 'Audio 🔕';
-            }}
-        }}
-
-        function toggleAudioAlarm() {{
-            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            if (audioCtx.state === 'suspended') audioCtx.resume();
-            alarmUnlocked = !alarmUnlocked;
-            localStorage.setItem('nifty_alarm_active', alarmUnlocked ? 'true' : 'false');
-            updateAlarmButtonUI();
-            if (alarmUnlocked) playBeepTone(880, 0.15);
-            else silenceAlarmNow();
-        }}
-
-        function silenceAlarmNow() {{
-            if (alarmTimer) {{ clearInterval(alarmTimer); alarmTimer = null; }}
-            document.getElementById('ringingBanner').style.display = 'none';
-            sessionStorage.setItem('alarm_silenced_for_session', 'true');
-        }}
-
-        function playBeepTone(freq = 750, duration = 0.3) {{
-            try {{
-                if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-                if (audioCtx.state === 'suspended') audioCtx.resume();
-                const osc = audioCtx.createOscillator();
-                const gain = audioCtx.createGain();
-                osc.type = 'sine';
-                osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
-                gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
-                gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
-                osc.connect(gain);
-                gain.connect(audioCtx.destination);
-                osc.start();
-                osc.stop(audioCtx.currentTime + duration);
-            }} catch(err) {{}}
-        }}
-
-        const shouldRingAlarm = {play_alarm_flag};
-        updateAlarmButtonUI();
-        const isSilenced = sessionStorage.getItem('alarm_silenced_for_session') === 'true';
-        if (shouldRingAlarm && alarmUnlocked && !isSilenced) {{
-            document.getElementById('ringingBanner').style.display = 'block';
-            alarmTimer = setInterval(() => {{
-                playBeepTone(880, 0.2);
-                setTimeout(() => playBeepTone(1100, 0.2), 300);
-            }}, 2000);
-        }}
 
         const chartContainer = document.getElementById('chartArea');
         const chart = LightweightCharts.createChart(chartContainer, {{
@@ -1570,7 +1565,6 @@ html_code = f"""
             document.getElementById('activeToolsContainer').appendChild(anchor);
         }}
 
-        // Render Strategy HUD
         const s = {hud_json};
         const table = document.getElementById('strategyBox');
 
