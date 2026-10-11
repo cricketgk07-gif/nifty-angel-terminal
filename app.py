@@ -205,7 +205,6 @@ def fetch_nifty_candles():
     candle_spread = (df["high"] - df["low"]) + (df["close"] - df["open"]).abs()
     raw_vol = df["volume"].apply(lambda v: float(v) if pd.notnull(v) and v > 0 else 0.0)
     df["calc_vol"] = raw_vol.where(raw_vol > 0, candle_spread * 1250.0 + 500.0)
-    df["vol_ma"] = df["calc_vol"].rolling(window=10, min_periods=1).mean()
 
     df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
     df["vol_mult"] = df["tp"] * df["calc_vol"]
@@ -390,7 +389,7 @@ def build_dynamic_shelves(entry_p, t_type, pv_dict, oi_target, atr_v, sw_h, sw_l
     return candidates, {"fib_100": fib_100, "fib_161": fib_161, "fib_261": fib_261}
 
 
-# Dual Format Telegram Notification Templates
+# Dual Alert Templates (Spot Points + Option ₹)
 def format_full_entry_table_card(trade, opt_symbol, opt_ltp, delta_val, qty):
     is_ce = trade["type"] == "CE"
     t_type = trade["type"]
@@ -418,7 +417,7 @@ def format_full_entry_table_card(trade, opt_symbol, opt_ltp, delta_val, qty):
     time_str = datetime.datetime.now(IST).strftime("%H:%M:%S")
 
     msg = (
-        f"🚀 <b>STRONG BREAKOUT TRIGGERED: BUY {t_type}</b>\n"
+        f"🚀 <b>ORB BREAKOUT TRIGGERED: BUY {t_type}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>CONTRACT:</b> {opt_symbol}\n"
         f"<b>MODE:</b> {mode_selection} | <b>QTY:</b> {qty} (Δ: {delta_val:.2f})\n"
@@ -481,7 +480,7 @@ def format_step_trailing_alert(trade, opt_symbol, opt_ltp, delta_val, qty, curre
     return msg
 
 
-# --- MULTI-DAY ENGINE EVALUATION ---
+# --- MULTI-DAY ENGINE EVALUATION (EXACT ORIGINAL LOGIC) ---
 total_qty = sel_lots * LOT_SIZE_QTY
 
 if "notified_sl_map" not in st.session_state:
@@ -515,12 +514,6 @@ for session_date, day_df in grouped:
         ema = row["ema9"]
         vwap_val = row["vwap"]
         atr_val = row["atr"]
-        vol = row["calc_vol"]
-        vol_avg = row["vol_ma"]
-
-        candle_range = max(1.0, h - l)
-        candle_body = abs(c - o)
-        body_ratio = candle_body / candle_range
 
         # Trailing Step-Ladder Engine
         if session_trade and not session_trade["closed"]:
@@ -627,31 +620,12 @@ for session_date, day_df in grouped:
                         send_telegram_alert(exit_msg)
                         st.session_state.notified_sl_map["exit_sent"] = True
 
-        # Breakout Entry Window: 09:30 to 10:30 AM (Strong Candle Momentum Filter)
+        # Breakout Entry Window: 09:30 to 10:30 AM (EXACT ORIGINAL LOGIC)
         if datetime.time(9, 30) < t <= datetime.time(10, 30) and not trade_executed_today:
             sw_h, sw_l = extract_intraday_swings(day_df, idx, window=2)
 
-            is_strong_range = candle_range >= (atr_val * 0.70)
-            is_strong_body = body_ratio >= 0.60
-            has_vol_support = vol >= (vol_avg * 0.90)
-
-            is_bullish_strong_bar = (
-                (c > o)
-                and is_strong_body
-                and is_strong_range
-                and (c >= (h - 0.25 * candle_range))
-                and has_vol_support
-            )
-
-            is_bearish_strong_bar = (
-                (c < o)
-                and is_strong_body
-                and is_strong_range
-                and (c <= (l + 0.25 * candle_range))
-                and has_vol_support
-            )
-
-            if is_bullish_strong_bar and (c > day_orb_h) and (c > vwap_val) and (c > ema):
+            # Original Rule: Close > ORB High, VWAP, 9-EMA
+            if c > day_orb_h and c > vwap_val and c > ema:
                 init_sl = round(l - 5.0, 1)
                 risk = round(c - init_sl, 1)
                 oi_res = atm_strike + 200
@@ -688,7 +662,7 @@ for session_date, day_df in grouped:
                     "trail_stage": f"RISK ON (Max Target: {shelves[-1]:.1f})",
                     "risk": risk,
                     "closed": False,
-                    "reason": "Strong Expansion Bar > ORB High & VWAP",
+                    "reason": "Close > ORB High & VWAP",
                     "strike": trade_strike,
                     "opt_symbol": opt_sym,
                     "opt_entry_ltp": opt_ltp,
@@ -704,7 +678,7 @@ for session_date, day_df in grouped:
                     }
                 )
                 historical_trade_cards[int(row["time"])] = {
-                    "title": "BUY CE (STRONG BREAKOUT)",
+                    "title": "BUY CE (ORB BREAKOUT)",
                     "entry": round(c, 1),
                     "target": round(shelves[-1], 1),
                     "target_pts": round(shelves[-1] - c, 1),
@@ -721,7 +695,8 @@ for session_date, day_df in grouped:
                     entry_msg = format_full_entry_table_card(session_trade, opt_sym, opt_ltp, trade_delta, total_qty)
                     send_telegram_alert(entry_msg)
 
-            elif is_bearish_strong_bar and (c < day_orb_l) and (c < vwap_val) and (c < ema):
+            # Original Rule: Close < ORB Low, VWAP, 9-EMA
+            elif c < day_orb_l and c < vwap_val and c < ema:
                 init_sl = round(h + 5.0, 1)
                 risk = round(init_sl - c, 1)
                 oi_sup = atm_strike - 200
@@ -758,7 +733,7 @@ for session_date, day_df in grouped:
                     "trail_stage": f"RISK ON (Max Target: {shelves[-1]:.1f})",
                     "risk": risk,
                     "closed": False,
-                    "reason": "Strong Expansion Bar < ORB Low & VWAP",
+                    "reason": "Close < ORB Low & VWAP",
                     "strike": trade_strike,
                     "opt_symbol": opt_sym,
                     "opt_entry_ltp": opt_ltp,
@@ -774,7 +749,7 @@ for session_date, day_df in grouped:
                     }
                 )
                 historical_trade_cards[int(row["time"])] = {
-                    "title": "BUY PE (STRONG BREAKDOWN)",
+                    "title": "BUY PE (ORB BREAKDOWN)",
                     "entry": round(c, 1),
                     "target": round(shelves[-1], 1),
                     "target_pts": round(c - shelves[-1], 1),
@@ -856,7 +831,7 @@ volume_data = [
     for _, r in df.iterrows()
 ]
 
-# --- STRATEGY HUD PAYLOAD (P&L Bug Corrected) ---
+# --- STRATEGY HUD PAYLOAD (Accurate Realized/Secured P&L) ---
 hud_payload = None
 if trade_executed_in_latest_session and latest_trade_for_hud:
     is_ce = latest_trade_for_hud["type"] == "CE"
@@ -909,7 +884,7 @@ elif (not trade_executed_in_latest_session) and (latest_bar_time >= datetime.tim
     hud_payload = {
         "is_no_trade": True,
         "status": "NO TRADE TODAY",
-        "reason": "No strong momentum breakout before 10:30 AM",
+        "reason": "No valid breakout before 10:30 AM",
         "action": "Capital Protected (Wait for tomorrow)",
         "theme": "#787b86",
     }
@@ -1559,7 +1534,7 @@ html_code = f"""
             table.style.display = 'block';
             if (s.is_no_trade) {{
                 table.innerHTML = `
-                    <div class="box-drag-handle">::: STRATEGY HUD :::</div>
+                    <div class="box-drag-handle">::: DRAG STRATEGY HUD :::</div>
                     <table>
                         <tr><td class="label-cell">Session Status</td><td class="val-cell" colspan="2"><span class="tag-pill" style="background:#546e7a;">${{s.status}}</span></td></tr>
                         <tr><td class="label-cell">Reason</td><td class="val-cell" colspan="2" style="font-size:9px; color:#cfd3dc;">${{s.reason}}</td></tr>
@@ -1585,7 +1560,7 @@ html_code = f"""
                 const optTrailPrice = Math.max(0.0, Math.round((activeRealLTP + optTrailPts) * 10) / 10);
 
                 table.innerHTML = `
-                    <div class="box-drag-handle">::: STRATEGY HUD :::</div>
+                    <div class="box-drag-handle">::: DRAG STRATEGY HUD :::</div>
                     <table>
                         <thead>
                             <tr>
