@@ -275,8 +275,7 @@ if not nfo_df.empty:
     elif not all_future.empty:
         auto_expiry = all_future["expiry"].iloc[0]
 
-# --- STREAMLINED TOP CONTROLS ---
-# Manual Strike and Expiry dropdowns are removed to eliminate conflicts
+# Streamlined Top Controls
 ctrl_cols = st.columns([2.0, 0.9, 0.9, 6.2])
 
 with ctrl_cols[0]:
@@ -291,7 +290,7 @@ with ctrl_cols[0]:
             "Budget (< ₹100)",
             "ATM (At-The-Money)",
         ],
-        index=3,  # Defaults to < ₹80
+        index=3,
     )
 
 with ctrl_cols[1]:
@@ -462,12 +461,12 @@ def build_dynamic_shelves(entry_p, t_type, pv_dict, oi_target, atr_v, sw_h, sw_l
     return candidates, {"fib_100": fib_100, "fib_161": fib_161, "fib_261": fib_261}
 
 
-def format_telegram_table_card(header_title, trade, spot_c, opt_ltp, delta_val, qty):
+def format_full_entry_table_card(trade, opt_ltp, delta_val, qty):
+    """Sends the full Strategy HUD table immediately upon trade entry."""
     is_ce = trade["type"] == "CE"
     t_type = trade["type"]
     entry_p = trade["entry"]
     trail_p = trade["current_sl"]
-    secured_pts = round(trail_p - entry_p, 1) if is_ce else round(entry_p - trail_p, 1)
     risk_pts = trade["risk"]
     t1_pts = round(abs(trade["tp1"] - entry_p), 1)
     tmid_pts = round(abs(trade["tp_mid"] - entry_p), 1)
@@ -488,19 +487,14 @@ def format_telegram_table_card(header_title, trade, spot_c, opt_ltp, delta_val, 
     opt_final_price = round(opt_ltp + opt_final_gain, 1)
     final_profit_inr = int(opt_final_gain * qty)
 
-    opt_trail_diff = round(secured_pts * delta_val, 1)
-    opt_trail_price = max(0.5, round(opt_ltp + opt_trail_diff, 1))
-    secured_pnl_inr = int(opt_trail_diff * qty)
-
     contract_name = target_symbol if target_symbol else f"NIFTY {active_strike} {t_type}"
-    trail_stage_text = trade["trail_stage"]
     time_str = datetime.datetime.now(IST).strftime("%H:%M:%S")
 
     msg = (
-        f"{header_title}\n"
+        f"🚀 <b>NIFTY TRADE TRIGGERED: BUY {t_type}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>CONTRACT:</b> {contract_name}\n"
-        f"<b>MODE:</b> {mode_selection} | <b>QTY:</b> {qty}\n"
+        f"<b>MODE:</b> {mode_selection} | <b>QTY:</b> {qty} (Δ: {delta_val:.2f})\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Parameter | Spot | Option (₹)</b>\n"
         f"• <b>Entry:</b> {entry_p:.1f} | <b>₹{opt_ltp:.2f}</b>\n"
@@ -508,10 +502,74 @@ def format_telegram_table_card(header_title, trade, spot_c, opt_ltp, delta_val, 
         f"• <b>Target 1:</b> {trade['tp1']:.1f} | <b>₹{opt_t1_price:.2f}</b> (+₹{t1_profit_inr})\n"
         f"• <b>Target Mid:</b> {trade['tp_mid']:.1f} | <b>₹{opt_tmid_price:.2f}</b>\n"
         f"• <b>Target Max:</b> {trade['tp_final']:.1f} | <b>₹{opt_final_price:.2f}</b> (+₹{final_profit_inr})\n"
-        f"• <b>Trailing SL:</b> {trail_p:.1f} | <b>₹{opt_trail_price:.2f}</b>\n"
+        f"• <b>Trailing SL:</b> {trail_p:.1f} | <b>₹{opt_sl_price:.2f}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🛡️ <b>Trail Mode:</b> {trail_stage_text}\n"
-        f"💰 <b>Secured P&L:</b> <b>{secured_pts:+.1f} pts (₹{secured_pnl_inr:+})</b>\n"
+        f"🛡️ <b>Trail Mode:</b> {trade['trail_stage']}\n"
+        f"💰 <b>Secured Points:</b> 0.0 pts (Risk Active)\n"
+        f"⏰ <b>Trigger Time:</b> {time_str}"
+    )
+    return msg
+
+
+def format_step_trailing_alert(trade, opt_ltp, delta_val, qty, current_shelf_idx, pullback_buffer):
+    """
+    Delivers the actionable next-step alert:
+    1. New Trailing SL (Spot & Option ₹)
+    2. Next Target to Aim For (Spot & Option ₹)
+    3. Secured Points / Profit
+    4. Next Trailing SL that will activate once Next Target is cleared
+    """
+    is_ce = trade["type"] == "CE"
+    t_type = trade["type"]
+    entry_p = trade["entry"]
+    trail_p = trade["current_sl"]
+    shelves = trade["shelves"]
+
+    secured_pts = round(trail_p - entry_p, 1) if is_ce else round(entry_p - trail_p, 1)
+    opt_trail_diff = round(secured_pts * delta_val, 1)
+    opt_trail_price = max(0.5, round(opt_ltp + opt_trail_diff, 1))
+    secured_pnl_inr = int(opt_trail_diff * qty)
+
+    # Calculate Next Target Shelf
+    if current_shelf_idx < len(shelves):
+        next_target_spot = shelves[current_shelf_idx]
+        next_target_shelf_num = current_shelf_idx + 1
+        next_pts = round(next_target_spot - entry_p, 1) if is_ce else round(entry_p - next_target_spot, 1)
+        next_opt_price = max(0.5, round(opt_ltp + (next_pts * delta_val), 1))
+        next_target_text = f"{next_target_spot:.1f} | <b>₹{next_opt_price:.2f}</b>"
+
+        # Calculate what the SL will become AFTER hitting next shelf
+        if current_shelf_idx == 0:
+            subsequent_sl_spot = round(entry_p + 3.0, 1) if is_ce else round(entry_p - 3.0, 1)
+        else:
+            prev_s = shelves[current_shelf_idx - 1]
+            subsequent_sl_spot = round(prev_s - pullback_buffer, 1) if is_ce else round(prev_s + pullback_buffer, 1)
+        
+        sub_pts = round(subsequent_sl_spot - entry_p, 1) if is_ce else round(entry_p - subsequent_sl_spot, 1)
+        sub_opt_price = max(0.5, round(opt_ltp + (sub_pts * delta_val), 1))
+        subsequent_sl_text = f"{subsequent_sl_spot:.1f} | <b>₹{sub_opt_price:.2f}</b> ({sub_pts:+.1f} pts)"
+    else:
+        next_target_shelf_num = "FINAL"
+        next_target_text = f"{shelves[-1]:.1f} (MAX RUNNER MODE - Trail 5m Bar Extremes)"
+        subsequent_sl_text = "Trailing Bar High/Low Continuously"
+
+    contract_name = target_symbol if target_symbol else f"NIFTY {active_strike} {t_type}"
+    time_str = datetime.datetime.now(IST).strftime("%H:%M:%S")
+
+    msg = (
+        f"🔔 <b>NIFTY {t_type} TRAILING SL UPDATED</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>CONTRACT:</b> {contract_name} (Qty: {qty})\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🛡️ <b>NEW TRAILING SL:</b> {trail_p:.1f} | <b>₹{opt_trail_price:.2f}</b>\n"
+        f"🔒 <b>SECURED POINTS:</b> <b>{secured_pts:+.1f} pts (₹{secured_pnl_inr:+})</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>NEXT TARGET (Shelf {next_target_shelf_num}):</b>\n"
+        f"   Spot: {next_target_text}\n"
+        f"🛡️ <b>NEXT SL (On Reaching Target):</b>\n"
+        f"   Spot: {subsequent_sl_text}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📍 <b>Status:</b> {trade['trail_stage']}\n"
         f"⏰ <b>Time:</b> {time_str}"
     )
     return msg
@@ -576,11 +634,11 @@ for session_date, day_df in grouped:
                 if session_date == latest_session_date:
                     last_alerted = st.session_state.notified_sl_map.get("current_sl")
                     if session_trade["current_sl"] != last_alerted:
-                        full_card_msg = format_telegram_table_card(
-                            "🔔 <b>NIFTY CE TRAILING SL UPDATED</b>",
-                            session_trade, c, live_real_ltp, active_delta, total_qty
+                        trail_msg = format_step_trailing_alert(
+                            session_trade, live_real_ltp, active_delta, total_qty,
+                            session_trade["current_shelf_idx"], pullback_buffer
                         )
-                        send_telegram_alert(full_card_msg)
+                        send_telegram_alert(trail_msg)
                         st.session_state.notified_sl_map["current_sl"] = session_trade["current_sl"]
 
                 if l <= session_trade["current_sl"] or (c < ema and c < o and c < (day_orb_h - 3.0)):
@@ -625,11 +683,11 @@ for session_date, day_df in grouped:
                 if session_date == latest_session_date:
                     last_alerted = st.session_state.notified_sl_map.get("current_sl")
                     if session_trade["current_sl"] != last_alerted:
-                        full_card_msg = format_telegram_table_card(
-                            "🔔 <b>NIFTY PE TRAILING SL UPDATED</b>",
-                            session_trade, c, live_real_ltp, active_delta, total_qty
+                        trail_msg = format_step_trailing_alert(
+                            session_trade, live_real_ltp, active_delta, total_qty,
+                            session_trade["current_shelf_idx"], pullback_buffer
                         )
-                        send_telegram_alert(full_card_msg)
+                        send_telegram_alert(trail_msg)
                         st.session_state.notified_sl_map["current_sl"] = session_trade["current_sl"]
 
                 if h >= session_trade["current_sl"] or (c > ema and c > o and c > (day_orb_l + 3.0)):
@@ -705,10 +763,8 @@ for session_date, day_df in grouped:
                     trade_executed_in_latest_session = True
                     alarm_signal_triggered = True
 
-                    entry_msg = format_telegram_table_card(
-                        "🚀 <b>NIFTY TRADE TRIGGERED: BUY CE</b>",
-                        session_trade, c, live_real_ltp, active_delta, total_qty
-                    )
+                    # 1. Full Strategy Table Alert on Entry
+                    entry_msg = format_full_entry_table_card(session_trade, live_real_ltp, active_delta, total_qty)
                     send_telegram_alert(entry_msg)
 
             elif c < day_orb_l and c < vwap_val and c < ema:
@@ -759,10 +815,8 @@ for session_date, day_df in grouped:
                     trade_executed_in_latest_session = True
                     alarm_signal_triggered = True
 
-                    entry_msg = format_telegram_table_card(
-                        "🚀 <b>NIFTY TRADE TRIGGERED: BUY PE</b>",
-                        session_trade, c, live_real_ltp, active_delta, total_qty
-                    )
+                    # 1. Full Strategy Table Alert on Entry
+                    entry_msg = format_full_entry_table_card(session_trade, live_real_ltp, active_delta, total_qty)
                     send_telegram_alert(entry_msg)
 
 today_date = df["date"].iloc[-1]
