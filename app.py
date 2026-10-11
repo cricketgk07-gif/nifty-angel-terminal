@@ -206,6 +206,7 @@ def fetch_nifty_candles():
     candle_spread = (df["high"] - df["low"]) + (df["close"] - df["open"]).abs()
     raw_vol = df["volume"].apply(lambda v: float(v) if pd.notnull(v) and v > 0 else 0.0)
     df["calc_vol"] = raw_vol.where(raw_vol > 0, candle_spread * 1250.0 + 500.0)
+    df["vol_ma"] = df["calc_vol"].rolling(window=10, min_periods=1).mean()
 
     df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
     df["vol_mult"] = df["tp"] * df["calc_vol"]
@@ -263,7 +264,7 @@ if len(unique_dates) >= 2:
 atm_strike = int(round(spot_price / 50.0) * 50)
 strikes_list = [atm_strike + (x * 50) for x in range(-20, 21)]
 
-# Expiry Filter: Automatically skip current day's expiry to avoid rapid theta bleed
+# Expiry Filter: Skip same-day expiry
 today_dt = datetime.datetime.now(IST).date()
 auto_expiry = "CURRENT"
 
@@ -313,15 +314,14 @@ exp_slice = nfo_df[nfo_df["expiry"] == auto_expiry] if not nfo_df.empty else pd.
 exp_date_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_dt
 days_to_expiry = max((exp_date_val - today_dt).days, 1)
 
-# Dynamic Budget to Strike Offset Map
 budget_offset_map = {
-    "Budget (< ₹50)": 4,   # 200 pts OTM
-    "Budget (< ₹60)": 3,   # 150 pts OTM
-    "Budget (< ₹70)": 3,   # 150 pts OTM
-    "Budget (< ₹80)": 2,   # 100 pts OTM
-    "Budget (< ₹90)": 2,   # 100 pts OTM
-    "Budget (< ₹100)": 1,  # 50 pts OTM
-    "ATM (At-The-Money)": 0 # 0 pts (ATM)
+    "Budget (< ₹50)": 4,
+    "Budget (< ₹60)": 3,
+    "Budget (< ₹70)": 3,
+    "Budget (< ₹80)": 2,
+    "Budget (< ₹90)": 2,
+    "Budget (< ₹100)": 1,
+    "ATM (At-The-Money)": 0,
 }
 
 step_offset = budget_offset_map.get(mode_selection, 2)
@@ -330,7 +330,6 @@ if sel_type == "CE":
 else:
     active_strike = atm_strike - (step_offset * 50)
 
-# Single Fast API LTP Fetch
 live_real_ltp = 0.0
 target_symbol = ""
 target_token = ""
@@ -461,12 +460,12 @@ def build_dynamic_shelves(entry_p, t_type, pv_dict, oi_target, atr_v, sw_h, sw_l
     return candidates, {"fib_100": fib_100, "fib_161": fib_161, "fib_261": fib_261}
 
 
+# --- TELEGRAM FORMATTERS: DUAL-MODE (INDEX + OPTION) ---
 def format_full_entry_table_card(trade, opt_ltp, delta_val, qty):
-    """Sends the full Strategy HUD table immediately upon trade entry."""
+    """Sends both Index Spot and Option Rupee figures on trade breakout."""
     is_ce = trade["type"] == "CE"
     t_type = trade["type"]
     entry_p = trade["entry"]
-    trail_p = trade["current_sl"]
     risk_pts = trade["risk"]
     t1_pts = round(abs(trade["tp1"] - entry_p), 1)
     tmid_pts = round(abs(trade["tp_mid"] - entry_p), 1)
@@ -491,21 +490,19 @@ def format_full_entry_table_card(trade, opt_ltp, delta_val, qty):
     time_str = datetime.datetime.now(IST).strftime("%H:%M:%S")
 
     msg = (
-        f"🚀 <b>NIFTY TRADE TRIGGERED: BUY {t_type}</b>\n"
+        f"🚀 <b>STRONG BREAKOUT TRIGGERED: BUY {t_type}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>CONTRACT:</b> {contract_name}\n"
         f"<b>MODE:</b> {mode_selection} | <b>QTY:</b> {qty} (Δ: {delta_val:.2f})\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Parameter | Spot | Option (₹)</b>\n"
-        f"• <b>Entry:</b> {entry_p:.1f} | <b>₹{opt_ltp:.2f}</b>\n"
-        f"• <b>SL (Risk):</b> {trade['init_sl']:.1f} | <b>₹{opt_sl_price:.2f}</b> (-₹{max_risk_inr})\n"
-        f"• <b>Target 1:</b> {trade['tp1']:.1f} | <b>₹{opt_t1_price:.2f}</b> (+₹{t1_profit_inr})\n"
-        f"• <b>Target Mid:</b> {trade['tp_mid']:.1f} | <b>₹{opt_tmid_price:.2f}</b>\n"
-        f"• <b>Target Max:</b> {trade['tp_final']:.1f} | <b>₹{opt_final_price:.2f}</b> (+₹{final_profit_inr})\n"
-        f"• <b>Trailing SL:</b> {trail_p:.1f} | <b>₹{opt_sl_price:.2f}</b>\n"
+        f"<b>LEVEL | INDEX (SPOT) | OPTION (₹)</b>\n"
+        f"• <b>ENTRY:</b> {entry_p:.1f} | <b>₹{opt_ltp:.2f}</b>\n"
+        f"• <b>STOP LOSS:</b> {trade['init_sl']:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl_price:.2f}</b> (-₹{max_risk_inr})\n"
+        f"• <b>TARGET 1:</b> {trade['tp1']:.1f} (+{t1_pts:.1f} pts) | <b>₹{opt_t1_price:.2f}</b> (+₹{t1_profit_inr})\n"
+        f"• <b>TARGET MID:</b> {trade['tp_mid']:.1f} (+{tmid_pts:.1f} pts) | <b>₹{opt_tmid_price:.2f}</b>\n"
+        f"• <b>TARGET MAX:</b> {trade['tp_final']:.1f} (+{tfinal_pts:.1f} pts) | <b>₹{opt_final_price:.2f}</b> (+₹{final_profit_inr})\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🛡️ <b>Trail Mode:</b> {trade['trail_stage']}\n"
-        f"💰 <b>Secured Points:</b> 0.0 pts (Risk Active)\n"
+        f"🛡️ <b>Initial SL:</b> Index: {trade['init_sl']:.1f} | Option: ₹{opt_sl_price:.2f}\n"
         f"⏰ <b>Trigger Time:</b> {time_str}"
     )
     return msg
@@ -513,11 +510,8 @@ def format_full_entry_table_card(trade, opt_ltp, delta_val, qty):
 
 def format_step_trailing_alert(trade, opt_ltp, delta_val, qty, current_shelf_idx, pullback_buffer):
     """
-    Delivers the actionable next-step alert:
-    1. New Trailing SL (Spot & Option ₹)
-    2. Next Target to Aim For (Spot & Option ₹)
-    3. Secured Points / Profit
-    4. Next Trailing SL that will activate once Next Target is cleared
+    Delivers a single active SL for both Index and Option to avoid confusion,
+    along with locked profit and next target.
     """
     is_ce = trade["type"] == "CE"
     t_type = trade["type"]
@@ -530,28 +524,19 @@ def format_step_trailing_alert(trade, opt_ltp, delta_val, qty, current_shelf_idx
     opt_trail_price = max(0.5, round(opt_ltp + opt_trail_diff, 1))
     secured_pnl_inr = int(opt_trail_diff * qty)
 
-    # Calculate Next Target Shelf
+    # Next Target
     if current_shelf_idx < len(shelves):
         next_target_spot = shelves[current_shelf_idx]
         next_target_shelf_num = current_shelf_idx + 1
         next_pts = round(next_target_spot - entry_p, 1) if is_ce else round(entry_p - next_target_spot, 1)
         next_opt_price = max(0.5, round(opt_ltp + (next_pts * delta_val), 1))
-        next_target_text = f"{next_target_spot:.1f} | <b>₹{next_opt_price:.2f}</b>"
-
-        # Calculate what the SL will become AFTER hitting next shelf
-        if current_shelf_idx == 0:
-            subsequent_sl_spot = round(entry_p + 3.0, 1) if is_ce else round(entry_p - 3.0, 1)
-        else:
-            prev_s = shelves[current_shelf_idx - 1]
-            subsequent_sl_spot = round(prev_s - pullback_buffer, 1) if is_ce else round(prev_s + pullback_buffer, 1)
-        
-        sub_pts = round(subsequent_sl_spot - entry_p, 1) if is_ce else round(entry_p - subsequent_sl_spot, 1)
-        sub_opt_price = max(0.5, round(opt_ltp + (sub_pts * delta_val), 1))
-        subsequent_sl_text = f"{subsequent_sl_spot:.1f} | <b>₹{sub_opt_price:.2f}</b> ({sub_pts:+.1f} pts)"
+        target_info = (
+            f"🎯 <b>NEXT TARGET (Shelf {next_target_shelf_num}):</b>\n"
+            f"   • <b>Index Spot:</b> <b>{next_target_spot:.1f}</b> (+{abs(next_pts):.1f} pts)\n"
+            f"   • <b>Option Price:</b> <b>₹{next_opt_price:.2f}</b>"
+        )
     else:
-        next_target_shelf_num = "FINAL"
-        next_target_text = f"{shelves[-1]:.1f} (MAX RUNNER MODE - Trail 5m Bar Extremes)"
-        subsequent_sl_text = "Trailing Bar High/Low Continuously"
+        target_info = f"🏆 <b>MAX RUNNER MODE:</b> Trail 5-minute candle extremes"
 
     contract_name = target_symbol if target_symbol else f"NIFTY {active_strike} {t_type}"
     time_str = datetime.datetime.now(IST).strftime("%H:%M:%S")
@@ -561,14 +546,13 @@ def format_step_trailing_alert(trade, opt_ltp, delta_val, qty, current_shelf_idx
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>CONTRACT:</b> {contract_name} (Qty: {qty})\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🛡️ <b>NEW TRAILING SL:</b> {trail_p:.1f} | <b>₹{opt_trail_price:.2f}</b>\n"
-        f"🔒 <b>SECURED POINTS:</b> <b>{secured_pts:+.1f} pts (₹{secured_pnl_inr:+})</b>\n"
+        f"🛡️ <b>SET STOP LOSS TO:</b>\n"
+        f"   • <b>INDEX (SPOT):</b> <b>{trail_p:.1f}</b>\n"
+        f"   • <b>OPTION (GTT ₹):</b> <b>₹{opt_trail_price:.2f}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 <b>NEXT TARGET (Shelf {next_target_shelf_num}):</b>\n"
-        f"   Spot: {next_target_text}\n"
-        f"🛡️ <b>NEXT SL (On Reaching Target):</b>\n"
-        f"   Spot: {subsequent_sl_text}\n"
+        f"🔒 <b>LOCKED PROFIT:</b> <b>{secured_pts:+.1f} pts (₹{secured_pnl_inr:+})</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{target_info}\n"
         f"📍 <b>Status:</b> {trade['trail_stage']}\n"
         f"⏰ <b>Time:</b> {time_str}"
     )
@@ -606,7 +590,14 @@ for session_date, day_df in grouped:
         ema = row["ema9"]
         vwap_val = row["vwap"]
         atr_val = row["atr"]
+        vol = row["calc_vol"]
+        vol_avg = row["vol_ma"]
 
+        candle_range = max(1.0, h - l)
+        candle_body = abs(c - o)
+        body_ratio = candle_body / candle_range
+
+        # Trailing Step-Ladder Engine
         if session_trade and not session_trade["closed"]:
             t_type = session_trade["type"]
             entry = session_trade["entry"]
@@ -654,7 +645,7 @@ for session_date, day_df in grouped:
                         exit_msg = (
                             f"🏁 <b>TRADE CLOSED (NIFTY CE)</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"🚪 <b>Exit Spot:</b> {exit_p:.1f}\n"
+                            f"🚪 <b>Exit Price (Spot):</b> <b>{exit_p:.1f}</b>\n"
                             f"💰 <b>Final Net Spot:</b> <b>{pts:+.1f} pts</b>\n"
                             f"💵 <b>Final Net Option:</b> <b>₹{round(pts * active_delta * total_qty):+}</b>\n"
                             f"⏰ <b>Exit Time:</b> {row['dt'].strftime('%H:%M')}"
@@ -703,7 +694,7 @@ for session_date, day_df in grouped:
                         exit_msg = (
                             f"🏁 <b>TRADE CLOSED (NIFTY PE)</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"🚪 <b>Exit Spot:</b> {exit_p:.1f}\n"
+                            f"🚪 <b>Exit Price (Spot):</b> <b>{exit_p:.1f}</b>\n"
                             f"💰 <b>Final Net Spot:</b> <b>{pts:+.1f} pts</b>\n"
                             f"💵 <b>Final Net Option:</b> <b>₹{round(pts * active_delta * total_qty):+}</b>\n"
                             f"⏰ <b>Exit Time:</b> {row['dt'].strftime('%H:%M')}"
@@ -711,11 +702,31 @@ for session_date, day_df in grouped:
                         send_telegram_alert(exit_msg)
                         st.session_state.notified_sl_map["exit_sent"] = True
 
-        # Breakout Entry Window: 09:30 to 10:30 AM
+        # Breakout Entry Window: 09:30 to 10:30 AM (Strict Strong Candle Filter)
         if datetime.time(9, 30) < t <= datetime.time(10, 30) and not trade_executed_today:
             sw_h, sw_l = extract_intraday_swings(day_df, idx, window=2)
 
-            if c > day_orb_h and c > vwap_val and c > ema:
+            is_strong_range = candle_range >= (atr_val * 0.70)
+            is_strong_body = body_ratio >= 0.60
+            has_vol_support = vol >= (vol_avg * 0.90)
+
+            is_bullish_strong_bar = (
+                (c > o)
+                and is_strong_body
+                and is_strong_range
+                and (c >= (h - 0.25 * candle_range))
+                and has_vol_support
+            )
+
+            is_bearish_strong_bar = (
+                (c < o)
+                and is_strong_body
+                and is_strong_range
+                and (c <= (l + 0.25 * candle_range))
+                and has_vol_support
+            )
+
+            if is_bullish_strong_bar and (c > day_orb_h) and (c > vwap_val) and (c > ema):
                 init_sl = round(l - 5.0, 1)
                 risk = round(c - init_sl, 1)
                 shelves, fibs = build_dynamic_shelves(c, "CE", pivot_lines_data, oi_res_strike, atr_val, sw_h, sw_l, day_orb_h, day_orb_l)
@@ -737,7 +748,7 @@ for session_date, day_df in grouped:
                     "trail_stage": f"RISK ON (Max Target: {shelves[-1]:.1f})",
                     "risk": risk,
                     "closed": False,
-                    "reason": "Close > ORB High & VWAP",
+                    "reason": "Strong Expansion Bar > ORB High & VWAP",
                 }
                 markers.append(
                     {
@@ -749,7 +760,7 @@ for session_date, day_df in grouped:
                     }
                 )
                 historical_trade_cards[int(row["time"])] = {
-                    "title": "BUY CE (ORB BREAKOUT)",
+                    "title": "BUY CE (STRONG BREAKOUT)",
                     "entry": round(c, 1),
                     "target": round(shelves[-1], 1),
                     "target_pts": round(shelves[-1] - c, 1),
@@ -763,11 +774,11 @@ for session_date, day_df in grouped:
                     trade_executed_in_latest_session = True
                     alarm_signal_triggered = True
 
-                    # 1. Full Strategy Table Alert on Entry
+                    # 1. Full Strategy Table Alert on Entry (Index + Option)
                     entry_msg = format_full_entry_table_card(session_trade, live_real_ltp, active_delta, total_qty)
                     send_telegram_alert(entry_msg)
 
-            elif c < day_orb_l and c < vwap_val and c < ema:
+            elif is_bearish_strong_bar and (c < day_orb_l) and (c < vwap_val) and (c < ema):
                 init_sl = round(h + 5.0, 1)
                 risk = round(init_sl - c, 1)
                 shelves, fibs = build_dynamic_shelves(c, "PE", pivot_lines_data, oi_sup_strike, atr_val, sw_h, sw_l, day_orb_h, day_orb_l)
@@ -789,7 +800,7 @@ for session_date, day_df in grouped:
                     "trail_stage": f"RISK ON (Max Target: {shelves[-1]:.1f})",
                     "risk": risk,
                     "closed": False,
-                    "reason": "Close < ORB Low & VWAP",
+                    "reason": "Strong Expansion Bar < ORB Low & VWAP",
                 }
                 markers.append(
                     {
@@ -801,7 +812,7 @@ for session_date, day_df in grouped:
                     }
                 )
                 historical_trade_cards[int(row["time"])] = {
-                    "title": "BUY PE (ORB BREAKDOWN)",
+                    "title": "BUY PE (STRONG BREAKDOWN)",
                     "entry": round(c, 1),
                     "target": round(shelves[-1], 1),
                     "target_pts": round(c - shelves[-1], 1),
@@ -815,7 +826,7 @@ for session_date, day_df in grouped:
                     trade_executed_in_latest_session = True
                     alarm_signal_triggered = True
 
-                    # 1. Full Strategy Table Alert on Entry
+                    # 1. Full Strategy Table Alert on Entry (Index + Option)
                     entry_msg = format_full_entry_table_card(session_trade, live_real_ltp, active_delta, total_qty)
                     send_telegram_alert(entry_msg)
 
@@ -891,7 +902,7 @@ elif (not trade_executed_in_latest_session) and (latest_bar_time >= datetime.tim
     hud_payload = {
         "is_no_trade": True,
         "status": "NO TRADE TODAY",
-        "reason": "No valid breakout before 10:30 AM",
+        "reason": "No strong momentum breakout before 10:30 AM",
         "action": "Capital Protected (Wait for tomorrow)",
         "theme": "#787b86",
     }
