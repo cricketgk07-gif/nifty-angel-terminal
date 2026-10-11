@@ -480,7 +480,7 @@ def format_step_trailing_alert(trade, opt_symbol, opt_ltp, delta_val, qty, curre
     return msg
 
 
-# --- MULTI-DAY ENGINE EVALUATION (EXACT ORIGINAL LOGIC) ---
+# --- MULTI-DAY ENGINE EVALUATION ---
 total_qty = sel_lots * LOT_SIZE_QTY
 
 if "notified_sl_map" not in st.session_state:
@@ -550,18 +550,40 @@ for session_date, day_df in grouped:
                         send_telegram_alert(trail_msg)
                         st.session_state.notified_sl_map["current_sl"] = session_trade["current_sl"]
 
-                if l <= session_trade["current_sl"] or (c < ema and c < o and c < (day_orb_h - 3.0)):
-                    exit_p = min(c, session_trade["current_sl"])
+                # FIXED: Precise Stop-Loss Fill Assignment
+                if l <= session_trade["current_sl"]:
+                    exit_p = session_trade["current_sl"]
                     pts = round(exit_p - entry, 1)
                     session_trade["closed"] = True
                     session_trade["exit_price"] = exit_p
                     session_trade["exit_pts"] = pts
-                    session_trade["trail_stage"] = f"TRADE EXITED ({pts:+.1f} pts)"
+                    session_trade["trail_stage"] = f"STOP HIT ({pts:+.1f} pts)"
                     latest_trade_for_hud = session_trade.copy()
 
                     if session_date == latest_session_date and not st.session_state.notified_sl_map.get("exit_sent"):
                         exit_msg = (
-                            f"🏁 <b>TRADE CLOSED (NIFTY CE)</b>\n"
+                            f"🏁 <b>TRADE CLOSED (NIFTY CE - STOP HIT)</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"🚪 <b>Exit Price (Spot):</b> <b>{exit_p:.1f}</b>\n"
+                            f"💰 <b>Final Net Spot:</b> <b>{pts:+.1f} pts</b>\n"
+                            f"💵 <b>Final Net Option:</b> <b>₹{round(pts * session_trade['delta'] * total_qty):+}</b>\n"
+                            f"⏰ <b>Exit Time:</b> {row['dt'].strftime('%H:%M')}"
+                        )
+                        send_telegram_alert(exit_msg)
+                        st.session_state.notified_sl_map["exit_sent"] = True
+
+                elif c < ema and c < o and c < (day_orb_h - 3.0):
+                    exit_p = c
+                    pts = round(exit_p - entry, 1)
+                    session_trade["closed"] = True
+                    session_trade["exit_price"] = exit_p
+                    session_trade["exit_pts"] = pts
+                    session_trade["trail_stage"] = f"EMA REVERSAL ({pts:+.1f} pts)"
+                    latest_trade_for_hud = session_trade.copy()
+
+                    if session_date == latest_session_date and not st.session_state.notified_sl_map.get("exit_sent"):
+                        exit_msg = (
+                            f"🏁 <b>TRADE CLOSED (NIFTY CE - EMA REVERSAL)</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                             f"🚪 <b>Exit Price (Spot):</b> <b>{exit_p:.1f}</b>\n"
                             f"💰 <b>Final Net Spot:</b> <b>{pts:+.1f} pts</b>\n"
@@ -599,18 +621,19 @@ for session_date, day_df in grouped:
                         send_telegram_alert(trail_msg)
                         st.session_state.notified_sl_map["current_sl"] = session_trade["current_sl"]
 
-                if h >= session_trade["current_sl"] or (c > ema and c > o and c > (day_orb_l + 3.0)):
-                    exit_p = max(c, session_trade["current_sl"])
+                # FIXED: Precise Stop-Loss Fill Assignment
+                if h >= session_trade["current_sl"]:
+                    exit_p = session_trade["current_sl"]
                     pts = round(entry - exit_p, 1)
                     session_trade["closed"] = True
                     session_trade["exit_price"] = exit_p
                     session_trade["exit_pts"] = pts
-                    session_trade["trail_stage"] = f"TRADE EXITED ({pts:+.1f} pts)"
+                    session_trade["trail_stage"] = f"STOP HIT ({pts:+.1f} pts)"
                     latest_trade_for_hud = session_trade.copy()
 
                     if session_date == latest_session_date and not st.session_state.notified_sl_map.get("exit_sent"):
                         exit_msg = (
-                            f"🏁 <b>TRADE CLOSED (NIFTY PE)</b>\n"
+                            f"🏁 <b>TRADE CLOSED (NIFTY PE - STOP HIT)</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                             f"🚪 <b>Exit Price (Spot):</b> <b>{exit_p:.1f}</b>\n"
                             f"💰 <b>Final Net Spot:</b> <b>{pts:+.1f} pts</b>\n"
@@ -620,7 +643,28 @@ for session_date, day_df in grouped:
                         send_telegram_alert(exit_msg)
                         st.session_state.notified_sl_map["exit_sent"] = True
 
-        # Breakout Entry Window: 09:30 to 10:30 AM (EXACT ORIGINAL LOGIC)
+                elif c > ema and c > o and c > (day_orb_l + 3.0):
+                    exit_p = c
+                    pts = round(entry - exit_p, 1)
+                    session_trade["closed"] = True
+                    session_trade["exit_price"] = exit_p
+                    session_trade["exit_pts"] = pts
+                    session_trade["trail_stage"] = f"EMA REVERSAL ({pts:+.1f} pts)"
+                    latest_trade_for_hud = session_trade.copy()
+
+                    if session_date == latest_session_date and not st.session_state.notified_sl_map.get("exit_sent"):
+                        exit_msg = (
+                            f"🏁 <b>TRADE CLOSED (NIFTY PE - EMA REVERSAL)</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"🚪 <b>Exit Price (Spot):</b> <b>{exit_p:.1f}</b>\n"
+                            f"💰 <b>Final Net Spot:</b> <b>{pts:+.1f} pts</b>\n"
+                            f"💵 <b>Final Net Option:</b> <b>₹{round(pts * session_trade['delta'] * total_qty):+}</b>\n"
+                            f"⏰ <b>Exit Time:</b> {row['dt'].strftime('%H:%M')}"
+                        )
+                        send_telegram_alert(exit_msg)
+                        st.session_state.notified_sl_map["exit_sent"] = True
+
+        # Breakout Entry Window: 09:30 to 10:30 AM
         if datetime.time(9, 30) < t <= datetime.time(10, 30) and not trade_executed_today:
             sw_h, sw_l = extract_intraday_swings(day_df, idx, window=2)
 
@@ -1534,7 +1578,7 @@ html_code = f"""
             table.style.display = 'block';
             if (s.is_no_trade) {{
                 table.innerHTML = `
-                    <div class="box-drag-handle">::: DRAG STRATEGY HUD :::</div>
+                    <div class="box-drag-handle">::: STRATEGY HUD :::</div>
                     <table>
                         <tr><td class="label-cell">Session Status</td><td class="val-cell" colspan="2"><span class="tag-pill" style="background:#546e7a;">${{s.status}}</span></td></tr>
                         <tr><td class="label-cell">Reason</td><td class="val-cell" colspan="2" style="font-size:9px; color:#cfd3dc;">${{s.reason}}</td></tr>
@@ -1560,7 +1604,7 @@ html_code = f"""
                 const optTrailPrice = Math.max(0.0, Math.round((activeRealLTP + optTrailPts) * 10) / 10);
 
                 table.innerHTML = `
-                    <div class="box-drag-handle">::: DRAG STRATEGY HUD :::</div>
+                    <div class="box-drag-handle">::: STRATEGY HUD :::</div>
                     <table>
                         <thead>
                             <tr>
