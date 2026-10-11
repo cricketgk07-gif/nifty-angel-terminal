@@ -271,7 +271,7 @@ if not nfo_df.empty:
     elif not all_future.empty:
         auto_expiry = all_future["expiry"].iloc[0]
 
-# --- CLEAN HEADER CONTROLS (Manual CE/PE Removed) ---
+# --- CLEAN HEADER CONTROLS ---
 ctrl_cols = st.columns([2.2, 0.9, 6.9])
 
 with ctrl_cols[0]:
@@ -550,7 +550,7 @@ for session_date, day_df in grouped:
                         send_telegram_alert(trail_msg)
                         st.session_state.notified_sl_map["current_sl"] = session_trade["current_sl"]
 
-                # Fixed: Precise Stop-Loss Fill Assignment
+                # Precise Stop-Loss Fill Assignment
                 if l <= session_trade["current_sl"]:
                     exit_p = session_trade["current_sl"]
                     pts = round(exit_p - entry, 1)
@@ -621,7 +621,7 @@ for session_date, day_df in grouped:
                         send_telegram_alert(trail_msg)
                         st.session_state.notified_sl_map["current_sl"] = session_trade["current_sl"]
 
-                # Fixed: Precise Stop-Loss Fill Assignment
+                # Precise Stop-Loss Fill Assignment
                 if h >= session_trade["current_sl"]:
                     exit_p = session_trade["current_sl"]
                     pts = round(entry - exit_p, 1)
@@ -1325,11 +1325,11 @@ html_code = f"""
                 borderColor: '#2a2e39',
                 timeVisible: true,
                 secondsVisible: false,
-                rightOffset: 1,
+                rightOffset: 0,
                 barSpacing: 6,
                 minBarSpacing: 1.5,
                 fixLeftEdge: false,
-                fixRightEdge: true,
+                fixRightEdge: false,
                 visible: true,
                 borderVisible: true,
             }},
@@ -1348,7 +1348,6 @@ html_code = f"""
             priceFormat: {{ type: 'price', precision: 2, minMove: 0.05 }}
         }});
         candleSeries.setData({candles_json});
-        chart.timeScale().fitContent();
 
         const volumeSeries = chart.addHistogramSeries({{
             priceFormat: {{ type: 'volume' }},
