@@ -72,8 +72,28 @@ PIN = st.secrets.get("PIN", "")
 TOTP_SECRET = st.secrets.get("TOTP_SECRET", "")
 INDEX_TOKEN = "99926000"
 
+TELEGRAM_BOT_TOKEN = st.secrets.get("TELEGRAM_BOT_TOKEN", "8925956740:AAHHo18Gp-rwlsGlnsyS5mz40RbvIN_tXqw")
+TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "6898891302")
+
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 LOT_SIZE_QTY = 65
+
+
+def send_telegram_alert(message: str):
+    """Sends immediate push notifications directly to Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        requests.post(url, json=payload, timeout=3)
+    except Exception:
+        pass
 
 
 @st.cache_resource
@@ -384,8 +404,7 @@ def build_dynamic_shelves(entry_p, t_type, pv_dict, oi_target, atr_v, sw_h, sw_l
     """
     orb_range = max(10.0, orb_h - orb_l)
     atr_3x = entry_p + (3.0 * atr_v) if t_type == "CE" else entry_p - (3.0 * atr_v)
-    
-    # Calculate Fibonacci ORB Extensions
+
     fib_100 = round(orb_h + (1.000 * orb_range), 1) if t_type == "CE" else round(orb_l - (1.000 * orb_range), 1)
     fib_161 = round(orb_h + (1.618 * orb_range), 1) if t_type == "CE" else round(orb_l - (1.618 * orb_range), 1)
     fib_261 = round(orb_h + (2.618 * orb_range), 1) if t_type == "CE" else round(orb_l - (2.618 * orb_range), 1)
@@ -425,6 +444,10 @@ def build_dynamic_shelves(entry_p, t_type, pv_dict, oi_target, atr_v, sw_h, sw_l
         candidates = [round(atr_3x, 1)]
     return candidates, {"fib_100": fib_100, "fib_161": fib_161, "fib_261": fib_261}
 
+
+# Session State for Alert Deduplication
+if "notified_sl_map" not in st.session_state:
+    st.session_state.notified_sl_map = {}
 
 # Strategy Processing Loop
 markers = []
@@ -482,6 +505,24 @@ for session_date, day_df in grouped:
                     session_trade["current_sl"] = max(session_trade["current_sl"], bar_trail)
                     session_trade["trail_stage"] = f"MAX RUNNER MODE (Bar Low Trail: {session_trade['current_sl']:.1f})"
 
+                # Mobile Alert Dispatcher for Trailing Stop Updates
+                if session_date == latest_session_date:
+                    last_alerted = st.session_state.notified_sl_map.get("current_sl")
+                    if session_trade["current_sl"] != last_alerted:
+                        pts_locked = round(session_trade["current_sl"] - entry, 1)
+                        alert_msg = (
+                            f"🔔 <b>NIFTY CE TRAILING SL UPDATED</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"📈 <b>Entry:</b> {entry:.1f}\n"
+                            f"🛡️ <b>New Stop:</b> <b>{session_trade['current_sl']:.1f}</b>\n"
+                            f"🔒 <b>Secured Points:</b> {pts_locked:+.1f} pts\n"
+                            f"📍 <b>Status:</b> {session_trade['trail_stage']}\n"
+                            f"🎯 <b>Max Target:</b> {session_trade['tp_final']:.1f}\n"
+                            f"⏰ <b>Time:</b> {row['dt'].strftime('%H:%M')}"
+                        )
+                        send_telegram_alert(alert_msg)
+                        st.session_state.notified_sl_map["current_sl"] = session_trade["current_sl"]
+
                 if l <= session_trade["current_sl"] or (c < ema and c < o and c < (day_orb_h - 3.0)):
                     exit_p = min(c, session_trade["current_sl"])
                     pts = round(exit_p - entry, 1)
@@ -490,6 +531,17 @@ for session_date, day_df in grouped:
                     session_trade["exit_pts"] = pts
                     session_trade["trail_stage"] = f"TRADE EXITED ({pts:+.1f} pts)"
                     latest_trade_for_hud = session_trade.copy()
+
+                    if session_date == latest_session_date and not st.session_state.notified_sl_map.get("exit_sent"):
+                        exit_msg = (
+                            f"🏁 <b>TRADE CLOSED (NIFTY CE)</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"🚪 <b>Exit Price:</b> {exit_p:.1f}\n"
+                            f"💰 <b>Final P&L:</b> <b>{pts:+.1f} pts</b>\n"
+                            f"⏰ <b>Exit Time:</b> {row['dt'].strftime('%H:%M')}"
+                        )
+                        send_telegram_alert(exit_msg)
+                        st.session_state.notified_sl_map["exit_sent"] = True
 
             elif t_type == "PE":
                 for s_idx, s_level in enumerate(shelves):
@@ -510,6 +562,24 @@ for session_date, day_df in grouped:
                     session_trade["current_sl"] = min(session_trade["current_sl"], bar_trail)
                     session_trade["trail_stage"] = f"MAX RUNNER MODE (Bar High Trail: {session_trade['current_sl']:.1f})"
 
+                # Mobile Alert Dispatcher for Trailing Stop Updates
+                if session_date == latest_session_date:
+                    last_alerted = st.session_state.notified_sl_map.get("current_sl")
+                    if session_trade["current_sl"] != last_alerted:
+                        pts_locked = round(entry - session_trade["current_sl"], 1)
+                        alert_msg = (
+                            f"🔔 <b>NIFTY PE TRAILING SL UPDATED</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"📉 <b>Entry:</b> {entry:.1f}\n"
+                            f"🛡️ <b>New Stop:</b> <b>{session_trade['current_sl']:.1f}</b>\n"
+                            f"🔒 <b>Secured Points:</b> {pts_locked:+.1f} pts\n"
+                            f"📍 <b>Status:</b> {session_trade['trail_stage']}\n"
+                            f"🎯 <b>Max Target:</b> {session_trade['tp_final']:.1f}\n"
+                            f"⏰ <b>Time:</b> {row['dt'].strftime('%H:%M')}"
+                        )
+                        send_telegram_alert(alert_msg)
+                        st.session_state.notified_sl_map["current_sl"] = session_trade["current_sl"]
+
                 if h >= session_trade["current_sl"] or (c > ema and c > o and c > (day_orb_l + 3.0)):
                     exit_p = max(c, session_trade["current_sl"])
                     pts = round(entry - exit_p, 1)
@@ -518,6 +588,17 @@ for session_date, day_df in grouped:
                     session_trade["exit_pts"] = pts
                     session_trade["trail_stage"] = f"TRADE EXITED ({pts:+.1f} pts)"
                     latest_trade_for_hud = session_trade.copy()
+
+                    if session_date == latest_session_date and not st.session_state.notified_sl_map.get("exit_sent"):
+                        exit_msg = (
+                            f"🏁 <b>TRADE CLOSED (NIFTY PE)</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"🚪 <b>Exit Price:</b> {exit_p:.1f}\n"
+                            f"💰 <b>Final P&L:</b> <b>{pts:+.1f} pts</b>\n"
+                            f"⏰ <b>Exit Time:</b> {row['dt'].strftime('%H:%M')}"
+                        )
+                        send_telegram_alert(exit_msg)
+                        st.session_state.notified_sl_map["exit_sent"] = True
 
         # Breakout Entry Window: 09:30 to 10:30 AM
         if datetime.time(9, 30) < t <= datetime.time(10, 30) and not trade_executed_today:
@@ -571,6 +652,18 @@ for session_date, day_df in grouped:
                     trade_executed_in_latest_session = True
                     alarm_signal_triggered = True
 
+                    # Initial Trade Entry Alert
+                    entry_msg = (
+                        f"🚀 <b>NIFTY TRADE TRIGGERED: BUY CE</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📈 <b>Entry:</b> {c:.1f}\n"
+                        f"🛑 <b>Initial SL:</b> {init_sl:.1f} (-{risk:.1f} pts)\n"
+                        f"🎯 <b>Shelf 1:</b> {shelves[0]:.1f}\n"
+                        f"🏆 <b>Max Run Target:</b> <b>{shelves[-1]:.1f}</b>\n"
+                        f"⏰ <b>Time:</b> {row['dt'].strftime('%H:%M')}"
+                    )
+                    send_telegram_alert(entry_msg)
+
             elif c < day_orb_l and c < vwap_val and c < ema:
                 init_sl = round(h + 5.0, 1)
                 risk = round(init_sl - c, 1)
@@ -618,6 +711,18 @@ for session_date, day_df in grouped:
                 if session_date == latest_session_date:
                     trade_executed_in_latest_session = True
                     alarm_signal_triggered = True
+
+                    # Initial Trade Entry Alert
+                    entry_msg = (
+                        f"🚀 <b>NIFTY TRADE TRIGGERED: BUY PE</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📉 <b>Entry:</b> {c:.1f}\n"
+                        f"🛑 <b>Initial SL:</b> {init_sl:.1f} (-{risk:.1f} pts)\n"
+                        f"🎯 <b>Shelf 1:</b> {shelves[0]:.1f}\n"
+                        f"🏆 <b>Max Run Target:</b> <b>{shelves[-1]:.1f}</b>\n"
+                        f"⏰ <b>Time:</b> {row['dt'].strftime('%H:%M')}"
+                    )
+                    send_telegram_alert(entry_msg)
 
 today_date = df["date"].iloc[-1]
 today_df = df[df["date"] == today_date]
@@ -825,7 +930,6 @@ html_code = f"""
         }}
         .dynamic-ohlc-row b {{ color: #d1d4dc; }}
 
-        /* Precise Viewport Height: Time Scale Fully Preserved Above Screen Edge */
         #chartArea {{
             width: 100vw;
             height: calc(100vh - 80px);
@@ -1109,6 +1213,7 @@ html_code = f"""
         }});
         volumeSeries.setData({volume_json});
 
+        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
         const vwapSeries = chart.addLineSeries({{
             color: '#ab47bc',
             lineWidth: 2,
@@ -1118,6 +1223,7 @@ html_code = f"""
         }});
         vwapSeries.setData({vwap_json});
 
+        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
         const emaSeries = chart.addLineSeries({{
             color: '#2962ff',
             lineWidth: 1,
