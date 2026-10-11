@@ -91,7 +91,7 @@ def send_telegram_alert(message: str):
         "disable_web_page_preview": True,
     }
     try:
-        requests.post(url, json=payload, timeout=4)
+        requests.post(url, json=payload, timeout=3)
     except Exception:
         pass
 
@@ -269,7 +269,6 @@ available_expiries = []
 
 if not nfo_df.empty:
     all_future = nfo_df[nfo_df["exp_dt"].dt.date >= today_dt].sort_values("exp_dt")
-    # Drop today's date if today is expiry day
     safe_future = all_future[all_future["exp_dt"].dt.date > today_dt]
     if not safe_future.empty:
         available_expiries = safe_future["expiry"].dropna().drop_duplicates().tolist()
@@ -279,7 +278,7 @@ if not nfo_df.empty:
 if not available_expiries:
     available_expiries = ["CURRENT"]
 
-# Top Header Layout
+# Top Header Controls
 ctrl_cols = st.columns([1.1, 1.2, 1.3, 0.7, 0.7, 4.0])
 
 with ctrl_cols[0]:
@@ -312,7 +311,7 @@ exp_slice = nfo_df[nfo_df["expiry"] == sel_expiry] if not nfo_df.empty else pd.D
 exp_date_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_dt
 days_to_expiry = max((exp_date_val - today_dt).days, 1)
 
-# Live Quote & Budget (< ₹80) Contract Selection
+# Fast Single-Call Option Fetch
 active_strike = sel_strike
 live_real_ltp = 0.0
 target_symbol = ""
@@ -331,43 +330,30 @@ def fetch_option_ltp(sym, tok):
 
 if not nfo_df.empty:
     if mode_selection == "Budget (< ₹80)":
-        # Search for strikes where price is <= 80
-        chain_slice = nfo_df[
-            (nfo_df["expiry"] == sel_expiry) &
-            (nfo_df["symbol"].str.endswith(sel_type))
-        ].copy()
-        
-        # Sort by distance from ATM
+        # Jump directly to 100-150 pts OTM without spamming the API
+        offset_steps = 2 if days_to_expiry <= 2 else 3
         if sel_type == "CE":
-            chain_slice = chain_slice[chain_slice["strike_num"] >= spot_price].sort_values("strike_num")
+            active_strike = atm_strike + (offset_steps * 50)
         else:
-            chain_slice = chain_slice[chain_slice["strike_num"] <= spot_price].sort_values("strike_num", ascending=False)
-            
-        chosen_row = None
-        for _, opt_row in chain_slice.iterrows():
-            cand_ltp = fetch_option_ltp(str(opt_row["symbol"]), str(opt_row["token"]))
-            if 10.0 <= cand_ltp <= 80.0:
-                chosen_row = opt_row
-                live_real_ltp = cand_ltp
-                break
-                
-        if chosen_row is not None:
-            active_strike = int(chosen_row["strike_num"])
-            target_symbol = str(chosen_row["symbol"])
-            target_token = str(chosen_row["token"])
-        else:
-            # Fallback: Pick 2 strikes OTM
-            offset = 100 if sel_type == "CE" else -100
-            active_strike = atm_strike + offset
-            match = nfo_df[(nfo_df["strike_num"] == active_strike) & (nfo_df["symbol"].str.endswith(sel_type)) & (nfo_df["expiry"] == sel_expiry)]
-            if not match.empty:
-                target_symbol = str(match.iloc[0]["symbol"])
-                target_token = str(match.iloc[0]["token"])
-                live_real_ltp = fetch_option_ltp(target_symbol, target_token)
+            active_strike = atm_strike - (offset_steps * 50)
+
+        match = nfo_df[
+            (nfo_df["strike_num"] == float(active_strike)) &
+            (nfo_df["symbol"].str.endswith(sel_type)) &
+            (nfo_df["expiry"] == sel_expiry)
+        ]
+        if not match.empty:
+            target_symbol = str(match.iloc[0]["symbol"])
+            target_token = str(match.iloc[0]["token"])
+            live_real_ltp = fetch_option_ltp(target_symbol, target_token)
     else:
         # ATM Mode
         active_strike = sel_strike
-        match = nfo_df[(nfo_df["strike_num"] == float(active_strike)) & (nfo_df["symbol"].str.endswith(sel_type)) & (nfo_df["expiry"] == sel_expiry)]
+        match = nfo_df[
+            (nfo_df["strike_num"] == float(active_strike)) &
+            (nfo_df["symbol"].str.endswith(sel_type)) &
+            (nfo_df["expiry"] == sel_expiry)
+        ]
         if not match.empty:
             target_symbol = str(match.iloc[0]["symbol"])
             target_token = str(match.iloc[0]["token"])
@@ -380,7 +366,7 @@ if live_real_ltp <= 0.0:
 active_delta = compute_contract_delta(spot_price, float(active_strike), days_to_expiry, is_ce=(sel_type == "CE"))
 total_qty = sel_lots * LOT_SIZE_QTY
 
-# Expiry Specific PCR and OI Max Levels
+# PCR and OI Levels
 ce_oi_map = {}
 pe_oi_map = {}
 total_ce_oi = 0
@@ -400,18 +386,14 @@ pcr_value = round(total_pe_oi / max(total_ce_oi, 1), 2)
 oi_res_strike = max(ce_oi_map, key=ce_oi_map.get) if ce_oi_map else atm_strike + 200
 oi_sup_strike = max(pe_oi_map, key=pe_oi_map.get) if pe_oi_map else atm_strike - 200
 
-adv_count = int(min(45, max(10, 25 + int((curr["close"] - df.iloc[0]["open"]) / 8.0))))
-dec_count = 50 - adv_count
-ad_ratio = round(adv_count / max(dec_count, 1), 2)
-
 with ctrl_cols[5]:
     st.markdown(
         f"""
         <div style="background:#161a25; border:1px solid #2a2e39; border-radius:4px; padding:3px 8px; display:flex; gap:10px; align-items:center; font-size:11px; height:32px;">
-            <div>Contract: <b style="color:#00e5ff;">{target_symbol or f'NIFTY{active_strike}{sel_type}'}</b></div>
+            <div>Contract: <b style="color:#00e5ff;">{target_symbol or f'NIFTY {active_strike} {sel_type}'}</b></div>
             <div>LTP: <b style="color:#ffd600; font-size:13px;">₹{live_real_ltp:.2f}</b></div>
             <div>Mode: <b style="color:#ab47bc;">{mode_selection}</b></div>
-            <div>Qty: <b style="color:#089981;">{total_qty}</b></div>
+            <div>Qty: <b style="color:#089981;">{total_qty}</b> ({sel_lots}L)</div>
             <div>Delta: <b style="color:#00e5ff;">{active_delta:.2f}</b></div>
             <div>PCR: <b>{pcr_value}</b></div>
         </div>
@@ -482,7 +464,6 @@ def build_dynamic_shelves(entry_p, t_type, pv_dict, oi_target, atr_v, sw_h, sw_l
 
 
 def format_telegram_table_card(header_title, trade, spot_c, opt_ltp, delta_val, qty):
-    """Formats the full strategy HUD table for Telegram delivery."""
     is_ce = trade["type"] == "CE"
     entry_p = trade["entry"]
     trail_p = trade["current_sl"]
@@ -532,7 +513,6 @@ def format_telegram_table_card(header_title, trade, spot_c, opt_ltp, delta_val, 
     return msg
 
 
-# Session State for Alert Deduplication
 if "notified_sl_map" not in st.session_state:
     st.session_state.notified_sl_map = {}
 
@@ -565,7 +545,6 @@ for session_date, day_df in grouped:
         vwap_val = row["vwap"]
         atr_val = row["atr"]
 
-        # Trailing Step-Ladder Engine
         if session_trade and not session_trade["closed"]:
             t_type = session_trade["type"]
             entry = session_trade["entry"]
@@ -722,7 +701,6 @@ for session_date, day_df in grouped:
                     trade_executed_in_latest_session = True
                     alarm_signal_triggered = True
 
-                    # Initial Full Table Entry Alert
                     entry_msg = format_telegram_table_card(
                         "🚀 <b>NIFTY TRADE TRIGGERED: BUY CE</b>",
                         session_trade, c, live_real_ltp, active_delta, total_qty
@@ -777,7 +755,6 @@ for session_date, day_df in grouped:
                     trade_executed_in_latest_session = True
                     alarm_signal_triggered = True
 
-                    # Initial Full Table Entry Alert
                     entry_msg = format_telegram_table_card(
                         "🚀 <b>NIFTY TRADE TRIGGERED: BUY PE</b>",
                         session_trade, c, live_real_ltp, active_delta, total_qty
@@ -1126,7 +1103,6 @@ html_code = f"""
         </div>
     </div>
 
-    <!-- Chart Canvas Container -->
     <div id="chartArea"></div>
     <div id="strategyBox" class="draggable-strategy-box" style="display: none;"></div>
     <div id="activeToolsContainer"></div>
@@ -1428,6 +1404,75 @@ html_code = f"""
                 activePositionWidgets[idx].domElem.remove();
                 activePositionWidgets.splice(idx, 1);
             }}
+        }}
+
+        function resizeWidgetTgt(e, id) {{
+            e.stopPropagation();
+            const wObj = activePositionWidgets.find(w => w.id === id);
+            if (!wObj) return;
+            const startY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
+            const origTgt = wObj.tgtPts;
+            function onMove(ev) {{
+                const curY = ev.type.includes('touch') ? ev.touches[0].clientY : ev.clientY;
+                wObj.tgtPts = Math.max(10.0, origTgt + (wObj.type === 'LONG' ? (startY - curY) * 0.9 : (curY - startY) * 0.9));
+                renderSinglePosWidget(wObj);
+            }}
+            function onUp() {{
+                window.removeEventListener('mousemove', onMove);
+                window.removeEventListener('mouseup', onUp);
+                window.removeEventListener('touchmove', onMove);
+                window.removeEventListener('touchend', onUp);
+            }}
+            window.addEventListener('mousemove', onMove);
+            window.addEventListener('mouseup', onUp);
+            window.addEventListener('touchmove', onMove, {{ passive: true }});
+            window.addEventListener('touchend', onUp);
+        }}
+
+        function resizeWidgetSL(e, id) {{
+            e.stopPropagation();
+            const wObj = activePositionWidgets.find(w => w.id === id);
+            if (!wObj) return;
+            const startY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
+            const origSL = wObj.slPts;
+            function onMove(ev) {{
+                const curY = ev.type.includes('touch') ? ev.touches[0].clientY : ev.clientY;
+                wObj.slPts = Math.max(8.0, origSL + (wObj.type === 'LONG' ? (curY - startY) * 0.9 : (startY - curY) * 0.9));
+                renderSinglePosWidget(wObj);
+            }}
+            function onUp() {{
+                window.removeEventListener('mousemove', onMove);
+                window.removeEventListener('mouseup', onUp);
+                window.removeEventListener('touchmove', onMove);
+                window.removeEventListener('touchend', onUp);
+            }}
+            window.addEventListener('mousemove', onMove);
+            window.addEventListener('mouseup', onUp);
+            window.addEventListener('touchmove', onMove, {{ passive: true }});
+            window.addEventListener('touchend', onUp);
+        }}
+
+        function startMovePosEntry(e, id) {{
+            e.stopPropagation();
+            const wObj = activePositionWidgets.find(w => w.id === id);
+            if (!wObj) return;
+            const startY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
+            const elem = wObj.domElem;
+            const origTop = parseFloat(elem.style.top);
+            function onMove(ev) {{
+                const curY = ev.type.includes('touch') ? ev.touches[0].clientY : ev.clientY;
+                elem.style.top = (origTop + (curY - startY)) + 'px';
+            }}
+            function onUp() {{
+                window.removeEventListener('mousemove', onMove);
+                window.removeEventListener('mouseup', onUp);
+                window.removeEventListener('touchmove', onMove);
+                window.removeEventListener('touchend', onUp);
+            }}
+            window.addEventListener('mousemove', onMove);
+            window.addEventListener('mouseup', onUp);
+            window.addEventListener('touchmove', onMove, {{ passive: true }});
+            window.addEventListener('touchend', onUp);
         }}
 
         function spawnTwoPointFibRetrace(pt1, pt2) {{
