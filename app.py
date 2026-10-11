@@ -80,7 +80,7 @@ LOT_SIZE_QTY = 65
 
 
 def send_telegram_alert(message: str):
-    """Dispatches push notifications directly to Telegram."""
+    """Dispatches immediate push notification directly to Telegram."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -146,8 +146,7 @@ nfo_df = load_nfo_scrip_master()
 
 
 def fetch_nifty_candles():
-    now_ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
-    now_dt = datetime.datetime.now(now_ist)
+    now_dt = datetime.datetime.now(IST)
     collected_frames = []
     current_end = now_dt
 
@@ -231,38 +230,16 @@ if df is None or len(df) == 0:
     st.info("Market data feed is initializing...")
     st.stop()
 
-# --- MARKET CLOCK & DUAL SESSION ROUTING ---
-now_ist = datetime.datetime.now(IST)
-now_time = now_ist.time()
-today_date = now_ist.date()
-is_weekday = now_ist.weekday() < 5
-is_live_trading_session = (
-    is_weekday
-    and (datetime.time(9, 15) <= now_time <= datetime.time(15, 30))
-)
+curr = df.iloc[-1]
+spot_price = float(curr["close"])
 
+# Previous Day Floor Pivots
 unique_dates = sorted(df["date"].unique())
-
-if is_live_trading_session and today_date in unique_dates:
-    active_eval_date = today_date
-    session_label = "🟢 LIVE MARKET"
-else:
-    # Off-market / weekend / pre-market: Target the latest completed trading session
-    active_eval_date = unique_dates[-1]
-    session_label = f"⚪ SESSION REVIEW ({active_eval_date.strftime('%d-%b')})"
-
-active_day_df = df[df["date"] == active_eval_date].copy().reset_index(drop=True)
-
-# Find previous session for Floor Pivots
-prev_eval_date = None
-for d in reversed(unique_dates):
-    if d < active_eval_date:
-        prev_eval_date = d
-        break
-
 pivot_lines_data = {}
-if prev_eval_date:
-    prev_day_df = df[df["date"] == prev_eval_date]
+
+if len(unique_dates) >= 2:
+    prev_date = unique_dates[-2]
+    prev_day_df = df[df["date"] == prev_date]
     if len(prev_day_df) > 0:
         pdh = round(float(prev_day_df["high"].max()), 2)
         pdl = round(float(prev_day_df["low"].min()), 2)
@@ -282,22 +259,20 @@ if prev_eval_date:
             "PDH": pdh, "PDL": pdl
         }
 
-curr = active_day_df.iloc[-1] if len(active_day_df) > 0 else df.iloc[-1]
-spot_price = float(curr["close"])
+# Base Strike Anchor
 atm_strike = int(round(spot_price / 50.0) * 50)
-strikes_list = [atm_strike + (x * 50) for x in range(-20, 21)]
-
-# Expiry Filter: Skip same-day expiry
+today_dt = datetime.datetime.now(IST).date()
 auto_expiry = "CURRENT"
+
 if not nfo_df.empty:
-    all_future = nfo_df[nfo_df["exp_dt"].dt.date >= today_date].sort_values("exp_dt")
-    safe_future = all_future[all_future["exp_dt"].dt.date > today_date]
+    all_future = nfo_df[nfo_df["exp_dt"].dt.date >= today_dt].sort_values("exp_dt")
+    safe_future = all_future[all_future["exp_dt"].dt.date > today_dt]
     if not safe_future.empty:
         auto_expiry = safe_future["expiry"].iloc[0]
     elif not all_future.empty:
         auto_expiry = all_future["expiry"].iloc[0]
 
-# Top Header Layout
+# --- CLEAN HEADER CONTROLS (Manual CE/PE Removed) ---
 ctrl_cols = st.columns([2.2, 0.9, 6.9])
 
 with ctrl_cols[0]:
@@ -329,8 +304,8 @@ def compute_contract_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
     return round(ce_delta if is_ce else (1.0 - ce_delta), 2)
 
 exp_slice = nfo_df[nfo_df["expiry"] == auto_expiry] if not nfo_df.empty else pd.DataFrame()
-exp_date_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_date
-days_to_expiry = max((exp_date_val - today_date).days, 1)
+exp_date_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_dt
+days_to_expiry = max((exp_date_val - today_dt).days, 1)
 
 budget_offset_map = {
     "Budget (< ₹50)": 4,
@@ -415,6 +390,7 @@ def build_dynamic_shelves(entry_p, t_type, pv_dict, oi_target, atr_v, sw_h, sw_l
     return candidates, {"fib_100": fib_100, "fib_161": fib_161, "fib_261": fib_261}
 
 
+# Dual Format Telegram Notification Templates
 def format_full_entry_table_card(trade, opt_symbol, opt_ltp, delta_val, qty):
     is_ce = trade["type"] == "CE"
     t_type = trade["type"]
@@ -505,7 +481,7 @@ def format_step_trailing_alert(trade, opt_symbol, opt_ltp, delta_val, qty, curre
     return msg
 
 
-# --- ENGINE & STRATEGY EVALUATION ---
+# --- MULTI-DAY ENGINE EVALUATION ---
 total_qty = sel_lots * LOT_SIZE_QTY
 
 if "notified_sl_map" not in st.session_state:
@@ -514,21 +490,26 @@ if "notified_sl_map" not in st.session_state:
 markers = []
 historical_trade_cards = {}
 active_fib_lines = {}
-active_session_trade = None
+latest_trade_for_hud = None
+trade_executed_in_latest_session = False
+alarm_signal_triggered = False
 
-# Evaluation boundary: in live market, ignore forming candle for signal generation
-closed_candles_count = len(active_day_df) - 1 if is_live_trading_session and len(active_day_df) > 1 else len(active_day_df)
-orb_window = active_day_df[active_day_df["dt"].dt.time <= datetime.time(9, 30)]
+grouped = df.groupby("date")
+latest_session_date = df["date"].iloc[-1]
 
-if len(orb_window) > 0:
+for session_date, day_df in grouped:
+    orb_window = day_df[day_df["dt"].dt.time <= datetime.time(9, 30)]
+    if len(orb_window) == 0:
+        continue
+
     day_orb_h = orb_window["high"].max()
     day_orb_l = orb_window["low"].min()
 
     session_trade = None
     trade_executed_today = False
 
-    for idx in range(closed_candles_count):
-        row = active_day_df.iloc[idx]
+    for idx in range(len(day_df)):
+        row = day_df.iloc[idx]
         t = row["dt"].time()
         o, h, l, c = row["open"], row["high"], row["low"], row["close"]
         ema = row["ema9"]
@@ -566,7 +547,7 @@ if len(orb_window) > 0:
                     session_trade["current_sl"] = max(session_trade["current_sl"], bar_trail)
                     session_trade["trail_stage"] = f"MAX RUNNER MODE (Bar Low Trail: {session_trade['current_sl']:.1f})"
 
-                if is_live_trading_session:
+                if session_date == latest_session_date:
                     last_alerted = st.session_state.notified_sl_map.get("current_sl")
                     if session_trade["current_sl"] != last_alerted:
                         trail_msg = format_step_trailing_alert(
@@ -583,9 +564,9 @@ if len(orb_window) > 0:
                     session_trade["exit_price"] = exit_p
                     session_trade["exit_pts"] = pts
                     session_trade["trail_stage"] = f"TRADE EXITED ({pts:+.1f} pts)"
-                    active_session_trade = session_trade.copy()
+                    latest_trade_for_hud = session_trade.copy()
 
-                    if is_live_trading_session and not st.session_state.notified_sl_map.get("exit_sent"):
+                    if session_date == latest_session_date and not st.session_state.notified_sl_map.get("exit_sent"):
                         exit_msg = (
                             f"🏁 <b>TRADE CLOSED (NIFTY CE)</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -615,7 +596,7 @@ if len(orb_window) > 0:
                     session_trade["current_sl"] = min(session_trade["current_sl"], bar_trail)
                     session_trade["trail_stage"] = f"MAX RUNNER MODE (Bar High Trail: {session_trade['current_sl']:.1f})"
 
-                if is_live_trading_session:
+                if session_date == latest_session_date:
                     last_alerted = st.session_state.notified_sl_map.get("current_sl")
                     if session_trade["current_sl"] != last_alerted:
                         trail_msg = format_step_trailing_alert(
@@ -632,9 +613,9 @@ if len(orb_window) > 0:
                     session_trade["exit_price"] = exit_p
                     session_trade["exit_pts"] = pts
                     session_trade["trail_stage"] = f"TRADE EXITED ({pts:+.1f} pts)"
-                    active_session_trade = session_trade.copy()
+                    latest_trade_for_hud = session_trade.copy()
 
-                    if is_live_trading_session and not st.session_state.notified_sl_map.get("exit_sent"):
+                    if session_date == latest_session_date and not st.session_state.notified_sl_map.get("exit_sent"):
                         exit_msg = (
                             f"🏁 <b>TRADE CLOSED (NIFTY PE)</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -646,9 +627,9 @@ if len(orb_window) > 0:
                         send_telegram_alert(exit_msg)
                         st.session_state.notified_sl_map["exit_sent"] = True
 
-        # Breakout Entry Window: 09:30 to 10:30 AM
+        # Breakout Entry Window: 09:30 to 10:30 AM (Strong Candle Momentum Filter)
         if datetime.time(9, 30) < t <= datetime.time(10, 30) and not trade_executed_today:
-            sw_h, sw_l = extract_intraday_swings(active_day_df, idx, window=2)
+            sw_h, sw_l = extract_intraday_swings(day_df, idx, window=2)
 
             is_strong_range = candle_range >= (atr_val * 0.70)
             is_strong_body = body_ratio >= 0.60
@@ -675,7 +656,8 @@ if len(orb_window) > 0:
                 risk = round(c - init_sl, 1)
                 oi_res = atm_strike + 200
                 shelves, fibs = build_dynamic_shelves(c, "CE", pivot_lines_data, oi_res, atr_val, sw_h, sw_l, day_orb_h, day_orb_l)
-                active_fib_lines = fibs
+                if session_date == latest_session_date:
+                    active_fib_lines = fibs
 
                 trade_strike = atm_strike + (step_offset * 50)
                 opt_sym = f"NIFTY {trade_strike} CE"
@@ -731,9 +713,11 @@ if len(orb_window) > 0:
                     "type": "CE",
                 }
                 trade_executed_today = True
-                active_session_trade = session_trade.copy()
+                latest_trade_for_hud = session_trade.copy()
+                if session_date == latest_session_date:
+                    trade_executed_in_latest_session = True
+                    alarm_signal_triggered = True
 
-                if is_live_trading_session:
                     entry_msg = format_full_entry_table_card(session_trade, opt_sym, opt_ltp, trade_delta, total_qty)
                     send_telegram_alert(entry_msg)
 
@@ -742,7 +726,8 @@ if len(orb_window) > 0:
                 risk = round(init_sl - c, 1)
                 oi_sup = atm_strike - 200
                 shelves, fibs = build_dynamic_shelves(c, "PE", pivot_lines_data, oi_sup, atr_val, sw_h, sw_l, day_orb_h, day_orb_l)
-                active_fib_lines = fibs
+                if session_date == latest_session_date:
+                    active_fib_lines = fibs
 
                 trade_strike = atm_strike - (step_offset * 50)
                 opt_sym = f"NIFTY {trade_strike} PE"
@@ -798,19 +783,21 @@ if len(orb_window) > 0:
                     "type": "PE",
                 }
                 trade_executed_today = True
-                active_session_trade = session_trade.copy()
+                latest_trade_for_hud = session_trade.copy()
+                if session_date == latest_session_date:
+                    trade_executed_in_latest_session = True
+                    alarm_signal_triggered = True
 
-                if is_live_trading_session:
                     entry_msg = format_full_entry_table_card(session_trade, opt_sym, opt_ltp, trade_delta, total_qty)
                     send_telegram_alert(entry_msg)
 
 # Active Contract Selection for HUD & Header
-if active_session_trade:
-    active_type = active_session_trade["type"]
-    active_strike = active_session_trade["strike"]
-    active_symbol = active_session_trade["opt_symbol"]
-    live_real_ltp = active_session_trade["opt_entry_ltp"]
-    active_delta = active_session_trade["delta"]
+if latest_trade_for_hud:
+    active_type = latest_trade_for_hud["type"]
+    active_strike = latest_trade_for_hud["strike"]
+    active_symbol = latest_trade_for_hud["opt_symbol"]
+    live_real_ltp = latest_trade_for_hud["opt_entry_ltp"]
+    active_delta = latest_trade_for_hud["delta"]
 else:
     active_type = "CE" if spot_price >= curr["vwap"] else "PE"
     active_strike = atm_strike + (step_offset * 50) if active_type == "CE" else atm_strike - (step_offset * 50)
@@ -826,14 +813,13 @@ else:
         live_real_ltp = max(1.5, round(max(0.0, diff) + (math.sqrt(days_to_expiry) * 22.0) - (abs(diff) * 0.08), 2))
     active_delta = compute_contract_delta(spot_price, active_strike, days_to_expiry, is_ce=(active_type == "CE"))
 
-# Header Status Box
 with ctrl_cols[2]:
     st.markdown(
         f"""
         <div style="background:#161a25; border:1px solid #2a2e39; border-radius:4px; padding:3px 8px; display:flex; gap:12px; align-items:center; font-size:11px; height:32px;">
-            <div>Mode: <b style="color:#00e5ff;">{session_label}</b></div>
-            <div>Contract: <b style="color:#ffd600;">{active_symbol}</b></div>
-            <div>LTP: <b>₹{live_real_ltp:.2f}</b></div>
+            <div>Contract: <b style="color:#00e5ff;">{active_symbol}</b></div>
+            <div>LTP: <b style="color:#ffd600; font-size:13px;">₹{live_real_ltp:.2f}</b></div>
+            <div>Mode: <b style="color:#ab47bc;">{mode_selection}</b></div>
             <div>Qty: <b style="color:#089981;">{total_qty}</b> ({sel_lots}L)</div>
             <div>Delta: <b style="color:#00e5ff;">{active_delta:.2f}</b></div>
             <div>Expiry: <b style="color:#d1d4dc;">{auto_expiry}</b></div>
@@ -841,6 +827,13 @@ with ctrl_cols[2]:
         """,
         unsafe_allow_html=True,
     )
+
+today_date = df["date"].iloc[-1]
+today_df = df[df["date"] == today_date]
+today_orb = today_df[today_df["dt"].dt.time <= datetime.time(9, 30)]
+curr_orb_h = today_orb["high"].max() if len(today_orb) > 0 else today_df.iloc[0:3]["high"].max()
+curr_orb_l = today_orb["low"].min() if len(today_orb) > 0 else today_df.iloc[0:3]["low"].min()
+latest_bar_time = curr["dt"].time()
 
 candles_data = [
     {
@@ -863,21 +856,21 @@ volume_data = [
     for _, r in df.iterrows()
 ]
 
-# --- STRATEGY HUD PAYLOAD ---
+# --- STRATEGY HUD PAYLOAD (P&L Bug Corrected) ---
 hud_payload = None
-if active_session_trade:
-    is_ce = active_session_trade["type"] == "CE"
-    entry_p = active_session_trade["entry"]
-    trail_p = active_session_trade["current_sl"]
+if trade_executed_in_latest_session and latest_trade_for_hud:
+    is_ce = latest_trade_for_hud["type"] == "CE"
+    entry_p = latest_trade_for_hud["entry"]
+    trail_p = latest_trade_for_hud["current_sl"]
     secured_pts = round(trail_p - entry_p, 1) if is_ce else round(entry_p - trail_p, 1)
-    risk_pts = active_session_trade["risk"]
-    target1_pts = round(abs(active_session_trade["tp1"] - entry_p), 1)
-    target_mid_pts = round(abs(active_session_trade["tp_mid"] - entry_p), 1)
-    target_final_pts = round(abs(active_session_trade["tp_final"] - entry_p), 1)
+    risk_pts = latest_trade_for_hud["risk"]
+    target1_pts = round(abs(latest_trade_for_hud["tp1"] - entry_p), 1)
+    target_mid_pts = round(abs(latest_trade_for_hud["tp_mid"] - entry_p), 1)
+    target_final_pts = round(abs(latest_trade_for_hud["tp_final"] - entry_p), 1)
 
-    is_trade_closed = active_session_trade.get("closed", False)
+    is_trade_closed = latest_trade_for_hud.get("closed", False)
     if is_trade_closed:
-        final_pts = active_session_trade.get("exit_pts", secured_pts)
+        final_pts = latest_trade_for_hud.get("exit_pts", secured_pts)
         final_opt_rs = round(final_pts * active_delta * total_qty)
         pnl_label = "Final Realized P&L"
         pts_display = f"{final_pts:+.1f} pts"
@@ -892,15 +885,15 @@ if active_session_trade:
 
     hud_payload = {
         "is_no_trade": False,
-        "call_or_put": active_session_trade["call_or_put"],
-        "reason": active_session_trade["reason"],
+        "call_or_put": latest_trade_for_hud["call_or_put"],
+        "reason": latest_trade_for_hud["reason"],
         "entry": f"{entry_p:.1f}",
-        "sl_risk": f"{active_session_trade['init_sl']:.1f} (-{risk_pts:.1f} pts)",
-        "target1": f"{active_session_trade['tp1']:.1f} (+{target1_pts:.1f} pts)",
-        "target_mid": f"{active_session_trade['tp_mid']:.1f} (+{target_mid_pts:.1f} pts)",
-        "target_final": f"{active_session_trade['tp_final']:.1f} (+{target_final_pts:.1f} pts)",
+        "sl_risk": f"{latest_trade_for_hud['init_sl']:.1f} (-{risk_pts:.1f} pts)",
+        "target1": f"{latest_trade_for_hud['tp1']:.1f} (+{target1_pts:.1f} pts)",
+        "target_mid": f"{latest_trade_for_hud['tp_mid']:.1f} (+{target_mid_pts:.1f} pts)",
+        "target_final": f"{latest_trade_for_hud['tp_final']:.1f} (+{target_final_pts:.1f} pts)",
         "trailing_sl": f"{trail_p:.1f}",
-        "trail_stage": active_session_trade["trail_stage"],
+        "trail_stage": latest_trade_for_hud["trail_stage"],
         "pnl_label": pnl_label,
         "pts_display": pts_display,
         "inr_display": inr_display,
@@ -912,27 +905,60 @@ if active_session_trade:
         "raw_secured_pts": secured_pts,
         "theme": "#089981" if is_ce else "#f23645",
     }
-else:
-    # State when no trade is active
-    if is_live_trading_session and now_time < datetime.time(9, 30):
-        status_text = "BUILDING ORB RANGE"
-        reason_text = "Waiting for 09:15 - 09:30 AM Opening Range formation"
-        action_text = "Scanning for breakout after 09:30 AM"
-    elif is_live_trading_session and now_time <= datetime.time(10, 30):
-        status_text = "HUNTING MOMENTUM"
-        reason_text = "Scanning 5-min candles for Strong Body >= 60% breakout"
-        action_text = "Awaiting confirmed setup"
-    else:
-        status_text = "NO TRADE EXECUTED"
-        reason_text = "No strong momentum expansion confirmed before 10:30 AM"
-        action_text = "Capital Protected (Wait for next session)"
-
+elif (not trade_executed_in_latest_session) and (latest_bar_time >= datetime.time(10, 30)):
     hud_payload = {
         "is_no_trade": True,
-        "status": status_text,
-        "reason": reason_text,
-        "action": action_text,
+        "status": "NO TRADE TODAY",
+        "reason": "No strong momentum breakout before 10:30 AM",
+        "action": "Capital Protected (Wait for tomorrow)",
         "theme": "#787b86",
+    }
+elif latest_trade_for_hud:
+    is_ce = latest_trade_for_hud["type"] == "CE"
+    entry_p = latest_trade_for_hud["entry"]
+    trail_p = latest_trade_for_hud["current_sl"]
+    secured_pts = round(trail_p - entry_p, 1) if is_ce else round(entry_p - trail_p, 1)
+    risk_pts = latest_trade_for_hud["risk"]
+    target1_pts = round(abs(latest_trade_for_hud["tp1"] - entry_p), 1)
+    target_mid_pts = round(abs(latest_trade_for_hud["tp_mid"] - entry_p), 1)
+    target_final_pts = round(abs(latest_trade_for_hud["tp_final"] - entry_p), 1)
+
+    is_trade_closed = latest_trade_for_hud.get("closed", False)
+    if is_trade_closed:
+        final_pts = latest_trade_for_hud.get("exit_pts", secured_pts)
+        final_opt_rs = round(final_pts * active_delta * total_qty)
+        pnl_label = "Final Realized P&L"
+        pts_display = f"{final_pts:+.1f} pts"
+        inr_display = f"{final_opt_rs:+d}"
+        pnl_theme = "#089981" if final_pts >= 0 else "#f23645"
+    else:
+        locked_opt_rs = int(round(secured_pts * active_delta * total_qty))
+        pnl_label = "Secured P&L (at SL)"
+        pts_display = f"{secured_pts:+.1f} pts"
+        inr_display = f"{locked_opt_rs:+d}"
+        pnl_theme = "#089981" if secured_pts >= 0 else "#f23645"
+
+    hud_payload = {
+        "is_no_trade": False,
+        "call_or_put": latest_trade_for_hud["call_or_put"],
+        "reason": latest_trade_for_hud["reason"],
+        "entry": f"{entry_p:.1f}",
+        "sl_risk": f"{latest_trade_for_hud['init_sl']:.1f} (-{risk_pts:.1f} pts)",
+        "target1": f"{latest_trade_for_hud['tp1']:.1f} (+{target1_pts:.1f} pts)",
+        "target_mid": f"{latest_trade_for_hud['tp_mid']:.1f} (+{target_mid_pts:.1f} pts)",
+        "target_final": f"{latest_trade_for_hud['tp_final']:.1f} (+{target_final_pts:.1f} pts)",
+        "trailing_sl": f"{trail_p:.1f}",
+        "trail_stage": latest_trade_for_hud["trail_stage"],
+        "pnl_label": pnl_label,
+        "pts_display": pts_display,
+        "inr_display": inr_display,
+        "pnl_theme": pnl_theme,
+        "raw_risk_pts": risk_pts,
+        "raw_target1_pts": target1_pts,
+        "raw_target_mid_pts": target_mid_pts,
+        "raw_target_final_pts": target_final_pts,
+        "raw_secured_pts": secured_pts,
+        "theme": "#089981" if is_ce else "#f23645",
     }
 
 # Serialization
@@ -945,15 +971,16 @@ history_cards_json = json.dumps(historical_trade_cards)
 pivots_json = json.dumps(pivot_lines_data)
 fibs_json = json.dumps(active_fib_lines)
 hud_json = json.dumps(hud_payload)
+play_alarm_flag = "true" if alarm_signal_triggered else "false"
 
 # Price Change
-day_open = active_day_df.iloc[0]["open"] if len(active_day_df) > 0 else df.iloc[0]["open"]
+day_open = today_df.iloc[0]["open"]
 chg = curr["close"] - day_open
 chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
-# --- Embedded Web Terminal ---
+# --- Embedded Lightweight Charts Web Terminal ---
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -1017,6 +1044,13 @@ html_code = f"""
         }}
         .tool-btn:hover {{ background: #2962ff; color: #ffffff; }}
         .tool-btn.active-draw {{ background: #00e5ff; color: #000; font-weight: 800; }}
+
+        .alarm-toggle-btn {{
+            background: rgba(30, 34, 45, 0.95); border: 1px solid #363c4e; color: #00e5ff;
+            font-size: 10px; font-weight: 700; padding: 2px 5px; border-radius: 4px;
+            cursor: pointer; display: flex; align-items: center; gap: 4px; flex-shrink: 0;
+        }}
+        .alarm-toggle-btn.enabled {{ background: #00bfa5; color: #000; border-color: #00bfa5; }}
 
         .dynamic-ohlc-row {{
             font-size: 9.5px; color: #787b86; display: flex; gap: 6px;
@@ -1101,9 +1135,24 @@ html_code = f"""
             padding: 5px 8px; font-size: 9.5px; color: #d1d4dc; line-height: 1.4;
             box-shadow: 0 4px 12px rgba(0,0,0,0.7); transform: translate(-50%, -100%);
         }}
+
+        .alarm-ringing-banner {{
+            position: fixed; top: 8px; left: 50%; transform: translateX(-50%); z-index: 100;
+            background: #f23645; color: #ffffff; font-weight: 800; font-size: 11px;
+            padding: 6px 14px; border-radius: 20px; box-shadow: 0 0 20px rgba(242, 54, 69, 0.8);
+            cursor: pointer; display: none; animation: pulseAlarm 0.8s infinite alternate;
+        }}
+        @keyframes pulseAlarm {{
+            from {{ transform: translateX(-50%) scale(1); }}
+            to {{ transform: translateX(-50%) scale(1.06); }}
+        }}
     </style>
 </head>
 <body>
+    <div id="ringingBanner" class="alarm-ringing-banner" onclick="silenceAlarmNow()">
+        🚨 SIGNAL CONFIRMED! [TAP TO MUTE] 🔇
+    </div>
+
     <div id="topHeaderArea">
         <div class="top-row-1">
             <div class="sym-group">
@@ -1139,6 +1188,10 @@ html_code = f"""
                 <button id="btnLong" class="tool-btn" onclick="activateDrawMode('LONG')">+ Long Tool</button>
                 <button id="btnShort" class="tool-btn" onclick="activateDrawMode('SHORT')">+ Short Tool</button>
             </div>
+
+            <button id="alarmBtn" class="alarm-toggle-btn" onclick="toggleAudioAlarm()">
+                🔔 <span id="alarmTxt">Audio</span>
+            </button>
         </div>
     </div>
 
@@ -1153,6 +1206,66 @@ html_code = f"""
         const activeLots = {sel_lots};
         const LOT_SIZE = {LOT_SIZE_QTY};
         const activeQty = activeLots * LOT_SIZE;
+
+        let audioCtx = null;
+        let alarmUnlocked = localStorage.getItem('nifty_alarm_active') === 'true';
+        let alarmTimer = null;
+
+        function updateAlarmButtonUI() {{
+            const btn = document.getElementById('alarmBtn');
+            const txt = document.getElementById('alarmTxt');
+            if (alarmUnlocked) {{
+                btn.className = 'alarm-toggle-btn enabled';
+                txt.innerText = 'Audio 🔔';
+            }} else {{
+                btn.className = 'alarm-toggle-btn';
+                txt.innerText = 'Audio 🔕';
+            }}
+        }}
+
+        function toggleAudioAlarm() {{
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            alarmUnlocked = !alarmUnlocked;
+            localStorage.setItem('nifty_alarm_active', alarmUnlocked ? 'true' : 'false');
+            updateAlarmButtonUI();
+            if (alarmUnlocked) playBeepTone(880, 0.15);
+            else silenceAlarmNow();
+        }}
+
+        function silenceAlarmNow() {{
+            if (alarmTimer) {{ clearInterval(alarmTimer); alarmTimer = null; }}
+            document.getElementById('ringingBanner').style.display = 'none';
+            sessionStorage.setItem('alarm_silenced_for_session', 'true');
+        }}
+
+        function playBeepTone(freq = 750, duration = 0.3) {{
+            try {{
+                if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                if (audioCtx.state === 'suspended') audioCtx.resume();
+                const osc = audioCtx.createOscillator();
+                const gain = audioCtx.createGain();
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+                gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+                osc.connect(gain);
+                gain.connect(audioCtx.destination);
+                osc.start();
+                osc.stop(audioCtx.currentTime + duration);
+            }} catch(err) {{}}
+        }}
+
+        const shouldRingAlarm = {play_alarm_flag};
+        updateAlarmButtonUI();
+        const isSilenced = sessionStorage.getItem('alarm_silenced_for_session') === 'true';
+        if (shouldRingAlarm && alarmUnlocked && !isSilenced) {{
+            document.getElementById('ringingBanner').style.display = 'block';
+            alarmTimer = setInterval(() => {{
+                playBeepTone(880, 0.2);
+                setTimeout(() => playBeepTone(1100, 0.2), 300);
+            }}, 2000);
+        }}
 
         const chartContainer = document.getElementById('chartArea');
         const chart = LightweightCharts.createChart(chartContainer, {{
@@ -1246,6 +1359,9 @@ html_code = f"""
         emaSeries.setData({ema_json});
 
         candleSeries.setMarkers({markers_json});
+
+        candleSeries.createPriceLine({{ price: {curr_orb_h:.2f}, color: '#089981', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'ORB HIGH' }});
+        candleSeries.createPriceLine({{ price: {curr_orb_l:.2f}, color: '#f23645', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'ORB LOW' }});
 
         const pv = {pivots_json};
         if (pv && pv.P) {{
