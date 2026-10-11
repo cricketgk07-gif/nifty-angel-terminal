@@ -91,7 +91,7 @@ def send_telegram_alert(message: str):
         "disable_web_page_preview": True,
     }
     try:
-        requests.post(url, json=payload, timeout=3)
+        requests.post(url, json=payload, timeout=4)
     except Exception:
         pass
 
@@ -189,7 +189,6 @@ def fetch_nifty_candles():
 
     df = df[(df["open"] > 1000) & (df["high"] > 1000) & (df["low"] > 1000) & (df["close"] > 1000)].copy()
 
-    # Retain full trading window through 15:30
     df = df[
         (df["dt"].dt.time >= datetime.time(9, 15))
         & (df["dt"].dt.time <= datetime.time(15, 30))
@@ -264,30 +263,39 @@ if len(unique_dates) >= 2:
 atm_strike = int(round(spot_price / 50.0) * 50)
 strikes_list = [atm_strike + (x * 50) for x in range(-20, 21)]
 
-# Expiry Contract List
-available_expiries = []
+# Expiry Filter: Automatically skip same-day expiry to prevent rapid time decay
 today_dt = datetime.datetime.now(IST).date()
-if not nfo_df.empty:
-    future_nfo = nfo_df[nfo_df["exp_dt"].dt.date >= today_dt].sort_values("exp_dt")
-    if not future_nfo.empty:
-        available_expiries = future_nfo["expiry"].dropna().drop_duplicates().tolist()
-    else:
-        available_expiries = nfo_df["expiry"].dropna().drop_duplicates().tolist()
+available_expiries = []
 
-# Top Controls Row
-ctrl_cols = st.columns([1.2, 1.4, 0.8, 0.8, 4.8])
+if not nfo_df.empty:
+    all_future = nfo_df[nfo_df["exp_dt"].dt.date >= today_dt].sort_values("exp_dt")
+    # Drop today's date if today is expiry day
+    safe_future = all_future[all_future["exp_dt"].dt.date > today_dt]
+    if not safe_future.empty:
+        available_expiries = safe_future["expiry"].dropna().drop_duplicates().tolist()
+    else:
+        available_expiries = all_future["expiry"].dropna().drop_duplicates().tolist()
+
+if not available_expiries:
+    available_expiries = ["CURRENT"]
+
+# Top Header Layout
+ctrl_cols = st.columns([1.1, 1.2, 1.3, 0.7, 0.7, 4.0])
 
 with ctrl_cols[0]:
+    mode_selection = st.selectbox("Mode", ["Budget (< ₹80)", "ATM"], index=0)
+
+with ctrl_cols[1]:
+    sel_expiry = st.selectbox("Expiry", available_expiries)
+
+with ctrl_cols[2]:
     default_strike_idx = strikes_list.index(atm_strike) if atm_strike in strikes_list else 20
     sel_strike = st.selectbox("Strike", strikes_list, index=default_strike_idx)
 
-with ctrl_cols[1]:
-    sel_expiry = st.selectbox("Expiry", available_expiries if available_expiries else ["CURRENT"])
-
-with ctrl_cols[2]:
+with ctrl_cols[3]:
     sel_type = st.selectbox("Type", ["CE", "PE"])
 
-with ctrl_cols[3]:
+with ctrl_cols[4]:
     sel_lots = st.number_input("Lots", min_value=1, max_value=100, value=1, step=1)
 
 # Black-Scholes Greeks Calculation
@@ -300,12 +308,77 @@ def compute_contract_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
     ce_delta = norm_cdf(d1)
     return round(ce_delta if is_ce else (1.0 - ce_delta), 2)
 
-# Expiry Specific Calculations
 exp_slice = nfo_df[nfo_df["expiry"] == sel_expiry] if not nfo_df.empty else pd.DataFrame()
 exp_date_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_dt
 days_to_expiry = max((exp_date_val - today_dt).days, 1)
 
-active_delta = compute_contract_delta(spot_price, float(sel_strike), days_to_expiry, is_ce=(sel_type == "CE"))
+# Live Quote & Budget (< ₹80) Contract Selection
+active_strike = sel_strike
+live_real_ltp = 0.0
+target_symbol = ""
+target_token = ""
+
+def fetch_option_ltp(sym, tok):
+    try:
+        res = api.ltpData("NFO", sym, tok)
+        if isinstance(res, dict) and res.get("status") and res.get("data"):
+            val = float(res["data"].get("ltp", 0.0))
+            if val > 0.0:
+                return val
+    except Exception:
+        pass
+    return 0.0
+
+if not nfo_df.empty:
+    if mode_selection == "Budget (< ₹80)":
+        # Search for strikes where price is <= 80
+        chain_slice = nfo_df[
+            (nfo_df["expiry"] == sel_expiry) &
+            (nfo_df["symbol"].str.endswith(sel_type))
+        ].copy()
+        
+        # Sort by distance from ATM
+        if sel_type == "CE":
+            chain_slice = chain_slice[chain_slice["strike_num"] >= spot_price].sort_values("strike_num")
+        else:
+            chain_slice = chain_slice[chain_slice["strike_num"] <= spot_price].sort_values("strike_num", ascending=False)
+            
+        chosen_row = None
+        for _, opt_row in chain_slice.iterrows():
+            cand_ltp = fetch_option_ltp(str(opt_row["symbol"]), str(opt_row["token"]))
+            if 10.0 <= cand_ltp <= 80.0:
+                chosen_row = opt_row
+                live_real_ltp = cand_ltp
+                break
+                
+        if chosen_row is not None:
+            active_strike = int(chosen_row["strike_num"])
+            target_symbol = str(chosen_row["symbol"])
+            target_token = str(chosen_row["token"])
+        else:
+            # Fallback: Pick 2 strikes OTM
+            offset = 100 if sel_type == "CE" else -100
+            active_strike = atm_strike + offset
+            match = nfo_df[(nfo_df["strike_num"] == active_strike) & (nfo_df["symbol"].str.endswith(sel_type)) & (nfo_df["expiry"] == sel_expiry)]
+            if not match.empty:
+                target_symbol = str(match.iloc[0]["symbol"])
+                target_token = str(match.iloc[0]["token"])
+                live_real_ltp = fetch_option_ltp(target_symbol, target_token)
+    else:
+        # ATM Mode
+        active_strike = sel_strike
+        match = nfo_df[(nfo_df["strike_num"] == float(active_strike)) & (nfo_df["symbol"].str.endswith(sel_type)) & (nfo_df["expiry"] == sel_expiry)]
+        if not match.empty:
+            target_symbol = str(match.iloc[0]["symbol"])
+            target_token = str(match.iloc[0]["token"])
+            live_real_ltp = fetch_option_ltp(target_symbol, target_token)
+
+if live_real_ltp <= 0.0:
+    diff = (spot_price - float(active_strike)) if sel_type == "CE" else (float(active_strike) - spot_price)
+    live_real_ltp = max(1.5, round(max(0.0, diff) + (math.sqrt(days_to_expiry) * 22.0) - (abs(diff) * 0.08), 2))
+
+active_delta = compute_contract_delta(spot_price, float(active_strike), days_to_expiry, is_ce=(sel_type == "CE"))
+total_qty = sel_lots * LOT_SIZE_QTY
 
 # Expiry Specific PCR and OI Max Levels
 ce_oi_map = {}
@@ -327,61 +400,28 @@ pcr_value = round(total_pe_oi / max(total_ce_oi, 1), 2)
 oi_res_strike = max(ce_oi_map, key=ce_oi_map.get) if ce_oi_map else atm_strike + 200
 oi_sup_strike = max(pe_oi_map, key=pe_oi_map.get) if pe_oi_map else atm_strike - 200
 
-# Live Quote from Angel One
-live_real_ltp = 0.0
-target_symbol = ""
-target_token = ""
-
-if not nfo_df.empty:
-    scrip_match = nfo_df[
-        (nfo_df["strike_num"] == float(sel_strike))
-        & (nfo_df["symbol"].str.endswith(sel_type))
-        & (nfo_df["expiry"] == sel_expiry)
-    ]
-    if not scrip_match.empty:
-        target_symbol = str(scrip_match.iloc[0]["symbol"])
-        target_token = str(scrip_match.iloc[0]["token"])
-        try:
-            res = api.ltpData("NFO", target_symbol, target_token)
-            if isinstance(res, dict) and res.get("status") and res.get("data"):
-                val = float(res["data"].get("ltp", 0.0))
-                if val > 0.0:
-                    live_real_ltp = val
-        except Exception:
-            pass
-
-if live_real_ltp <= 0.0:
-    diff = (spot_price - float(sel_strike)) if sel_type == "CE" else (float(sel_strike) - spot_price)
-    live_real_ltp = max(1.5, round(max(0.0, diff) + (math.sqrt(days_to_expiry) * 22.0) - (abs(diff) * 0.08), 2))
-
-total_qty = sel_lots * LOT_SIZE_QTY
-
-# Nifty 50 Advance / Decline Ratio
 adv_count = int(min(45, max(10, 25 + int((curr["close"] - df.iloc[0]["open"]) / 8.0))))
 dec_count = 50 - adv_count
 ad_ratio = round(adv_count / max(dec_count, 1), 2)
 
-with ctrl_cols[4]:
+with ctrl_cols[5]:
     st.markdown(
         f"""
         <div style="background:#161a25; border:1px solid #2a2e39; border-radius:4px; padding:3px 8px; display:flex; gap:10px; align-items:center; font-size:11px; height:32px;">
-            <div>Contract: <b style="color:#00e5ff;">{target_symbol or f'NIFTY{sel_expiry}{sel_strike}{sel_type}'}</b></div>
+            <div>Contract: <b style="color:#00e5ff;">{target_symbol or f'NIFTY{active_strike}{sel_type}'}</b></div>
             <div>LTP: <b style="color:#ffd600; font-size:13px;">₹{live_real_ltp:.2f}</b></div>
-            <div>Qty: <b style="color:#089981;">{total_qty}</b> ({sel_lots}L)</div>
-            <div>Delta: <b style="color:#ab47bc;">{active_delta:.2f}</b></div>
-            <div>PCR: <b style="color:#00e5ff;">{pcr_value}</b></div>
-            <div>A/D: <b style="color:#089981;">{adv_count}:{dec_count}</b> ({ad_ratio})</div>
-            <div>Res: <b style="color:#f23645;">{oi_res_strike}</b></div>
-            <div>Sup: <b style="color:#089981;">{oi_sup_strike}</b></div>
+            <div>Mode: <b style="color:#ab47bc;">{mode_selection}</b></div>
+            <div>Qty: <b style="color:#089981;">{total_qty}</b></div>
+            <div>Delta: <b style="color:#00e5ff;">{active_delta:.2f}</b></div>
+            <div>PCR: <b>{pcr_value}</b></div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-# --- DYNAMIC SHELF RUNNER ENGINE WITH FIB EXTENSIONS ---
+# --- STRATEGY ENGINE & DYNAMIC SHELVES ---
 def extract_intraday_swings(day_data, current_idx, window=2):
-    """Identifies fractal swing highs and lows prior to the breakout candle."""
     swings_h = []
     swings_l = []
     for i in range(window, max(window, current_idx)):
@@ -398,10 +438,6 @@ def extract_intraday_swings(day_data, current_idx, window=2):
 
 
 def build_dynamic_shelves(entry_p, t_type, pv_dict, oi_target, atr_v, sw_h, sw_l, orb_h, orb_l):
-    """
-    Combines Major Swings, Floor Pivots, PDH/PDL, Max OI, 3*ATR, and Fibonacci ORB Extensions
-    (100%, 161.8%, 261.8%) into directionally sorted shelves. Sets farthest as Max Run target.
-    """
     orb_range = max(10.0, orb_h - orb_l)
     atr_3x = entry_p + (3.0 * atr_v) if t_type == "CE" else entry_p - (3.0 * atr_v)
 
@@ -445,11 +481,61 @@ def build_dynamic_shelves(entry_p, t_type, pv_dict, oi_target, atr_v, sw_h, sw_l
     return candidates, {"fib_100": fib_100, "fib_161": fib_161, "fib_261": fib_261}
 
 
+def format_telegram_table_card(header_title, trade, spot_c, opt_ltp, delta_val, qty):
+    """Formats the full strategy HUD table for Telegram delivery."""
+    is_ce = trade["type"] == "CE"
+    entry_p = trade["entry"]
+    trail_p = trade["current_sl"]
+    secured_pts = round(trail_p - entry_p, 1) if is_ce else round(entry_p - trail_p, 1)
+    risk_pts = trade["risk"]
+    t1_pts = round(abs(trade["tp1"] - entry_p), 1)
+    tmid_pts = round(abs(trade["tp_mid"] - entry_p), 1)
+    tfinal_pts = round(abs(trade["tp_final"] - entry_p), 1)
+
+    opt_risk_rs = round(risk_pts * delta_val, 1)
+    opt_sl_price = max(0.5, round(opt_ltp - opt_risk_rs, 1))
+    max_risk_inr = int(opt_risk_rs * qty)
+
+    opt_t1_gain = round(t1_pts * delta_val, 1)
+    opt_t1_price = round(opt_ltp + opt_t1_gain, 1)
+    t1_profit_inr = int(opt_t1_gain * qty)
+
+    opt_tmid_gain = round(tmid_pts * delta_val, 1)
+    opt_tmid_price = round(opt_ltp + opt_tmid_gain, 1)
+
+    opt_final_gain = round(tfinal_pts * delta_val, 1)
+    opt_final_price = round(opt_ltp + opt_final_gain, 1)
+    final_profit_inr = int(opt_final_gain * qty)
+
+    opt_trail_diff = round(secured_pts * delta_val, 1)
+    opt_trail_price = max(0.5, round(opt_ltp + opt_trail_diff, 1))
+    secured_pnl_inr = int(opt_trail_diff * qty)
+
+    msg = (
+        f"{header_title}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>CONTRACT:</b> {target_symbol or f'NIFTY {active_strike} {trade[\"type\"]}'}\n"
+        f"<b>QUANTITY:</b> {qty} (Delta: {delta_val:.2f})\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Parameter | Spot | Option (₹)</b>\n"
+        f"• <b>Entry:</b> {entry_p:.1f} | <b>₹{opt_ltp:.2f}</b>\n"
+        f"• <b>SL (Risk):</b> {trade['init_sl']:.1f} | <b>₹{opt_sl_price:.2f}</b> (-₹{max_risk_inr})\n"
+        f"• <b>Target 1:</b> {trade['tp1']:.1f} | <b>₹{opt_t1_price:.2f}</b> (+₹{t1_profit_inr})\n"
+        f"• <b>Target Mid:</b> {trade['tp_mid']:.1f} | <b>₹{opt_tmid_price:.2f}</b>\n"
+        f"• <b>Target Max:</b> {trade['tp_final']:.1f} | <b>₹{opt_final_price:.2f}</b> (+₹{final_profit_inr})\n"
+        f"• <b>Trailing SL:</b> {trail_p:.1f} | <b>₹{opt_trail_price:.2f}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🛡️ <b>Trail Mode:</b> {trade['trail_stage']}\n"
+        f"💰 <b>Secured P&L:</b> <b>{secured_pts:+.1f} pts (₹{secured_pnl_inr:+})</b>\n"
+        f"⏰ <b>Time:</b> {datetime.datetime.now(IST).strftime('%H:%M:%S')}"
+    )
+    return msg
+
+
 # Session State for Alert Deduplication
 if "notified_sl_map" not in st.session_state:
     st.session_state.notified_sl_map = {}
 
-# Strategy Processing Loop
 markers = []
 historical_trade_cards = {}
 latest_trade_for_hud = None
@@ -499,28 +585,19 @@ for session_date, day_df in grouped:
                             session_trade["current_sl"] = max(session_trade["current_sl"], target_sl)
                             session_trade["trail_stage"] = f"SHELF {s_idx+1} CLEARED ({s_level:.1f}) -> TRAIL LOCK"
 
-                # Runner Mode: Trail 5-minute bar lows after all major shelves are crossed
                 if session_trade["current_shelf_idx"] >= len(shelves):
                     bar_trail = round(l - 3.0, 1)
                     session_trade["current_sl"] = max(session_trade["current_sl"], bar_trail)
                     session_trade["trail_stage"] = f"MAX RUNNER MODE (Bar Low Trail: {session_trade['current_sl']:.1f})"
 
-                # Mobile Alert Dispatcher for Trailing Stop Updates
                 if session_date == latest_session_date:
                     last_alerted = st.session_state.notified_sl_map.get("current_sl")
                     if session_trade["current_sl"] != last_alerted:
-                        pts_locked = round(session_trade["current_sl"] - entry, 1)
-                        alert_msg = (
-                            f"🔔 <b>NIFTY CE TRAILING SL UPDATED</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━\n"
-                            f"📈 <b>Entry:</b> {entry:.1f}\n"
-                            f"🛡️ <b>New Stop:</b> <b>{session_trade['current_sl']:.1f}</b>\n"
-                            f"🔒 <b>Secured Points:</b> {pts_locked:+.1f} pts\n"
-                            f"📍 <b>Status:</b> {session_trade['trail_stage']}\n"
-                            f"🎯 <b>Max Target:</b> {session_trade['tp_final']:.1f}\n"
-                            f"⏰ <b>Time:</b> {row['dt'].strftime('%H:%M')}"
+                        full_card_msg = format_telegram_table_card(
+                            "🔔 <b>NIFTY CE TRAILING SL UPDATED</b>",
+                            session_trade, c, live_real_ltp, active_delta, total_qty
                         )
-                        send_telegram_alert(alert_msg)
+                        send_telegram_alert(full_card_msg)
                         st.session_state.notified_sl_map["current_sl"] = session_trade["current_sl"]
 
                 if l <= session_trade["current_sl"] or (c < ema and c < o and c < (day_orb_h - 3.0)):
@@ -535,9 +612,10 @@ for session_date, day_df in grouped:
                     if session_date == latest_session_date and not st.session_state.notified_sl_map.get("exit_sent"):
                         exit_msg = (
                             f"🏁 <b>TRADE CLOSED (NIFTY CE)</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━\n"
-                            f"🚪 <b>Exit Price:</b> {exit_p:.1f}\n"
-                            f"💰 <b>Final P&L:</b> <b>{pts:+.1f} pts</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"🚪 <b>Exit Spot:</b> {exit_p:.1f}\n"
+                            f"💰 <b>Final Net Spot:</b> <b>{pts:+.1f} pts</b>\n"
+                            f"💵 <b>Final Net Option:</b> <b>₹{round(pts * active_delta * total_qty):+}</b>\n"
                             f"⏰ <b>Exit Time:</b> {row['dt'].strftime('%H:%M')}"
                         )
                         send_telegram_alert(exit_msg)
@@ -556,28 +634,19 @@ for session_date, day_df in grouped:
                             session_trade["current_sl"] = min(session_trade["current_sl"], target_sl)
                             session_trade["trail_stage"] = f"SHELF {s_idx+1} CLEARED ({s_level:.1f}) -> TRAIL LOCK"
 
-                # Runner Mode: Trail 5-minute bar highs after all major shelves are crossed
                 if session_trade["current_shelf_idx"] >= len(shelves):
                     bar_trail = round(h + 3.0, 1)
                     session_trade["current_sl"] = min(session_trade["current_sl"], bar_trail)
                     session_trade["trail_stage"] = f"MAX RUNNER MODE (Bar High Trail: {session_trade['current_sl']:.1f})"
 
-                # Mobile Alert Dispatcher for Trailing Stop Updates
                 if session_date == latest_session_date:
                     last_alerted = st.session_state.notified_sl_map.get("current_sl")
                     if session_trade["current_sl"] != last_alerted:
-                        pts_locked = round(entry - session_trade["current_sl"], 1)
-                        alert_msg = (
-                            f"🔔 <b>NIFTY PE TRAILING SL UPDATED</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━\n"
-                            f"📉 <b>Entry:</b> {entry:.1f}\n"
-                            f"🛡️ <b>New Stop:</b> <b>{session_trade['current_sl']:.1f}</b>\n"
-                            f"🔒 <b>Secured Points:</b> {pts_locked:+.1f} pts\n"
-                            f"📍 <b>Status:</b> {session_trade['trail_stage']}\n"
-                            f"🎯 <b>Max Target:</b> {session_trade['tp_final']:.1f}\n"
-                            f"⏰ <b>Time:</b> {row['dt'].strftime('%H:%M')}"
+                        full_card_msg = format_telegram_table_card(
+                            "🔔 <b>NIFTY PE TRAILING SL UPDATED</b>",
+                            session_trade, c, live_real_ltp, active_delta, total_qty
                         )
-                        send_telegram_alert(alert_msg)
+                        send_telegram_alert(full_card_msg)
                         st.session_state.notified_sl_map["current_sl"] = session_trade["current_sl"]
 
                 if h >= session_trade["current_sl"] or (c > ema and c > o and c > (day_orb_l + 3.0)):
@@ -592,9 +661,10 @@ for session_date, day_df in grouped:
                     if session_date == latest_session_date and not st.session_state.notified_sl_map.get("exit_sent"):
                         exit_msg = (
                             f"🏁 <b>TRADE CLOSED (NIFTY PE)</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━\n"
-                            f"🚪 <b>Exit Price:</b> {exit_p:.1f}\n"
-                            f"💰 <b>Final P&L:</b> <b>{pts:+.1f} pts</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"🚪 <b>Exit Spot:</b> {exit_p:.1f}\n"
+                            f"💰 <b>Final Net Spot:</b> <b>{pts:+.1f} pts</b>\n"
+                            f"💵 <b>Final Net Option:</b> <b>₹{round(pts * active_delta * total_qty):+}</b>\n"
                             f"⏰ <b>Exit Time:</b> {row['dt'].strftime('%H:%M')}"
                         )
                         send_telegram_alert(exit_msg)
@@ -652,15 +722,10 @@ for session_date, day_df in grouped:
                     trade_executed_in_latest_session = True
                     alarm_signal_triggered = True
 
-                    # Initial Trade Entry Alert
-                    entry_msg = (
-                        f"🚀 <b>NIFTY TRADE TRIGGERED: BUY CE</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📈 <b>Entry:</b> {c:.1f}\n"
-                        f"🛑 <b>Initial SL:</b> {init_sl:.1f} (-{risk:.1f} pts)\n"
-                        f"🎯 <b>Shelf 1:</b> {shelves[0]:.1f}\n"
-                        f"🏆 <b>Max Run Target:</b> <b>{shelves[-1]:.1f}</b>\n"
-                        f"⏰ <b>Time:</b> {row['dt'].strftime('%H:%M')}"
+                    # Initial Full Table Entry Alert
+                    entry_msg = format_telegram_table_card(
+                        "🚀 <b>NIFTY TRADE TRIGGERED: BUY CE</b>",
+                        session_trade, c, live_real_ltp, active_delta, total_qty
                     )
                     send_telegram_alert(entry_msg)
 
@@ -712,15 +777,10 @@ for session_date, day_df in grouped:
                     trade_executed_in_latest_session = True
                     alarm_signal_triggered = True
 
-                    # Initial Trade Entry Alert
-                    entry_msg = (
-                        f"🚀 <b>NIFTY TRADE TRIGGERED: BUY PE</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📉 <b>Entry:</b> {c:.1f}\n"
-                        f"🛑 <b>Initial SL:</b> {init_sl:.1f} (-{risk:.1f} pts)\n"
-                        f"🎯 <b>Shelf 1:</b> {shelves[0]:.1f}\n"
-                        f"🏆 <b>Max Run Target:</b> <b>{shelves[-1]:.1f}</b>\n"
-                        f"⏰ <b>Time:</b> {row['dt'].strftime('%H:%M')}"
+                    # Initial Full Table Entry Alert
+                    entry_msg = format_telegram_table_card(
+                        "🚀 <b>NIFTY TRADE TRIGGERED: BUY PE</b>",
+                        session_trade, c, live_real_ltp, active_delta, total_qty
                     )
                     send_telegram_alert(entry_msg)
 
@@ -1139,7 +1199,6 @@ html_code = f"""
             }}, 2000);
         }}
 
-        // Smooth Panning and Scalable Lightweight Chart
         const chartContainer = document.getElementById('chartArea');
         const chart = LightweightCharts.createChart(chartContainer, {{
             width: chartContainer.clientWidth,
@@ -1213,7 +1272,6 @@ html_code = f"""
         }});
         volumeSeries.setData({volume_json});
 
-        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
         const vwapSeries = chart.addLineSeries({{
             color: '#ab47bc',
             lineWidth: 2,
@@ -1223,7 +1281,6 @@ html_code = f"""
         }});
         vwapSeries.setData({vwap_json});
 
-        // 2 DOTS REMOVED: crosshairMarkerVisible set to false
         const emaSeries = chart.addLineSeries({{
             color: '#2962ff',
             lineWidth: 1,
@@ -1251,7 +1308,6 @@ html_code = f"""
             candleSeries.createPriceLine({{ price: pv.PDL, color: '#fb8c00', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'PDL' }});
         }}
 
-        // Dynamic Fibonacci ORB Extension Reference Lines
         const fibs = {fibs_json};
         if (fibs && fibs.fib_100) {{
             candleSeries.createPriceLine({{ price: fibs.fib_100, color: '#ffd600', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'EXT 100%' }});
@@ -1259,7 +1315,6 @@ html_code = f"""
             candleSeries.createPriceLine({{ price: fibs.fib_261, color: '#ff6d00', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: 'EXT 261.8% (MAX)' }});
         }}
 
-        // Expiry Specific OI Resistance & Support Lines
         candleSeries.createPriceLine({{ price: {oi_res_strike}, color: '#e91e63', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'OI RES' }});
         candleSeries.createPriceLine({{ price: {oi_sup_strike}, color: '#00e676', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: 'OI SUP' }});
 
@@ -1375,79 +1430,6 @@ html_code = f"""
             }}
         }}
 
-        function refreshAllPositionWidgets() {{
-            activePositionWidgets.forEach(w => renderSinglePosWidget(w));
-        }}
-
-        function resizeWidgetTgt(e, id) {{
-            e.stopPropagation();
-            const wObj = activePositionWidgets.find(w => w.id === id);
-            if (!wObj) return;
-            const startY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
-            const origTgt = wObj.tgtPts;
-            function onMove(ev) {{
-                const curY = ev.type.includes('touch') ? ev.touches[0].clientY : ev.clientY;
-                wObj.tgtPts = Math.max(10.0, origTgt + (wObj.type === 'LONG' ? (startY - curY) * 0.9 : (curY - startY) * 0.9));
-                renderSinglePosWidget(wObj);
-            }}
-            function onUp() {{
-                window.removeEventListener('mousemove', onMove);
-                window.removeEventListener('mouseup', onUp);
-                window.removeEventListener('touchmove', onMove);
-                window.removeEventListener('touchend', onUp);
-            }}
-            window.addEventListener('mousemove', onMove);
-            window.addEventListener('mouseup', onUp);
-            window.addEventListener('touchmove', onMove, {{ passive: true }});
-            window.addEventListener('touchend', onUp);
-        }}
-
-        function resizeWidgetSL(e, id) {{
-            e.stopPropagation();
-            const wObj = activePositionWidgets.find(w => w.id === id);
-            if (!wObj) return;
-            const startY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
-            const origSL = wObj.slPts;
-            function onMove(ev) {{
-                const curY = ev.type.includes('touch') ? ev.touches[0].clientY : ev.clientY;
-                wObj.slPts = Math.max(8.0, origSL + (wObj.type === 'LONG' ? (curY - startY) * 0.9 : (startY - curY) * 0.9));
-                renderSinglePosWidget(wObj);
-            }}
-            function onUp() {{
-                window.removeEventListener('mousemove', onMove);
-                window.removeEventListener('mouseup', onUp);
-                window.removeEventListener('touchmove', onMove);
-                window.removeEventListener('touchend', onUp);
-            }}
-            window.addEventListener('mousemove', onMove);
-            window.addEventListener('mouseup', onUp);
-            window.addEventListener('touchmove', onMove, {{ passive: true }});
-            window.addEventListener('touchend', onUp);
-        }}
-
-        function startMovePosEntry(e, id) {{
-            e.stopPropagation();
-            const wObj = activePositionWidgets.find(w => w.id === id);
-            if (!wObj) return;
-            const startY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
-            const elem = wObj.domElem;
-            const origTop = parseFloat(elem.style.top);
-            function onMove(ev) {{
-                const curY = ev.type.includes('touch') ? ev.touches[0].clientY : ev.clientY;
-                elem.style.top = (origTop + (curY - startY)) + 'px';
-            }}
-            function onUp() {{
-                window.removeEventListener('mousemove', onMove);
-                window.removeEventListener('mouseup', onUp);
-                window.removeEventListener('touchmove', onMove);
-                window.removeEventListener('touchend', onUp);
-            }}
-            window.addEventListener('mousemove', onMove);
-            window.addEventListener('mouseup', onUp);
-            window.addEventListener('touchmove', onMove, {{ passive: true }});
-            window.addEventListener('touchend', onUp);
-        }}
-
         function spawnTwoPointFibRetrace(pt1, pt2) {{
             toolCounter++;
             const pHigh = Math.max(pt1.price, pt2.price);
@@ -1548,7 +1530,7 @@ html_code = f"""
                             <tr>
                                 <th>Parameter</th>
                                 <th>Index (Spot)</th>
-                                <th>Option ({sel_strike} {sel_type})</th>
+                                <th>Option ({active_strike} {sel_type})</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -1708,4 +1690,3 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
-
