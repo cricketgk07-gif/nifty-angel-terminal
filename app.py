@@ -263,7 +263,7 @@ if len(unique_dates) >= 2:
 atm_strike = int(round(spot_price / 50.0) * 50)
 strikes_list = [atm_strike + (x * 50) for x in range(-20, 21)]
 
-# Expiry Filter: Automatically skip same-day expiry to prevent rapid time decay
+# Expiry Filter: Excludes same-day expiry to eliminate excessive theta decay
 today_dt = datetime.datetime.now(IST).date()
 available_expiries = []
 
@@ -278,7 +278,7 @@ if not nfo_df.empty:
 if not available_expiries:
     available_expiries = ["CURRENT"]
 
-# Top Header Controls
+# Top Header Layout
 ctrl_cols = st.columns([1.1, 1.2, 1.3, 0.7, 0.7, 4.0])
 
 with ctrl_cols[0]:
@@ -311,7 +311,7 @@ exp_slice = nfo_df[nfo_df["expiry"] == sel_expiry] if not nfo_df.empty else pd.D
 exp_date_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_dt
 days_to_expiry = max((exp_date_val - today_dt).days, 1)
 
-# Fast Single-Call Option Fetch
+# Single-Call Option Quote Resolver
 active_strike = sel_strike
 live_real_ltp = 0.0
 target_symbol = ""
@@ -330,7 +330,6 @@ def fetch_option_ltp(sym, tok):
 
 if not nfo_df.empty:
     if mode_selection == "Budget (< ₹80)":
-        # Jump directly to 100-150 pts OTM without spamming the API
         offset_steps = 2 if days_to_expiry <= 2 else 3
         if sel_type == "CE":
             active_strike = atm_strike + (offset_steps * 50)
@@ -347,7 +346,6 @@ if not nfo_df.empty:
             target_token = str(match.iloc[0]["token"])
             live_real_ltp = fetch_option_ltp(target_symbol, target_token)
     else:
-        # ATM Mode
         active_strike = sel_strike
         match = nfo_df[
             (nfo_df["strike_num"] == float(active_strike)) &
@@ -465,6 +463,7 @@ def build_dynamic_shelves(entry_p, t_type, pv_dict, oi_target, atr_v, sw_h, sw_l
 
 def format_telegram_table_card(header_title, trade, spot_c, opt_ltp, delta_val, qty):
     is_ce = trade["type"] == "CE"
+    t_type = trade["type"]
     entry_p = trade["entry"]
     trail_p = trade["current_sl"]
     secured_pts = round(trail_p - entry_p, 1) if is_ce else round(entry_p - trail_p, 1)
@@ -492,10 +491,14 @@ def format_telegram_table_card(header_title, trade, spot_c, opt_ltp, delta_val, 
     opt_trail_price = max(0.5, round(opt_ltp + opt_trail_diff, 1))
     secured_pnl_inr = int(opt_trail_diff * qty)
 
+    contract_name = target_symbol if target_symbol else f"NIFTY {active_strike} {t_type}"
+    trail_stage_text = trade["trail_stage"]
+    time_str = datetime.datetime.now(IST).strftime("%H:%M:%S")
+
     msg = (
         f"{header_title}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>CONTRACT:</b> {target_symbol or f'NIFTY {active_strike} {trade[\"type\"]}'}\n"
+        f"<b>CONTRACT:</b> {contract_name}\n"
         f"<b>QUANTITY:</b> {qty} (Delta: {delta_val:.2f})\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Parameter | Spot | Option (₹)</b>\n"
@@ -506,9 +509,9 @@ def format_telegram_table_card(header_title, trade, spot_c, opt_ltp, delta_val, 
         f"• <b>Target Max:</b> {trade['tp_final']:.1f} | <b>₹{opt_final_price:.2f}</b> (+₹{final_profit_inr})\n"
         f"• <b>Trailing SL:</b> {trail_p:.1f} | <b>₹{opt_trail_price:.2f}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🛡️ <b>Trail Mode:</b> {trade['trail_stage']}\n"
+        f"🛡️ <b>Trail Mode:</b> {trail_stage_text}\n"
         f"💰 <b>Secured P&L:</b> <b>{secured_pts:+.1f} pts (₹{secured_pnl_inr:+})</b>\n"
-        f"⏰ <b>Time:</b> {datetime.datetime.now(IST).strftime('%H:%M:%S')}"
+        f"⏰ <b>Time:</b> {time_str}"
     )
     return msg
 
@@ -1404,75 +1407,6 @@ html_code = f"""
                 activePositionWidgets[idx].domElem.remove();
                 activePositionWidgets.splice(idx, 1);
             }}
-        }}
-
-        function resizeWidgetTgt(e, id) {{
-            e.stopPropagation();
-            const wObj = activePositionWidgets.find(w => w.id === id);
-            if (!wObj) return;
-            const startY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
-            const origTgt = wObj.tgtPts;
-            function onMove(ev) {{
-                const curY = ev.type.includes('touch') ? ev.touches[0].clientY : ev.clientY;
-                wObj.tgtPts = Math.max(10.0, origTgt + (wObj.type === 'LONG' ? (startY - curY) * 0.9 : (curY - startY) * 0.9));
-                renderSinglePosWidget(wObj);
-            }}
-            function onUp() {{
-                window.removeEventListener('mousemove', onMove);
-                window.removeEventListener('mouseup', onUp);
-                window.removeEventListener('touchmove', onMove);
-                window.removeEventListener('touchend', onUp);
-            }}
-            window.addEventListener('mousemove', onMove);
-            window.addEventListener('mouseup', onUp);
-            window.addEventListener('touchmove', onMove, {{ passive: true }});
-            window.addEventListener('touchend', onUp);
-        }}
-
-        function resizeWidgetSL(e, id) {{
-            e.stopPropagation();
-            const wObj = activePositionWidgets.find(w => w.id === id);
-            if (!wObj) return;
-            const startY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
-            const origSL = wObj.slPts;
-            function onMove(ev) {{
-                const curY = ev.type.includes('touch') ? ev.touches[0].clientY : ev.clientY;
-                wObj.slPts = Math.max(8.0, origSL + (wObj.type === 'LONG' ? (curY - startY) * 0.9 : (startY - curY) * 0.9));
-                renderSinglePosWidget(wObj);
-            }}
-            function onUp() {{
-                window.removeEventListener('mousemove', onMove);
-                window.removeEventListener('mouseup', onUp);
-                window.removeEventListener('touchmove', onMove);
-                window.removeEventListener('touchend', onUp);
-            }}
-            window.addEventListener('mousemove', onMove);
-            window.addEventListener('mouseup', onUp);
-            window.addEventListener('touchmove', onMove, {{ passive: true }});
-            window.addEventListener('touchend', onUp);
-        }}
-
-        function startMovePosEntry(e, id) {{
-            e.stopPropagation();
-            const wObj = activePositionWidgets.find(w => w.id === id);
-            if (!wObj) return;
-            const startY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
-            const elem = wObj.domElem;
-            const origTop = parseFloat(elem.style.top);
-            function onMove(ev) {{
-                const curY = ev.type.includes('touch') ? ev.touches[0].clientY : ev.clientY;
-                elem.style.top = (origTop + (curY - startY)) + 'px';
-            }}
-            function onUp() {{
-                window.removeEventListener('mousemove', onMove);
-                window.removeEventListener('mouseup', onUp);
-                window.removeEventListener('touchmove', onMove);
-                window.removeEventListener('touchend', onUp);
-            }}
-            window.addEventListener('mousemove', onMove);
-            window.addEventListener('mouseup', onUp);
-            window.addEventListener('touchmove', onMove, {{ passive: true }});
-            window.addEventListener('touchend', onUp);
         }}
 
         function spawnTwoPointFibRetrace(pt1, pt2) {{
