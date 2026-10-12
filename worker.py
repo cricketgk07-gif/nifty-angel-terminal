@@ -79,7 +79,7 @@ def send_telegram_alert(message: str):
         "disable_web_page_preview": True,
     }
     try:
-        r = requests.post(url, json=payload, timeout=8)
+        r = requests.post(url, json=payload, timeout=6)
         print(f"[Telegram Response {r.status_code}]: {r.text}")
         return r.status_code == 200
     except Exception as e:
@@ -96,6 +96,22 @@ def push_to_redis(key, data_obj):
         requests.post(url, headers=headers, data=json.dumps(data_obj), timeout=3)
     except Exception as e:
         print(f"Redis write error: {e}")
+
+
+def read_from_redis(key="nifty_live_state"):
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return None
+    url = f"{UPSTASH_REDIS_REST_URL}/get/{key}"
+    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
+    try:
+        r = requests.get(url, headers=headers, timeout=2)
+        if r.status_code == 200:
+            val = r.json().get("result")
+            if val:
+                return json.loads(val)
+    except Exception:
+        pass
+    return None
 
 
 def get_dynamic_budget():
@@ -115,86 +131,7 @@ def get_dynamic_budget():
 
 
 # ==========================================
-# 3. Boot Verification Test (Ordered Sequence with Explicit Dates)
-# ==========================================
-def fire_immediate_boot_verification():
-    """Demonstrates chronological order: Entry -> Trail Cost -> Trail Ratchet -> Exit with exact date."""
-    now_dt = datetime.datetime.now(IST)
-    date_str = now_dt.strftime("%d-%b-%Y (%A)")
-    time_str = now_dt.strftime("%H:%M:%S")
-
-    # 1. Trigger Entry Alert
-    send_telegram_alert(
-        f"🚀 <b>ORB BREAKDOWN TRIGGERED: BUY PE</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>CONTRACT:</b> NIFTY 22350 PE\n"
-        f"<b>MODE:</b> Budget (&lt; ₹80) | <b>QTY:</b> {LOT_SIZE_QTY} (Δ: 0.50)\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>LEVEL | INDEX (SPOT) | OPTION (₹)</b>\n"
-        f"• <b>ENTRY:</b> 22512.0 | <b>₹75.00</b>\n"
-        f"• <b>STOP LOSS:</b> 22532.0 (-20.0 pts) | <b>₹65.00</b> (-₹650)\n"
-        f"• <b>TARGET 1:</b> 22472.0 (+40.0 pts) | <b>₹95.00</b> (+₹1300)\n"
-        f"• <b>TARGET 2:</b> 22437.0 (+75.0 pts) | <b>₹112.50</b> (+₹2437)\n"
-        f"• <b>TARGET 3:</b> 22392.0 (+120.0 pts) | <b>₹135.00</b> (+₹3900)\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🛡 <b>Initial SL:</b> Spot: 22532.0 | Option: ₹65.00\n"
-        f"📅 <b>Session Date:</b> {date_str}\n"
-        f"⏰ <b>Trigger Time:</b> {time_str}"
-    )
-
-    time.sleep(2)
-
-    # 2. First Trail Alert: Moved to Cost / Break-Even
-    send_telegram_alert(
-        f"🔔 <b>NIFTY PE TRAILING SL UPDATED (TARGET 1 MET)</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>CONTRACT:</b> NIFTY 22350 PE (Qty: {LOT_SIZE_QTY})\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🛡 <b>SET STOP LOSS (GTT) TO:</b>\n"
-        f"• <b>INDEX (SPOT):</b> 22510.0\n"
-        f"• <b>OPTION (GTT ₹):</b> ₹76.00\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔒 <b>LOCKED PROFIT:</b> +2.0 pts (+₹65) [COST LOCKED]\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 <b>NEXT HURDLE:</b> Target 2: 22437.0\n"
-        f"📍 <b>Status:</b> RISK FREE RUNNER\n"
-        f"📅 <b>Date:</b> {date_str} | ⏰ <b>Time:</b> {time_str}"
-    )
-
-    time.sleep(2)
-
-    # 3. Second Trail Alert: Ratcheted Higher
-    send_telegram_alert(
-        f"🔔 <b>NIFTY PE TRAILING SL UPDATED (RATCHETED HIGHER)</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>CONTRACT:</b> NIFTY 22350 PE (Qty: {LOT_SIZE_QTY})\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🛡 <b>UPDATE STOP LOSS (GTT) TO:</b>\n"
-        f"• <b>INDEX (SPOT):</b> 22452.0\n"
-        f"• <b>OPTION (GTT ₹):</b> ₹105.00\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔒 <b>LOCKED PROFIT:</b> +60.0 pts (+₹1950)\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 <b>PEAK REACHED:</b> 22437.0 (Cushion: 15 pts)\n"
-        f"📍 <b>Status:</b> RUNNER TIGHTENED (Targeting Extreme: 22392.0)\n"
-        f"📅 <b>Date:</b> {date_str} | ⏰ <b>Time:</b> {time_str}"
-    )
-
-    time.sleep(2)
-
-    # 4. Exit Alert
-    send_telegram_alert(
-        f"🏁 <b>TRADE CLOSED (NIFTY PE - STOP HIT)</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🚪 <b>Exit Price (Spot):</b> 22452.0\n"
-        f"💰 <b>Final Net Spot:</b> +60.0 pts\n"
-        f"💵 <b>Final Net Option:</b> +₹1950\n"
-        f"📅 <b>Date:</b> {date_str} | ⏰ <b>Exit Time:</b> {time_str}"
-    )
-
-
-# ==========================================
-# 4. Dedicated Strategy Engine
+# 3. Strategy Core Engine
 # ==========================================
 class DedicatedTradingWorker:
     def __init__(self):
@@ -207,13 +144,15 @@ class DedicatedTradingWorker:
         self.candles = []
         self.active_bar = None
         self.today = datetime.datetime.now(IST).date()
-        self.locked_trade = None
         self.markers = []
         self.history_cards = {}
         self.pivot_lines = {}
         self.fib_lines = {}
         self.orb_levels = {}
         self.hud_data = {}
+
+        saved_state = read_from_redis("nifty_live_state")
+        self.locked_trade = saved_state.get("locked_trade") if saved_state else None
 
         self.nfo_df = self.load_scrip_master()
         self.init_historical_candles()
@@ -385,6 +324,7 @@ class DedicatedTradingWorker:
         self.history_cards = {}
         last_found_trade = None
 
+        # Rigorous bar-by-bar backtest to verify if trades survived or hit their Stop Loss
         for d_str, day_df in df_h.groupby("date_str"):
             ow = day_df[(day_df["dt"].dt.time >= datetime.time(9, 15)) & (day_df["dt"].dt.time < datetime.time(9, 30))]
             if len(ow) < 3:
@@ -392,16 +332,30 @@ class DedicatedTradingWorker:
 
             d_h = float(ow["high"].max())
             d_l = float(ow["low"].min())
-            executed = False
+            sim_trade = None
 
             for idx in range(len(day_df)):
                 r = day_df.iloc[idx]
                 t = r["dt"].time()
                 c = float(r["close"])
+                h_bar = float(r["high"])
+                l_bar = float(r["low"])
                 vw = float(r["vwap"])
                 em = float(r["ema9"])
 
-                if datetime.time(9, 30) <= t <= datetime.time(11, 30) and not executed:
+                # Check if active simulated trade hit stop-loss FIRST
+                if sim_trade and not sim_trade.get("closed"):
+                    if sim_trade["type"] == "CE" and l_bar <= sim_trade["sl"]:
+                        sim_trade["closed"] = True
+                        sim_trade["outcome"] = "STOP HIT (LOSS)"
+                        sim_trade["exit_price"] = sim_trade["sl"]
+                    elif sim_trade["type"] == "PE" and h_bar >= sim_trade["sl"]:
+                        sim_trade["closed"] = True
+                        sim_trade["outcome"] = "STOP HIT (LOSS)"
+                        sim_trade["exit_price"] = sim_trade["sl"]
+
+                # Entry trigger condition
+                if datetime.time(9, 30) <= t <= datetime.time(11, 30) and not sim_trade:
                     if c > d_h and c > vw and c > em:
                         sl_val = round(float(r["low"]) - 5.0, 1)
                         t_list = self.compute_all_confluence_targets(df_h.iloc[:idx+1], c, is_ce=True)
@@ -414,7 +368,7 @@ class DedicatedTradingWorker:
                             "shape": "arrowUp",
                             "text": f"BUY CE @ {c:.1f}",
                         })
-                        card = {
+                        sim_trade = {
                             "title": "BUY CE (ORB BREAKOUT)",
                             "entry": round(c, 1),
                             "sl": sl_val,
@@ -423,11 +377,12 @@ class DedicatedTradingWorker:
                             "time_str": r["dt"].strftime("%H:%M"),
                             "date": d_str,
                             "date_readable": r["dt"].strftime("%d-%b-%Y (%A)"),
+                            "closed": False,
+                            "outcome": "ACTIVE / RUNNING",
                         }
-                        self.history_cards[str(t_sec)] = card
-                        self.history_cards[t_sec] = card
-                        last_found_trade = card
-                        executed = True
+                        self.history_cards[str(t_sec)] = sim_trade
+                        self.history_cards[t_sec] = sim_trade
+                        last_found_trade = sim_trade
 
                     elif c < d_l and c < vw and c < em:
                         sl_val = round(float(r["high"]) + 5.0, 1)
@@ -441,7 +396,7 @@ class DedicatedTradingWorker:
                             "shape": "arrowDown",
                             "text": f"BUY PE @ {c:.1f}",
                         })
-                        card = {
+                        sim_trade = {
                             "title": "BUY PE (ORB BREAKDOWN)",
                             "entry": round(c, 1),
                             "sl": sl_val,
@@ -450,27 +405,30 @@ class DedicatedTradingWorker:
                             "time_str": r["dt"].strftime("%H:%M"),
                             "date": d_str,
                             "date_readable": r["dt"].strftime("%d-%b-%Y (%A)"),
+                            "closed": False,
+                            "outcome": "ACTIVE / RUNNING",
                         }
-                        self.history_cards[str(t_sec)] = card
-                        self.history_cards[t_sec] = card
-                        last_found_trade = card
-                        executed = True
+                        self.history_cards[str(t_sec)] = sim_trade
+                        self.history_cards[t_sec] = sim_trade
+                        last_found_trade = sim_trade
 
         last_close = float(self.candles[-1]["close"])
         active_t = self.locked_trade
 
         if not active_t and last_found_trade and last_found_trade["date"] == unique_days[-1]:
+            # If the trade already hit its SL on that day, display the stop hit state
             active_t = {
                 "type": last_found_trade["type"],
                 "entry": last_found_trade["entry"],
                 "init_sl": last_found_trade["sl"],
-                "current_sl": last_found_trade["sl"],
+                "current_sl": last_found_trade.get("exit_price", last_found_trade["sl"]),
                 "last_alerted_sl": last_found_trade["sl"],
                 "targets": last_found_trade["targets"],
                 "symbol": f"NIFTY {int(round(last_found_trade['entry'] / 50.0) * 50)} {last_found_trade['type']}",
                 "delta": 0.50,
                 "opt_entry_ltp": 75.0,
                 "date_readable": last_found_trade.get("date_readable", str(self.today)),
+                "closed": last_found_trade.get("closed", False),
             }
 
         if active_t:
@@ -533,6 +491,7 @@ class DedicatedTradingWorker:
             "trail_opt": max(0.5, round(opt_entry + (secured_pts * delta_v), 2)),
             "secured_pts": secured_pts,
             "date_readable": active_t.get("date_readable", str(self.today)) if active_t else str(self.today),
+            "trade_closed": active_t.get("closed", False) if active_t else False,
         }
 
     def fetch_option_ltp(self, sym, tok):
@@ -746,6 +705,11 @@ class DedicatedTradingWorker:
                 )
 
     def evaluate_live_trail_and_exit(self, live_spot):
+        """
+        STRICT EXECUTION ORDER:
+        1. Check Stop-Loss FIRST. If price crossed current_sl -> EXIT IMMEDIATELY AS STOP HIT.
+        2. Evaluate targets and trailing updates ONLY if stop loss is untouched.
+        """
         if not self.locked_trade or self.locked_trade.get("closed"):
             return
 
@@ -760,6 +724,31 @@ class DedicatedTradingWorker:
         t_now = datetime.datetime.now(IST).strftime("%H:%M:%S")
         date_readable = tr.get("date_readable", datetime.datetime.now(IST).strftime("%d-%b-%Y (%A)"))
 
+        # =================================================================
+        # CRITICAL FIX STEP 1: EVALUATE STOP-LOSS HIT BEFORE UPDATING TRAILS
+        # =================================================================
+        stop_hit = (live_spot <= tr["current_sl"]) if is_ce else (live_spot >= tr["current_sl"])
+        if stop_hit:
+            tr["closed"] = True
+            exit_spot = tr["current_sl"]
+            final_pts = round((exit_spot - entry_p) if is_ce else (entry_p - exit_spot), 1)
+            final_inr = int(round(final_pts * delta_v * LOT_SIZE_QTY))
+            sign = "+" if final_pts >= 0 else ""
+            
+            # Send accurate Stop Hit Alert (displays actual loss if stopped out)
+            send_telegram_alert(
+                f"🏁 <b>TRADE CLOSED (NIFTY {tr['type']} - STOP HIT)</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🚪 <b>Exit Price (Spot):</b> {exit_spot:.1f}\n"
+                f"💰 <b>Final Net Spot:</b> {sign}{final_pts:.1f} pts\n"
+                f"💵 <b>Final Net Option:</b> ₹{sign}{final_inr}\n"
+                f"📅 <b>Date:</b> {date_readable} | ⏰ <b>Exit Time:</b> {t_now}"
+            )
+            return
+
+        # =================================================================
+        # STEP 2: EVALUATE TARGETS & TRAILS ONLY WHEN ACTIVE AND UNSTOPPED
+        # =================================================================
         if is_ce:
             tr["peak_extreme"] = max(tr.get("peak_extreme", entry_p), live_spot)
             peak_gain = tr["peak_extreme"] - entry_p
@@ -770,7 +759,7 @@ class DedicatedTradingWorker:
         sl_updated = False
         update_reason = ""
 
-        # Step 1: Milestone Target Crossings
+        # Check Milestone Target Crossings
         for idx, tg_p in enumerate(targets, start=1):
             if current_stage < idx:
                 crossed = (live_spot >= tg_p) if is_ce else (live_spot <= tg_p)
@@ -789,7 +778,7 @@ class DedicatedTradingWorker:
                         update_reason = f"TARGET {idx} MET"
                         sl_updated = True
 
-        # Step 2: Progressive Ratchet (Runs when peak gain >= 60 pts)
+        # Progressive Dynamic Ratchet (Runs when peak gain >= 60 pts)
         if peak_gain >= 60.0:
             cushion = max(10.0, 0.75 * atr_val) if peak_gain >= 90.0 else max(13.0, 1.00 * atr_val)
 
@@ -819,7 +808,7 @@ class DedicatedTradingWorker:
                     update_reason = f"RATCHETED HIGHER (PEAK: {tr['peak_extreme']:.1f})"
                     sl_updated = True
 
-        # DISPATCH TRAILING SL ALERT (Before Stop Hit)
+        # DISPATCH TRAILING SL ALERT (Fires whenever SL changes)
         last_alerted = tr.get("last_alerted_sl", tr["init_sl"])
         if sl_updated or abs(tr["current_sl"] - last_alerted) >= 4.0:
             tr["last_alerted_sl"] = tr["current_sl"]
@@ -842,23 +831,6 @@ class DedicatedTradingWorker:
                 f"🔒 <b>LOCKED PROFIT:</b> {sign}{locked_pts:.1f} pts (₹{sign}{locked_inr})\n"
                 f"📍 <b>Status:</b> RUNNER TIGHTENED\n"
                 f"📅 <b>Date:</b> {date_readable} | ⏰ <b>Time:</b> {t_now}"
-            )
-
-        # Step 3: Exit Condition (Breaches Active Trailed Stop)
-        stop_hit = (live_spot <= tr["current_sl"]) if is_ce else (live_spot >= tr["current_sl"])
-        if stop_hit:
-            tr["closed"] = True
-            exit_spot = tr["current_sl"]
-            final_pts = round((exit_spot - entry_p) if is_ce else (entry_p - exit_spot), 1)
-            final_inr = int(round(final_pts * delta_v * LOT_SIZE_QTY))
-            sign = "+" if final_pts >= 0 else ""
-            send_telegram_alert(
-                f"🏁 <b>TRADE CLOSED (NIFTY {tr['type']} - STOP HIT)</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🚪 <b>Exit Price (Spot):</b> {exit_spot:.1f}\n"
-                f"💰 <b>Final Net Spot:</b> {sign}{final_pts:.1f} pts\n"
-                f"💵 <b>Final Net Option:</b> ₹{sign}{final_inr}\n"
-                f"📅 <b>Date:</b> {date_readable} | ⏰ <b>Exit Time:</b> {t_now}"
             )
 
     def sync_state(self, live_ltp):
@@ -908,17 +880,12 @@ class DedicatedTradingWorker:
 
 
 # ==========================================
-# 5. Resilient Worker Loop
+# 4. Resilient Worker Loop
 # ==========================================
 def run_worker():
-    try:
-        fire_immediate_boot_verification()
-    except Exception as e:
-        print(f"Boot test notice: {e}")
-
     while True:
         try:
-            print("Initializing Dedicated Trading Worker...")
+            print("Initializing Dedicated Trading Worker in LIVE PRODUCTION MODE...")
             engine = DedicatedTradingWorker()
             sws = SmartWebSocketV2(engine.auth_token, API_KEY, CLIENT_CODE, engine.feed_token)
 
