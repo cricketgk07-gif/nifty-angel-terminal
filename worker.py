@@ -53,8 +53,19 @@ threading.Thread(target=run_ping_server, daemon=True).start()
 
 
 # ==========================================
-# 2. Redis & Telegram Helpers
+# 2. Redis, Math & Telegram Helpers
 # ==========================================
+def norm_cdf(x):
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+
+def compute_contract_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
+    tau = max(days_to_exp / 365.0, 0.001)
+    d1 = (math.log(s / k) + (r + 0.5 * iv ** 2) * tau) / (iv * math.sqrt(tau))
+    ce_delta = norm_cdf(d1)
+    return round(ce_delta if is_ce else (1.0 - ce_delta), 2)
+
+
 def send_telegram_alert(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -116,7 +127,6 @@ class DedicatedTradingWorker:
         self.nfo_df = self.load_scrip_master()
         self.init_historical_candles()
 
-        # Immediate push so dashboard loads even outside market hours
         if self.candles:
             self.sync_state(self.candles[-1]["close"])
 
@@ -183,13 +193,20 @@ class DedicatedTradingWorker:
         opt_type = "CE" if is_ce else "PE"
 
         if self.nfo_df.empty:
-            return atm, f"NIFTY {atm} {opt_type}", ""
+            return atm, f"NIFTY {atm} {opt_type}", "", 0.50, 4
 
-        future_exp = self.nfo_df[self.nfo_df["exp_dt"].dt.date >= self.today].sort_values("exp_dt")
+        # Strictly skip today's expiry (exp_dt > self.today) to prevent 0DTE decay
+        future_exp = self.nfo_df[self.nfo_df["exp_dt"].dt.date > self.today].sort_values("exp_dt")
         if future_exp.empty:
-            return atm, f"NIFTY {atm} {opt_type}", ""
+            # Fallback if no next-week expiries found in current file
+            future_exp = self.nfo_df[self.nfo_df["exp_dt"].dt.date >= self.today].sort_values("exp_dt")
+
+        if future_exp.empty:
+            return atm, f"NIFTY {atm} {opt_type}", "", 0.50, 4
+
         curr_exp = future_exp["expiry"].iloc[0]
         exp_slice = future_exp[future_exp["expiry"] == curr_exp]
+        days_to_exp = max(1, (exp_slice.iloc[0]["exp_dt"].date() - self.today).days)
 
         candidates = []
         for offset in range(-5, 6):
@@ -202,12 +219,20 @@ class DedicatedTradingWorker:
                 if ltp > 0:
                     candidates.append((k, sym, tok, ltp))
 
+        chosen_strike = atm
+        chosen_sym = f"NIFTY {atm} {opt_type}"
+        chosen_tok = ""
+
         valid = [c for c in candidates if c[3] <= budget_target + 8.0]
         if valid:
             valid.sort(key=lambda x: abs(x[3] - budget_target))
-            return valid[0][0], valid[0][1], valid[0][2]
+            chosen_strike, chosen_sym, chosen_tok = valid[0][0], valid[0][1], valid[0][2]
+        elif candidates:
+            candidates.sort(key=lambda x: abs(x[3] - budget_target))
+            chosen_strike, chosen_sym, chosen_tok = candidates[0][0], candidates[0][1], candidates[0][2]
 
-        return atm, f"NIFTY {atm} {opt_type}", ""
+        delta = compute_contract_delta(spot_ref, chosen_strike, days_to_exp, is_ce=is_ce)
+        return chosen_strike, chosen_sym, chosen_tok, delta, days_to_exp
 
     def on_tick(self, ltp):
         now = datetime.datetime.now(IST)
@@ -252,12 +277,21 @@ class DedicatedTradingWorker:
 
         if datetime.time(9, 30) < t <= datetime.time(10, 30) and not self.locked_trade:
             if close_p > orb_h:
-                strike, sym, tok = self.find_budget_strike(close_p, is_ce=True)
+                strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=True)
                 init_sl = round(last_c["low"] - 5.0, 1)
                 opt_ltp = self.fetch_option_ltp(sym, tok) if tok else 0.0
+                if opt_ltp <= 0.0:
+                    diff = max(0.0, close_p - strike)
+                    opt_ltp = max(1.5, round(diff + (math.sqrt(days_exp) * 22.0) - (abs(close_p - strike) * 0.08), 2))
+
                 risk_pts = round(close_p - init_sl, 1)
-                delta_est = 0.50
-                opt_sl = max(0.5, round(opt_ltp - (risk_pts * delta_est), 1))
+                opt_sl = max(0.5, round(opt_ltp - (risk_pts * delta), 1))
+                t1_p = round(close_p + 40.0, 1)
+                tmid_p = round(close_p + 70.0, 1)
+                tfinal_p = round(close_p + 110.0, 1)
+                opt_t1 = round(opt_ltp + (40.0 * delta), 1)
+                opt_tmid = round(opt_ltp + (70.0 * delta), 1)
+                opt_tfinal = round(opt_ltp + (110.0 * delta), 1)
 
                 self.locked_trade = {
                     "type": "CE",
@@ -265,33 +299,49 @@ class DedicatedTradingWorker:
                     "entry": close_p,
                     "init_sl": init_sl,
                     "current_sl": init_sl,
-                    "tp1": round(close_p + 40.0, 1),
-                    "tp_mid": round(close_p + 70.0, 1),
-                    "tp_final": round(close_p + 110.0, 1),
+                    "tp1": t1_p,
+                    "tp_mid": tmid_p,
+                    "tp_final": tfinal_p,
                     "closed": False,
                     "symbol": sym,
                     "token": tok,
+                    "delta": delta,
                     "opt_entry_ltp": opt_ltp,
                     "time": last_c["time"],
                 }
+
+                total_qty = LOT_SIZE_QTY
                 send_telegram_alert(
                     f"🚀 <b>ORB BREAKOUT TRIGGERED: BUY {sym}</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"• <b>ENTRY (Spot):</b> <b>{close_p:.1f}</b> | <b>Option:</b> ₹{opt_ltp:.2f}\n"
-                    f"• <b>STOP LOSS:</b> <b>{init_sl:.1f}</b> (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b>\n"
-                    f"• <b>TARGET 1:</b> <b>{close_p + 40.0:.1f}</b> (+40.0 pts)\n"
-                    f"• <b>TARGET MID:</b> <b>{close_p + 70.0:.1f}</b> (+70.0 pts)\n"
-                    f"• <b>TARGET MAX:</b> <b>{close_p + 110.0:.1f}</b> (+110.0 pts)\n"
-                    f"⏰ <b>Time:</b> {last_c['dt'].strftime('%H:%M:%S')}"
+                    f"<b>CONTRACT:</b> {sym} (Δ: {delta:.2f})\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"<b>LEVEL | INDEX (SPOT) | OPTION (₹)</b>\n"
+                    f"• <b>ENTRY:</b> {close_p:.1f} | <b>₹{opt_ltp:.2f}</b>\n"
+                    f"• <b>STOP LOSS:</b> {init_sl:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b> (-₹{int(round(risk_pts * delta * total_qty))})\n"
+                    f"• <b>TARGET 1:</b> {t1_p:.1f} (+40.0 pts) | <b>₹{opt_t1:.2f}</b> (+₹{int(round(40.0 * delta * total_qty))})\n"
+                    f"• <b>TARGET MID:</b> {tmid_p:.1f} (+70.0 pts) | <b>₹{opt_tmid:.2f}</b>\n"
+                    f"• <b>TARGET MAX:</b> {tfinal_p:.1f} (+110.0 pts) | <b>₹{opt_tfinal:.2f}</b> (+₹{int(round(110.0 * delta * total_qty))})\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"⏰ <b>Trigger Time:</b> {last_c['dt'].strftime('%H:%M:%S')}"
                 )
 
             elif close_p < orb_l:
-                strike, sym, tok = self.find_budget_strike(close_p, is_ce=False)
+                strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=False)
                 init_sl = round(last_c["high"] + 5.0, 1)
                 opt_ltp = self.fetch_option_ltp(sym, tok) if tok else 0.0
+                if opt_ltp <= 0.0:
+                    diff = max(0.0, strike - close_p)
+                    opt_ltp = max(1.5, round(diff + (math.sqrt(days_exp) * 22.0) - (abs(strike - close_p) * 0.08), 2))
+
                 risk_pts = round(init_sl - close_p, 1)
-                delta_est = 0.50
-                opt_sl = max(0.5, round(opt_ltp - (risk_pts * delta_est), 1))
+                opt_sl = max(0.5, round(opt_ltp - (risk_pts * delta), 1))
+                t1_p = round(close_p - 40.0, 1)
+                tmid_p = round(close_p - 70.0, 1)
+                tfinal_p = round(close_p - 110.0, 1)
+                opt_t1 = round(opt_ltp + (40.0 * delta), 1)
+                opt_tmid = round(opt_ltp + (70.0 * delta), 1)
+                opt_tfinal = round(opt_ltp + (110.0 * delta), 1)
 
                 self.locked_trade = {
                     "type": "PE",
@@ -299,34 +349,53 @@ class DedicatedTradingWorker:
                     "entry": close_p,
                     "init_sl": init_sl,
                     "current_sl": init_sl,
-                    "tp1": round(close_p - 40.0, 1),
-                    "tp_mid": round(close_p - 70.0, 1),
-                    "tp_final": round(close_p - 110.0, 1),
+                    "tp1": t1_p,
+                    "tp_mid": tmid_p,
+                    "tp_final": tfinal_p,
                     "closed": False,
                     "symbol": sym,
                     "token": tok,
+                    "delta": delta,
                     "opt_entry_ltp": opt_ltp,
                     "time": last_c["time"],
                 }
+
+                total_qty = LOT_SIZE_QTY
                 send_telegram_alert(
                     f"🚀 <b>ORB BREAKDOWN TRIGGERED: BUY {sym}</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"• <b>ENTRY (Spot):</b> <b>{close_p:.1f}</b> | <b>Option:</b> ₹{opt_ltp:.2f}\n"
-                    f"• <b>STOP LOSS:</b> <b>{init_sl:.1f}</b> (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b>\n"
-                    f"• <b>TARGET 1:</b> <b>{close_p - 40.0:.1f}</b> (+40.0 pts)\n"
-                    f"• <b>TARGET MID:</b> <b>{close_p - 70.0:.1f}</b> (+70.0 pts)\n"
-                    f"• <b>TARGET MAX:</b> <b>{close_p - 110.0:.1f}</b> (+110.0 pts)\n"
-                    f"⏰ <b>Time:</b> {last_c['dt'].strftime('%H:%M:%S')}"
+                    f"<b>CONTRACT:</b> {sym} (Δ: {delta:.2f})\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"<b>LEVEL | INDEX (SPOT) | OPTION (₹)</b>\n"
+                    f"• <b>ENTRY:</b> {close_p:.1f} | <b>₹{opt_ltp:.2f}</b>\n"
+                    f"• <b>STOP LOSS:</b> {init_sl:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b> (-₹{int(round(risk_pts * delta * total_qty))})\n"
+                    f"• <b>TARGET 1:</b> {t1_p:.1f} (+40.0 pts) | <b>₹{opt_t1:.2f}</b> (+₹{int(round(40.0 * delta * total_qty))})\n"
+                    f"• <b>TARGET MID:</b> {tmid_p:.1f} (+70.0 pts) | <b>₹{opt_tmid:.2f}</b>\n"
+                    f"• <b>TARGET MAX:</b> {tfinal_p:.1f} (+110.0 pts) | <b>₹{opt_tfinal:.2f}</b> (+₹{int(round(110.0 * delta * total_qty))})\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"⏰ <b>Trigger Time:</b> {last_c['dt'].strftime('%H:%M:%S')}"
                 )
 
         if self.locked_trade and not self.locked_trade.get("closed"):
             trade = self.locked_trade
             if trade["type"] == "CE" and last_c["low"] <= trade["current_sl"]:
                 trade["closed"] = True
-                send_telegram_alert(f"🏁 <b>STOP HIT: {trade['symbol']} CLOSED @ {trade['current_sl']:.1f}</b>")
+                pts = round(trade["current_sl"] - trade["entry"], 1)
+                opt_gain = round(pts * trade.get("delta", 0.50), 1)
+                send_telegram_alert(
+                    f"🏁 <b>STOP HIT: {trade['symbol']} CLOSED</b>\n"
+                    f"• <b>Exit Spot:</b> {trade['current_sl']:.1f} ({pts:+.1f} pts)\n"
+                    f"• <b>Option Gain:</b> ₹{opt_gain:+.2f} per qty"
+                )
             elif trade["type"] == "PE" and last_c["high"] >= trade["current_sl"]:
                 trade["closed"] = True
-                send_telegram_alert(f"🏁 <b>STOP HIT: {trade['symbol']} CLOSED @ {trade['current_sl']:.1f}</b>")
+                pts = round(trade["entry"] - trade["current_sl"], 1)
+                opt_gain = round(pts * trade.get("delta", 0.50), 1)
+                send_telegram_alert(
+                    f"🏁 <b>STOP HIT: {trade['symbol']} CLOSED</b>\n"
+                    f"• <b>Exit Spot:</b> {trade['current_sl']:.1f} ({pts:+.1f} pts)\n"
+                    f"• <b>Option Gain:</b> ₹{opt_gain:+.2f} per qty"
+                )
 
     def sync_state(self, live_ltp):
         opt_ltp = 0.0
