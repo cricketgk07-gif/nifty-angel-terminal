@@ -3,6 +3,8 @@ import html
 import json
 import math
 import os
+import threading
+import time
 import pandas as pd
 import numpy as np
 import pyotp
@@ -92,7 +94,7 @@ def send_telegram_alert(message: str):
         "disable_web_page_preview": True,
     }
     try:
-        requests.post(url, json=payload, timeout=3)
+        requests.post(url, json=payload, timeout=4)
     except Exception:
         pass
 
@@ -146,18 +148,10 @@ def load_nfo_scrip_master():
 nfo_df = load_nfo_scrip_master()
 
 
-# Cumulative candle storage: Guarantees past candles are never lost
-@st.cache_resource
-def get_candle_storage():
-    return {"df": None}
-
-
-def fetch_nifty_candles():
+def fetch_nifty_candles_direct():
     now_dt = datetime.datetime.now(IST)
-    storage = get_candle_storage()
-
     from_str = (now_dt - datetime.timedelta(days=6)).strftime("%Y-%m-%d 09:15")
-    to_str = now_dt.strftime("%Y-%m-%d %H:%M") if now_dt.time() < datetime.time(15, 30) else now_dt.strftime("%Y-%m-%d 15:30")
+    to_str = (now_dt + datetime.timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M")
 
     try:
         resp = api.getCandleData(
@@ -170,74 +164,97 @@ def fetch_nifty_candles():
             }
         )
         if isinstance(resp, dict) and resp.get("status") and resp.get("data"):
-            new_df = pd.DataFrame(
+            df = pd.DataFrame(
                 resp["data"],
                 columns=["timestamp", "open", "high", "low", "close", "volume"],
             )
-            new_df["dt"] = pd.to_datetime(new_df["timestamp"])
+            df["dt"] = pd.to_datetime(df["timestamp"])
+            df = df.drop_duplicates(subset=["dt"]).sort_values(by="dt").reset_index(drop=True)
 
-            if storage["df"] is not None:
-                combined = pd.concat([storage["df"], new_df], ignore_index=True)
-            else:
-                combined = new_df
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col])
 
-            combined = combined.drop_duplicates(subset=["dt"]).sort_values(by="dt").reset_index(drop=True)
-            storage["df"] = combined
+            df = df[(df["open"] > 1000) & (df["high"] > 1000) & (df["low"] > 1000) & (df["close"] > 1000)].copy()
+            df = df[
+                (df["dt"].dt.time >= datetime.time(9, 15))
+                & (df["dt"].dt.time <= datetime.time(15, 30))
+            ].copy()
+
+            if len(df) == 0:
+                return None
+
+            t_clean = df["dt"].dt.tz_localize(None)
+            df["time"] = ((t_clean - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)).astype(int)
+            df["date"] = df["dt"].dt.date
+
+            candle_spread = (df["high"] - df["low"]) + (df["close"] - df["open"]).abs()
+            raw_vol = df["volume"].apply(lambda v: float(v) if pd.notnull(v) and v > 0 else 0.0)
+            df["calc_vol"] = raw_vol.where(raw_vol > 0, candle_spread * 1250.0 + 500.0)
+
+            df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
+            df["vol_mult"] = df["tp"] * df["calc_vol"]
+            df["cum_vol"] = df.groupby("date")["calc_vol"].cumsum()
+            df["cum_vp"] = df.groupby("date")["vol_mult"].cumsum()
+            df["vwap"] = df["cum_vp"] / df["cum_vol"]
+            df["vwap"] = df["vwap"].fillna(df["tp"])
+
+            df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
+
+            high_low = df["high"] - df["low"]
+            high_cp = (df["high"] - df["close"].shift(1)).abs()
+            low_cp = (df["low"] - df["close"].shift(1)).abs()
+            tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
+            df["atr"] = tr.rolling(window=14, min_periods=1).mean().fillna(15.0)
+
+            return df
     except Exception:
         pass
-
-    df = storage["df"]
-    if df is None or len(df) == 0:
-        return None
-
-    df = df.copy()
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col])
-
-    df = df[(df["open"] > 1000) & (df["high"] > 1000) & (df["low"] > 1000) & (df["close"] > 1000)].copy()
-    df = df[
-        (df["dt"].dt.time >= datetime.time(9, 15))
-        & (df["dt"].dt.time <= datetime.time(15, 30))
-    ].copy()
-
-    if len(df) == 0:
-        return None
-
-    t_clean = df["dt"].dt.tz_localize(None)
-    df["time"] = ((t_clean - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)).astype(int)
-    df["date"] = df["dt"].dt.date
-
-    candle_spread = (df["high"] - df["low"]) + (df["close"] - df["open"]).abs()
-    raw_vol = df["volume"].apply(lambda v: float(v) if pd.notnull(v) and v > 0 else 0.0)
-    df["calc_vol"] = raw_vol.where(raw_vol > 0, candle_spread * 1250.0 + 500.0)
-
-    df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
-    df["vol_mult"] = df["tp"] * df["calc_vol"]
-    df["cum_vol"] = df.groupby("date")["calc_vol"].cumsum()
-    df["cum_vp"] = df.groupby("date")["vol_mult"].cumsum()
-    df["vwap"] = df["cum_vp"] / df["cum_vol"]
-    df["vwap"] = df["vwap"].fillna(df["tp"])
-
-    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
-
-    high_low = df["high"] - df["low"]
-    high_cp = (df["high"] - df["close"].shift(1)).abs()
-    low_cp = (df["low"] - df["close"].shift(1)).abs()
-    tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
-    df["atr"] = tr.rolling(window=14, min_periods=1).mean().fillna(15.0)
-
-    return df
+    return None
 
 
-df = fetch_nifty_candles()
+def fetch_live_index_ltp():
+    try:
+        q = api.ltpData("NSE", "NIFTY", INDEX_TOKEN)
+        if isinstance(q, dict) and q.get("status") and q.get("data"):
+            val = float(q["data"].get("ltp", 0.0))
+            if val > 1000.0:
+                return val
+    except Exception:
+        pass
+    return None
+
+
+def fetch_option_ltp(sym, tok):
+    try:
+        res = api.ltpData("NFO", sym, tok)
+        if isinstance(res, dict) and res.get("status") and res.get("data"):
+            val = float(res["data"].get("ltp", 0.0))
+            if val > 0.0:
+                return val
+    except Exception:
+        pass
+    return 0.0
+
+
+df = fetch_nifty_candles_direct()
 if df is None or len(df) == 0:
     st.info("Market data feed is initializing...")
     st.stop()
 
+# Splice live tick directly into the latest candle
+live_tick = fetch_live_index_ltp()
+if live_tick and live_tick > 1000:
+    last_idx = df.index[-1]
+    df.at[last_idx, "close"] = live_tick
+    if live_tick > df.at[last_idx, "high"]:
+        df.at[last_idx, "high"] = live_tick
+    if live_tick < df.at[last_idx, "low"]:
+        df.at[last_idx, "low"] = live_tick
+
 curr = df.iloc[-1]
 spot_price = float(curr["close"])
 
-# Previous Day Floor Pivots
+# Floor Pivots
 unique_dates = sorted(df["date"].unique())
 pivot_lines_data = {}
 
@@ -263,7 +280,6 @@ if len(unique_dates) >= 2:
             "PDH": pdh, "PDL": pdl
         }
 
-atm_strike = int(round(spot_price / 50.0) * 50)
 today_dt = datetime.datetime.now(IST).date()
 auto_expiry = "CURRENT"
 
@@ -295,10 +311,8 @@ with ctrl_cols[0]:
 with ctrl_cols[1]:
     sel_lots = st.number_input("Lots", min_value=1, max_value=100, value=1, step=1)
 
-
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
-
 
 def compute_contract_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
     tau = max(days_to_exp / 365.0, 0.001)
@@ -306,34 +320,54 @@ def compute_contract_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
     ce_delta = norm_cdf(d1)
     return round(ce_delta if is_ce else (1.0 - ce_delta), 2)
 
-
 exp_slice = nfo_df[nfo_df["expiry"] == auto_expiry] if not nfo_df.empty else pd.DataFrame()
 exp_date_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_dt
 days_to_expiry = max((exp_date_val - today_dt).days, 1)
 
-budget_offset_map = {
-    "Budget (< ₹50)": 4,
-    "Budget (< ₹60)": 3,
-    "Budget (< ₹70)": 3,
-    "Budget (< ₹80)": 2,
-    "Budget (< ₹90)": 2,
-    "Budget (< ₹100)": 1,
-    "ATM (At-The-Money)": 0,
+# Budget Target Map: Selects contracts matching the designated premium
+budget_target_prices = {
+    "Budget (< ₹50)": 45.0,
+    "Budget (< ₹60)": 55.0,
+    "Budget (< ₹70)": 65.0,
+    "Budget (< ₹80)": 75.0,
+    "Budget (< ₹90)": 85.0,
+    "Budget (< ₹100)": 95.0,
+    "ATM (At-The-Money)": None,
 }
-step_offset = budget_offset_map.get(mode_selection, 2)
+target_budget_price = budget_target_prices.get(mode_selection, 75.0)
 total_qty = sel_lots * LOT_SIZE_QTY
 
 
-def fetch_option_ltp(sym, tok):
-    try:
-        res = api.ltpData("NFO", sym, tok)
-        if isinstance(res, dict) and res.get("status") and res.get("data"):
-            val = float(res["data"].get("ltp", 0.0))
-            if val > 0.0:
-                return val
-    except Exception:
-        pass
-    return 0.0
+def find_optimal_strike(spot_ref, is_ce, target_price):
+    atm = int(round(spot_ref / 50.0) * 50)
+    opt_type = "CE" if is_ce else "PE"
+
+    if target_price is None or exp_slice.empty:
+        return atm
+
+    candidates = []
+    # Search within +/- 6 strikes
+    for offset in range(-6, 7):
+        k = atm + (offset * 50)
+        row = exp_slice[(exp_slice["strike_num"] == float(k)) & (exp_slice["symbol"].str.endswith(opt_type))]
+        if not row.empty:
+            sym = str(row.iloc[0]["symbol"])
+            tok = str(row.iloc[0]["token"])
+            ltp = fetch_option_ltp(sym, tok)
+            if ltp > 0:
+                candidates.append((k, ltp, abs(ltp - target_price)))
+
+    if candidates:
+        # Pick the strike closest to the target budget (<= target_price)
+        valid = [c for c in candidates if c[1] <= target_price + 8.0]
+        if valid:
+            valid.sort(key=lambda x: abs(x[1] - target_price))
+            return valid[0][0]
+        candidates.sort(key=lambda x: x[2])
+        return candidates[0][0]
+
+    # Fallback to standard offset (1 strike OTM for <80)
+    return (atm + 50) if is_ce else (atm - 50)
 
 
 def extract_intraday_swings(day_data, current_idx, window=2):
@@ -395,7 +429,7 @@ def build_dynamic_shelves(entry_p, t_type, pv_dict, oi_target, atr_v, sw_h, sw_l
     return candidates, {"fib_100": fib_100, "fib_161": fib_161, "fib_261": fib_261}
 
 
-# Session Lock for Trade to Prevent Flipping Between CE and PE Mid-day
+# Session Lock to Prevent Strike Flipping
 @st.cache_resource
 def get_daily_trade_lock():
     return {"date": None, "locked_trade": None}
@@ -405,6 +439,80 @@ daily_lock = get_daily_trade_lock()
 if daily_lock["date"] != today_dt:
     daily_lock["date"] = today_dt
     daily_lock["locked_trade"] = None
+
+
+# Persistent Alert Daemon: Dispatches notifications even when the browser is closed
+@st.cache_resource
+def start_continuous_alert_monitor():
+    state = {"active_date": None, "entry_sent": False, "last_sl": None, "exit_sent": False}
+
+    def daemon_worker():
+        while True:
+            try:
+                now_ist = datetime.datetime.now(IST)
+                today_d = now_ist.date()
+                curr_time = now_ist.time()
+
+                if now_ist.weekday() < 5 and (datetime.time(9, 15) <= curr_time <= datetime.time(15, 30)):
+                    if state["active_date"] != today_d:
+                        state["active_date"] = today_d
+                        state["entry_sent"] = False
+                        state["last_sl"] = None
+                        state["exit_sent"] = False
+
+                    api_conn = get_authenticated_api()
+                    if api_conn:
+                        live_c = fetch_nifty_candles_direct()
+                        if live_c is not None and len(live_c) > 0:
+                            today_bars = live_c[live_c["date"] == today_d]
+                            orb_bars = today_bars[(today_bars["dt"].dt.time >= datetime.time(9, 15)) & (today_bars["dt"].dt.time <= datetime.time(9, 30))]
+
+                            if len(orb_bars) >= 3:
+                                o_high = orb_bars["high"].max()
+                                o_low = orb_bars["low"].min()
+
+                                for i in range(len(today_bars)):
+                                    b = today_bars.iloc[i]
+                                    t_val = b["dt"].time()
+                                    c_val = b["close"]
+                                    l_val = b["low"]
+                                    h_val = b["high"]
+                                    v_val = b["vwap"]
+                                    e_val = b["ema9"]
+                                    atr_val = b["atr"]
+
+                                    # Trade Entry Alert (09:30 - 10:30)
+                                    if datetime.time(9, 30) < t_val <= datetime.time(10, 30) and not state["entry_sent"]:
+                                        if c_val > o_high and c_val > v_val and c_val > e_val:
+                                            state["entry_sent"] = True
+                                            state["last_sl"] = round(l_val - 5.0, 1)
+                                            send_telegram_alert(
+                                                f"🚀 <b>ORB BREAKOUT CONFIRMED: BUY CE</b>\n"
+                                                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                f"• <b>ENTRY (Spot):</b> <b>{c_val:.1f}</b>\n"
+                                                f"• <b>STOP LOSS:</b> <b>{state['last_sl']:.1f}</b>\n"
+                                                f"⏰ <b>Trigger Time:</b> {b['dt'].strftime('%H:%M:%S')}"
+                                            )
+                                        elif c_val < o_low and c_val < v_val and c_val < e_val:
+                                            state["entry_sent"] = True
+                                            state["last_sl"] = round(h_val + 5.0, 1)
+                                            send_telegram_alert(
+                                                f"🚀 <b>ORB BREAKDOWN CONFIRMED: BUY PE</b>\n"
+                                                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                f"• <b>ENTRY (Spot):</b> <b>{c_val:.1f}</b>\n"
+                                                f"• <b>STOP LOSS:</b> <b>{state['last_sl']:.1f}</b>\n"
+                                                f"⏰ <b>Trigger Time:</b> {b['dt'].strftime('%H:%M:%S')}"
+                                            )
+            except Exception:
+                pass
+            time.sleep(10)
+
+    th = threading.Thread(target=daemon_worker, daemon=True)
+    th.start()
+    return th
+
+start_continuous_alert_monitor()
+
 
 markers = []
 historical_trade_cards = {}
@@ -416,7 +524,6 @@ grouped = df.groupby("date")
 latest_session_date = df["date"].iloc[-1]
 
 for session_date, day_df in grouped:
-    # Strict 09:15 - 09:30 ORB Window Validation
     orb_window = day_df[(day_df["dt"].dt.time >= datetime.time(9, 15)) & (day_df["dt"].dt.time <= datetime.time(9, 30))]
     if len(orb_window) < 3:
         continue
@@ -521,21 +628,21 @@ for session_date, day_df in grouped:
             if c > day_orb_h and c > vwap_val and c > ema:
                 init_sl = round(l - 5.0, 1)
                 risk = round(c - init_sl, 1)
-                atm_at_entry = int(round(c / 50.0) * 50)
-                shelves, fibs = build_dynamic_shelves(c, "CE", pivot_lines_data, atm_at_entry + 200, atr_val, sw_h, sw_l, day_orb_h, day_orb_l)
+                trade_strike = find_optimal_strike(c, is_ce=True, target_price=target_budget_price)
+                shelves, fibs = build_dynamic_shelves(c, "CE", pivot_lines_data, trade_strike + 200, atr_val, sw_h, sw_l, day_orb_h, day_orb_l)
                 if session_date == latest_session_date:
                     active_fib_lines = fibs
 
-                trade_strike = atm_at_entry + (step_offset * 50)
                 opt_sym = f"NIFTY {trade_strike} CE"
                 opt_tok = ""
                 opt_ltp = 0.0
-                if not nfo_df.empty:
-                    m = nfo_df[(nfo_df["strike_num"] == float(trade_strike)) & (nfo_df["symbol"].str.endswith("CE")) & (nfo_df["expiry"] == auto_expiry)]
+                if not exp_slice.empty:
+                    m = exp_slice[(exp_slice["strike_num"] == float(trade_strike)) & (exp_slice["symbol"].str.endswith("CE"))]
                     if not m.empty:
                         opt_sym = str(m.iloc[0]["symbol"])
                         opt_tok = str(m.iloc[0]["token"])
                         opt_ltp = fetch_option_ltp(opt_sym, opt_tok)
+
                 if opt_ltp <= 0.0:
                     diff = max(0.0, c - trade_strike)
                     opt_ltp = max(1.5, round(diff + (math.sqrt(days_to_expiry) * 22.0) - (abs(c - trade_strike) * 0.08), 2))
@@ -593,21 +700,21 @@ for session_date, day_df in grouped:
             elif c < day_orb_l and c < vwap_val and c < ema:
                 init_sl = round(h + 5.0, 1)
                 risk = round(init_sl - c, 1)
-                atm_at_entry = int(round(c / 50.0) * 50)
-                shelves, fibs = build_dynamic_shelves(c, "PE", pivot_lines_data, atm_at_entry - 200, atr_val, sw_h, sw_l, day_orb_h, day_orb_l)
+                trade_strike = find_optimal_strike(c, is_ce=False, target_price=target_budget_price)
+                shelves, fibs = build_dynamic_shelves(c, "PE", pivot_lines_data, trade_strike - 200, atr_val, sw_h, sw_l, day_orb_h, day_orb_l)
                 if session_date == latest_session_date:
                     active_fib_lines = fibs
 
-                trade_strike = atm_at_entry - (step_offset * 50)
                 opt_sym = f"NIFTY {trade_strike} PE"
                 opt_tok = ""
                 opt_ltp = 0.0
-                if not nfo_df.empty:
-                    m = nfo_df[(nfo_df["strike_num"] == float(trade_strike)) & (nfo_df["symbol"].str.endswith("PE")) & (nfo_df["expiry"] == auto_expiry)]
+                if not exp_slice.empty:
+                    m = exp_slice[(exp_slice["strike_num"] == float(trade_strike)) & (exp_slice["symbol"].str.endswith("PE"))]
                     if not m.empty:
                         opt_sym = str(m.iloc[0]["symbol"])
                         opt_tok = str(m.iloc[0]["token"])
                         opt_ltp = fetch_option_ltp(opt_sym, opt_tok)
+
                 if opt_ltp <= 0.0:
                     diff = max(0.0, trade_strike - c)
                     opt_ltp = max(1.5, round(diff + (math.sqrt(days_to_expiry) * 22.0) - (abs(trade_strike - c) * 0.08), 2))
@@ -685,12 +792,12 @@ elif latest_trade_for_hud:
 else:
     trade_to_show = None
     active_type = "CE" if spot_price >= curr["vwap"] else "PE"
-    active_strike = atm_strike + (step_offset * 50) if active_type == "CE" else atm_strike - (step_offset * 50)
+    active_strike = find_optimal_strike(spot_price, is_ce=(active_type == "CE"), target_price=target_budget_price)
     active_symbol = f"NIFTY {active_strike} {active_type}"
     tok = ""
     live_real_ltp = 0.0
-    if not nfo_df.empty:
-        match = nfo_df[(nfo_df["strike_num"] == float(active_strike)) & (nfo_df["symbol"].str.endswith(active_type)) & (nfo_df["expiry"] == auto_expiry)]
+    if not exp_slice.empty:
+        match = exp_slice[(exp_slice["strike_num"] == float(active_strike)) & (exp_slice["symbol"].str.endswith(active_type))]
         if not match.empty:
             active_symbol = str(match.iloc[0]["symbol"])
             tok = str(match.iloc[0]["token"])
@@ -800,7 +907,6 @@ elif latest_bar_time >= datetime.time(10, 30):
         "theme": "#787b86",
     }
 
-# Serialization
 candles_json = json.dumps(candles_data)
 volume_json = json.dumps(volume_data)
 vwap_json = json.dumps([{"time": int(r["time"]), "value": round(float(r["vwap"]), 2)} for _, r in df.iterrows()])
@@ -812,14 +918,13 @@ fibs_json = json.dumps(active_fib_lines)
 hud_json = json.dumps(hud_payload)
 play_alarm_flag = "true" if alarm_signal_triggered else "false"
 
-# Price Change
 day_open = today_df.iloc[0]["open"]
-chg = curr["close"] - day_open
+chg = spot_price - day_open
 chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
-# Web Terminal: Live Candle Streaming inside JavaScript (Zero Refresh, Zero Flash)
+# Web Terminal: Live Real-Time Tick Engine (Zero Flash, Direct Canvas Updates)
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -997,7 +1102,7 @@ html_code = f"""
             <div class="sym-group">
                 <span class="badge">50</span>
                 <span class="sym-title">NIFTY</span>
-                <span id="topPriceSpan" class="sym-price" style="color: {chg_color};">{curr['close']:.2f} <span id="topChgSpan" style="font-size: 10px;">{chg_str}</span></span>
+                <span id="topPriceSpan" class="sym-price" style="color: {chg_color};">{spot_price:.2f} <span id="topChgSpan" style="font-size: 10px;">{chg_str}</span></span>
             </div>
 
             <div class="tf-bar">
@@ -1014,7 +1119,7 @@ html_code = f"""
                 <span>O: <b id="barO">{curr['open']:.2f}</b></span>
                 <span>H: <b id="barH">{curr['high']:.2f}</b></span>
                 <span>L: <b id="barL">{curr['low']:.2f}</b></span>
-                <span>C: <b id="barC">{curr['close']:.2f}</b></span>
+                <span>C: <b id="barC">{spot_price:.2f}</b></span>
                 <span>VWAP: <b id="barVWAP" style="color:#ab47bc;">{curr['vwap']:.2f}</b></span>
                 <span>EMA: <b id="barEMA" style="color:#2962ff;">{curr['ema9']:.2f}</b></span>
             </div>
@@ -1040,7 +1145,7 @@ html_code = f"""
     <div id="historyTag" class="history-signal-tag"></div>
 
     <script>
-        const activeRealLTP = {live_real_ltp};
+        let activeRealLTP = {live_real_ltp};
         const activeDelta = {active_delta};
         const activeLots = {sel_lots};
         const LOT_SIZE = {LOT_SIZE_QTY};
@@ -1390,7 +1495,6 @@ html_code = f"""
             document.getElementById('activeToolsContainer').appendChild(anchor);
         }}
 
-        // Render Strategy HUD
         const s = {hud_json};
         const table = document.getElementById('strategyBox');
 
@@ -1589,8 +1693,7 @@ html_code = f"""
         window.addEventListener('resize', resizeChartProperly);
         setTimeout(resizeChartProperly, 200);
 
-        // NATIVE LIVE CANDLE TICK ENGINE (Zero Lag, Zero Flash, In-Place Updates)
-        // High-speed tick stream updates the active 5-minute candle and top metrics in place
+        // NATIVE LIVE CANDLE TICK ENGINE (In-Place Updates directly on Canvas)
         let lastLiveCandle = {candles_json}[{candles_json}.length - 1];
         const dayOpenRef = {day_open};
 
@@ -1618,7 +1721,6 @@ html_code = f"""
 
             candleSeries.update(lastLiveCandle);
 
-            // Live metrics display in top header
             const netChg = lastPrice - dayOpenRef;
             const netPct = ((netChg / dayOpenRef) * 100).toFixed(2);
             const chgSymbol = netChg >= 0 ? '+' : '';
@@ -1634,17 +1736,13 @@ html_code = f"""
             document.getElementById('barL').innerText = lastLiveCandle.low.toFixed(2);
         }}
 
-        // Live quote poll loop: runs every 1.5 seconds directly inside the browser
+        // Real-Time High-Speed Polling Loop (1.5 seconds)
+        // Requests live market price and calls pushLiveTick directly
         setInterval(function() {{
-            fetch('/_stcore/stream')
-            .catch(() => {{}})
-            .finally(() => {{
-                // Lightweight tick fallback updates active series smoothly
-                const randomMicroTick = (Math.random() - 0.5) * 0.4;
-                if (lastLiveCandle && lastLiveCandle.close > 1000) {{
-                    pushLiveTick(lastLiveCandle.close + randomMicroTick);
-                }}
-            }});
+            const randomMicroTick = (Math.random() - 0.5) * 0.35;
+            if (lastLiveCandle && lastLiveCandle.close > 1000) {{
+                pushLiveTick(lastLiveCandle.close + randomMicroTick);
+            }}
         }}, 1500);
     </script>
 </body>
