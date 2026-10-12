@@ -71,17 +71,6 @@ IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 LOT_SIZE_QTY = 65
 
 
-def norm_cdf(x):
-    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
-
-
-def compute_contract_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
-    tau = max(days_to_exp / 365.0, 0.001)
-    d1 = (math.log(s / k) + (r + 0.5 * iv ** 2) * tau) / (iv * math.sqrt(tau))
-    ce_delta = norm_cdf(d1)
-    return round(ce_delta if is_ce else (1.0 - ce_delta), 2)
-
-
 def read_from_redis(key="nifty_live_state"):
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
         return None
@@ -120,7 +109,7 @@ df = pd.DataFrame(raw_candles)
 df["dt"] = pd.to_datetime(df["time"], unit="s").dt.tz_localize("UTC").dt.tz_convert(IST)
 df["date"] = df["dt"].dt.date
 
-# VWAP & 9 EMA
+# Technical Indicators
 candle_spread = (df["high"] - df["low"]) + (df["close"] - df["open"]).abs()
 df["calc_vol"] = candle_spread * 1250.0 + 500.0
 df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
@@ -158,11 +147,6 @@ curr = df.iloc[-1]
 spot_price = float(live_state.get("ltp", curr["close"]))
 live_real_ltp = float(live_state.get("opt_ltp", 0.0))
 
-today_df = df[df["date"] == df["date"].iloc[-1]]
-today_orb = today_df[(today_df["dt"].dt.time >= datetime.time(9, 15)) & (today_df["dt"].dt.time <= datetime.time(9, 30))]
-curr_orb_h = today_orb["high"].max() if len(today_orb) > 0 else today_df.iloc[0:3]["high"].max()
-curr_orb_l = today_orb["low"].min() if len(today_orb) > 0 else today_df.iloc[0:3]["low"].min()
-
 ctrl_cols = st.columns([2.2, 0.9, 6.9])
 
 budget_map = {
@@ -188,70 +172,27 @@ with ctrl_cols[1]:
 
 total_qty = sel_lots * LOT_SIZE_QTY
 
-# Historical Scanner
-markers = []
-historical_trade_cards = {}
-detected_historical_trades = []
+# Markers and History directly supplied by Worker
+markers = live_state.get("markers", [])
+historical_trade_cards = live_state.get("history_cards", {})
 
-for session_date, day_df in df.groupby("date"):
-    orb_window = day_df[(day_df["dt"].dt.time >= datetime.time(9, 15)) & (day_df["dt"].dt.time <= datetime.time(9, 30))]
-    if len(orb_window) < 3:
-        continue
-    d_orb_h = orb_window["high"].max()
-    d_orb_l = orb_window["low"].min()
-    executed = False
+# Calculate Today's ORB Lines and Fibonacci Extensions
+latest_session_date = df["date"].iloc[-1]
+today_df = df[df["date"] == latest_session_date]
+today_orb = today_df[(today_df["dt"].dt.time >= datetime.time(9, 15)) & (today_df["dt"].dt.time <= datetime.time(9, 30))]
 
-    for idx, r in day_df.iterrows():
-        t = r["dt"].time()
-        c = r["close"]
-        if datetime.time(9, 30) <= t <= datetime.time(11, 30) and not executed:
-            if c > d_orb_h and c > r["vwap"] and c > r["ema9"]:
-                sl_val = round(r["low"] - 5.0, 1)
-                t_sec = int(r["time"])
-                markers.append({
-                    "time": t_sec,
-                    "position": "belowBar",
-                    "color": "#00bfa5",
-                    "shape": "arrowUp",
-                    "text": f"BUY CE @ {c:.1f}",
-                })
-                card_data = {
-                    "title": "BUY CE (ORB BREAKOUT)",
-                    "entry": round(c, 1),
-                    "target": round(c + 70.0, 1),
-                    "target_pts": 70.0,
-                    "sl": sl_val,
-                    "sl_pts": round(c - sl_val, 1),
-                    "type": "CE",
-                }
-                historical_trade_cards[t_sec] = card_data
-                detected_historical_trades.append(card_data)
-                executed = True
+curr_orb_h = float(today_orb["high"].max()) if len(today_orb) > 0 else float(today_df.iloc[0:3]["high"].max())
+curr_orb_l = float(today_orb["low"].min()) if len(today_orb) > 0 else float(today_df.iloc[0:3]["low"].min())
+orb_range_val = max(10.0, curr_orb_h - curr_orb_l)
 
-            elif c < d_orb_l and c < r["vwap"] and c < r["ema9"]:
-                sl_val = round(r["high"] + 5.0, 1)
-                t_sec = int(r["time"])
-                markers.append({
-                    "time": t_sec,
-                    "position": "aboveBar",
-                    "color": "#f23645",
-                    "shape": "arrowDown",
-                    "text": f"BUY PE @ {c:.1f}",
-                })
-                card_data = {
-                    "title": "BUY PE (ORB BREAKDOWN)",
-                    "entry": round(c, 1),
-                    "target": round(c - 70.0, 1),
-                    "target_pts": 70.0,
-                    "sl": sl_val,
-                    "sl_pts": round(sl_val - c, 1),
-                    "type": "PE",
-                }
-                historical_trade_cards[t_sec] = card_data
-                detected_historical_trades.append(card_data)
-                executed = True
-
+# Check if there is an active trade in worker or a detected trade today
 locked_trade = live_state.get("locked_trade")
+
+# Search history cards for today's trade if no live trade is active
+today_card = None
+for t_sec, card in historical_trade_cards.items():
+    if card.get("date") == str(latest_session_date):
+        today_card = card
 
 if locked_trade:
     t_type = locked_trade.get("type", "CE")
@@ -264,29 +205,29 @@ if locked_trade:
     strike_val = locked_trade.get("strike", int(round(entry_p / 50.0) * 50))
     active_symbol = locked_trade.get("symbol", f"NIFTY {strike_val} {t_type}")
     active_delta = float(locked_trade.get("delta", 0.50))
-elif len(detected_historical_trades) > 0:
-    last_hist = detected_historical_trades[-1]
-    t_type = last_hist["type"]
-    entry_p = float(last_hist["entry"])
-    sl_p = float(last_hist["sl"])
+elif today_card:
+    t_type = today_card["type"]
+    entry_p = float(today_card["entry"])
+    sl_p = float(today_card["sl"])
     trail_p = sl_p
-    t1_p = round(entry_p + 40.0 if t_type == "CE" else entry_p - 40.0, 1)
-    tmid_p = round(entry_p + 70.0 if t_type == "CE" else entry_p - 70.0, 1)
-    tfinal_p = float(last_hist["target"])
+    t1_p = float(today_card["target1"])
+    tmid_p = float(today_card["target_mid"])
+    tfinal_p = float(today_card["target_final"])
     strike_val = int(round(entry_p / 50.0) * 50)
     active_symbol = f"NIFTY {strike_val} {t_type}"
-    active_delta = compute_contract_delta(spot_price, strike_val, 4, is_ce=(t_type == "CE"))
+    active_delta = 0.50
 else:
+    # Awaiting ORB breakout today
     t_type = "CE" if spot_price >= curr["vwap"] else "PE"
-    entry_p = spot_price
-    sl_p = round(spot_price - 25.0 if t_type == "CE" else spot_price + 25.0, 1)
+    entry_p = curr_orb_h if t_type == "CE" else curr_orb_l
+    sl_p = round(curr_orb_l - 5.0 if t_type == "CE" else curr_orb_h + 5.0, 1)
     trail_p = sl_p
-    t1_p = round(spot_price + 40.0 if t_type == "CE" else spot_price - 40.0, 1)
-    tmid_p = round(spot_price + 70.0 if t_type == "CE" else spot_price - 70.0, 1)
-    tfinal_p = round(spot_price + 110.0 if t_type == "CE" else spot_price - 110.0, 1)
+    t1_p = round(curr_orb_h + (1.000 * orb_range_val) if t_type == "CE" else curr_orb_l - (1.000 * orb_range_val), 1)
+    tmid_p = round(curr_orb_h + (1.618 * orb_range_val) if t_type == "CE" else curr_orb_l - (1.618 * orb_range_val), 1)
+    tfinal_p = round(curr_orb_h + (2.618 * orb_range_val) if t_type == "CE" else curr_orb_l - (2.618 * orb_range_val), 1)
     strike_val = int(round(spot_price / 50.0) * 50)
     active_symbol = f"NIFTY {strike_val} {t_type}"
-    active_delta = compute_contract_delta(spot_price, strike_val, 4, is_ce=(t_type == "CE"))
+    active_delta = 0.50
 
 if live_real_ltp <= 0.0:
     live_real_ltp = 75.0
@@ -296,6 +237,18 @@ t1_pts = round(abs(t1_p - entry_p), 1)
 tmid_pts = round(abs(tmid_p - entry_p), 1)
 tfinal_pts = round(abs(tfinal_p - entry_p), 1)
 secured_pts = round(trail_p - entry_p, 1) if t_type == "CE" else round(entry_p - trail_p, 1)
+
+# Fibonacci Extension Lines for ORB Breakout
+if t_type == "CE":
+    fib_100 = round(curr_orb_h + (1.000 * orb_range_val), 1)
+    fib_161 = round(curr_orb_h + (1.618 * orb_range_val), 1)
+    fib_261 = round(curr_orb_h + (2.618 * orb_range_val), 1)
+else:
+    fib_100 = round(curr_orb_l - (1.000 * orb_range_val), 1)
+    fib_161 = round(curr_orb_l - (1.618 * orb_range_val), 1)
+    fib_261 = round(curr_orb_l - (2.618 * orb_range_val), 1)
+
+fibs_dict = {"fib_100": fib_100, "fib_161": fib_161, "fib_261": fib_261}
 
 with ctrl_cols[2]:
     st.markdown(
@@ -340,6 +293,7 @@ ema_json = json.dumps([{"time": int(r["time"]), "value": round(float(r["ema9"]),
 markers_json = json.dumps(markers)
 history_cards_json = json.dumps(historical_trade_cards)
 pivots_json = json.dumps(pivot_lines_data)
+fibs_json = json.dumps(fibs_dict)
 
 day_open = float(today_df.iloc[0]["open"])
 chg = spot_price - day_open
@@ -465,6 +419,31 @@ html_code = f"""
             padding: 5px 8px; font-size: 9.5px; color: #d1d4dc; line-height: 1.4;
             box-shadow: 0 4px 12px rgba(0,0,0,0.7); transform: translate(-50%, -100%);
         }}
+
+        .tv-widget-item {{
+            position: absolute; z-index: 55; user-select: none; touch-action: none;
+            font-family: sans-serif; border-radius: 4px; overflow: visible;
+            display: flex; flex-direction: column; width: 220px;
+        }}
+        .tv-pos-zone {{
+            position: relative; padding: 6px 8px; font-size: 9px;
+            display: flex; flex-direction: column; justify-content: center;
+        }}
+        .tv-pos-green {{ background: rgba(8, 153, 129, 0.40); border: 1.5px solid #089981; }}
+        .tv-pos-red {{ background: rgba(242, 54, 69, 0.40); border: 1.5px solid #f23645; }}
+        .tv-center-handle {{
+            position: absolute; left: 4px; width: 12px; height: 12px;
+            background: #2962ff; border: 2px solid #ffffff; border-radius: 50%;
+            cursor: move; touch-action: none; z-index: 68; top: -5px;
+        }}
+        .tv-del-btn {{
+            position: absolute; top: -9px; right: -9px; z-index: 70;
+            background: #1e222d; border: 1px solid #f23645; color: #f23645;
+            border-radius: 50%; width: 20px; height: 20px; font-size: 11px;
+            display: flex; align-items: center; justify-content: center; cursor: pointer;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.8); font-weight: 800;
+        }}
+        .chart-click-crosshair {{ cursor: crosshair !important; }}
     </style>
 </head>
 <body>
@@ -507,6 +486,7 @@ html_code = f"""
     </div>
 
     <div id="chartArea"></div>
+    <div id="activeToolsContainer"></div>
 
     <div id="strategyBox" class="draggable-strategy-box">
         <div class="box-drag-handle">::: STRATEGY HUD :::</div>
@@ -601,11 +581,22 @@ html_code = f"""
         const emaSeries = chart.addLineSeries({{ color: '#2962ff', lineWidth: 1, title: '9-EMA' }});
         emaSeries.setData({ema_json});
 
+        // Set Historical Breakout Markers straight from Worker
         candleSeries.setMarkers({markers_json});
 
+        // Current ORB Lines
         candleSeries.createPriceLine({{ price: {curr_orb_h:.2f}, color: '#089981', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, title: 'ORB HIGH' }});
         candleSeries.createPriceLine({{ price: {curr_orb_l:.2f}, color: '#f23645', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, title: 'ORB LOW' }});
 
+        // ORB Fibonacci Extensions
+        const fibs = {fibs_json};
+        if (fibs && fibs.fib_100) {{
+            candleSeries.createPriceLine({{ price: fibs.fib_100, color: '#ffd600', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dashed, title: 'EXT 100%' }});
+            candleSeries.createPriceLine({{ price: fibs.fib_161, color: '#00e5ff', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dashed, title: 'EXT 161.8%' }});
+            candleSeries.createPriceLine({{ price: fibs.fib_261, color: '#ff6d00', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Solid, title: 'EXT 261.8% (MAX)' }});
+        }}
+
+        // Floor Pivots
         const pv = {pivots_json};
         if (pv && pv.P) {{
             candleSeries.createPriceLine({{ price: pv.P, color: '#ffd600', lineWidth: 1.5, title: 'PIVOT (P)' }});
@@ -615,6 +606,174 @@ html_code = f"""
             candleSeries.createPriceLine({{ price: pv.PDL, color: '#fb8c00', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, title: 'PDL' }});
         }}
 
+        // ==========================================
+        // Interactive Drawing Tools System
+        // ==========================================
+        let toolCounter = 0;
+        let currentDrawMode = null;
+        let drawPoints = [];
+        const activePositionWidgets = [];
+
+        function activateDrawMode(mode) {{
+            currentDrawMode = mode;
+            drawPoints = [];
+            chartContainer.classList.add('chart-click-crosshair');
+            ['btnFibR', 'btnFibE', 'btnLong', 'btnShort'].forEach(b => document.getElementById(b).classList.remove('active-draw'));
+            if (mode === 'FIB_RETRACE') document.getElementById('btnFibR').classList.add('active-draw');
+            if (mode === 'FIB_EXT') document.getElementById('btnFibE').classList.add('active-draw');
+            if (mode === 'LONG') document.getElementById('btnLong').classList.add('active-draw');
+            if (mode === 'SHORT') document.getElementById('btnShort').classList.add('active-draw');
+        }}
+
+        function cancelDrawMode() {{
+            currentDrawMode = null;
+            drawPoints = [];
+            chartContainer.classList.remove('chart-click-crosshair');
+            ['btnFibR', 'btnFibE', 'btnLong', 'btnShort'].forEach(b => document.getElementById(b).classList.remove('active-draw'));
+        }}
+
+        chart.subscribeClick(param => {{
+            if (!currentDrawMode || !param.point) return;
+            const price = candleSeries.coordinateToPrice(param.point.y);
+            if (!price) return;
+            drawPoints.push({{ price: price, x: param.point.x, y: param.point.y }});
+
+            if (currentDrawMode === 'LONG' || currentDrawMode === 'SHORT') {{
+                spawnInteractivePositionWidget(currentDrawMode, price, param.point.x, param.point.y);
+                cancelDrawMode();
+            }} else if (currentDrawMode === 'FIB_RETRACE' && drawPoints.length === 2) {{
+                spawnTwoPointFibRetrace(drawPoints[0], drawPoints[1]);
+                cancelDrawMode();
+            }} else if (currentDrawMode === 'FIB_EXT' && drawPoints.length === 3) {{
+                spawnThreePointFibExtension(drawPoints[0], drawPoints[1], drawPoints[2]);
+                cancelDrawMode();
+            }}
+        }});
+
+        function spawnInteractivePositionWidget(type, entryPrice, clickX, clickY) {{
+            toolCounter++;
+            const wId = 'pos_w_' + toolCounter;
+            const wObj = {{ id: wId, type: type, entryPrice: entryPrice, tgtPts: 60.0, slPts: 25.0, domElem: null }};
+            const wElem = document.createElement('div');
+            wElem.className = 'tv-widget-item';
+            wElem.style.left = (clickX - 40) + 'px';
+            wElem.style.top = (clickY - 50) + 'px';
+            wObj.domElem = wElem;
+            activePositionWidgets.push(wObj);
+
+            renderSinglePosWidget(wObj);
+            makeDraggable(wElem);
+            document.getElementById('activeToolsContainer').appendChild(wElem);
+        }}
+
+        function renderSinglePosWidget(wObj) {{
+            const optTgtGain = Math.round((wObj.tgtPts * liveDelta) * 10) / 10;
+            const optStopLoss = Math.round((wObj.slPts * liveDelta) * 10) / 10;
+            const expectedProfit = Math.round(optTgtGain * activeQty);
+            const expectedLoss = Math.round(optStopLoss * activeQty);
+            const rr = (wObj.tgtPts / wObj.slPts).toFixed(2);
+
+            const pHeight = Math.max(30, Math.round(wObj.tgtPts * 1.5));
+            const lHeight = Math.max(26, Math.round(wObj.slPts * 1.5));
+
+            if (wObj.type === 'LONG') {{
+                wObj.domElem.innerHTML = `
+                    <div class="tv-del-btn" onclick="deletePosWidget('${{wObj.id}}')">✕</div>
+                    <div class="tv-pos-zone tv-pos-green" style="height:${{pHeight}}px;">
+                        <span style="font-weight:700; color:#fff;">Target: +${{wObj.tgtPts.toFixed(1)}} pts (₹${{expectedProfit}})</span>
+                        <span style="color:#d1d4dc;">Opt Tgt: ₹${{({live_real_ltp} + optTgtGain).toFixed(2)}} | 1:${{rr}}</span>
+                    </div>
+                    <div style="height:3px; background:#2962ff; position:relative;">
+                        <div class="tv-center-handle"></div>
+                    </div>
+                    <div class="tv-pos-zone tv-pos-red" style="height:${{lHeight}}px;">
+                        <span style="font-weight:700; color:#fff;">Stop: -${{wObj.slPts.toFixed(1)}} pts (₹${{expectedLoss}})</span>
+                        <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, {live_real_ltp} - optStopLoss).toFixed(2)}}</span>
+                    </div>
+                `;
+            }} else {{
+                wObj.domElem.innerHTML = `
+                    <div class="tv-del-btn" onclick="deletePosWidget('${{wObj.id}}')">✕</div>
+                    <div class="tv-pos-zone tv-pos-red" style="height:${{lHeight}}px;">
+                        <span style="font-weight:700; color:#fff;">Stop: -${{wObj.slPts.toFixed(1)}} pts (₹${{expectedLoss}})</span>
+                        <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, {live_real_ltp} - optStopLoss).toFixed(2)}}</span>
+                    </div>
+                    <div style="height:3px; background:#2962ff; position:relative;">
+                        <div class="tv-center-handle"></div>
+                    </div>
+                    <div class="tv-pos-zone tv-pos-green" style="height:${{pHeight}}px;">
+                        <span style="font-weight:700; color:#fff;">Target: +${{wObj.tgtPts.toFixed(1)}} pts (₹${{expectedProfit}})</span>
+                        <span style="color:#d1d4dc;">Opt Tgt: ₹${{({live_real_ltp} + optTgtGain).toFixed(2)}} | 1:${{rr}}</span>
+                    </div>
+                `;
+            }}
+        }}
+
+        function deletePosWidget(id) {{
+            const idx = activePositionWidgets.findIndex(w => w.id === id);
+            if (idx !== -1) {{
+                activePositionWidgets[idx].domElem.remove();
+                activePositionWidgets.splice(idx, 1);
+            }}
+        }}
+
+        function spawnTwoPointFibRetrace(pt1, pt2) {{
+            toolCounter++;
+            const pHigh = Math.max(pt1.price, pt2.price);
+            const pLow = Math.min(pt1.price, pt2.price);
+            const range = pHigh - pLow;
+            const levels = [
+                {{ p: pHigh, c: '#787b86', lbl: '0.0%' }},
+                {{ p: pHigh - (range * 0.236), c: '#f23645', lbl: '23.6%' }},
+                {{ p: pHigh - (range * 0.382), c: '#ff9800', lbl: '38.2%' }},
+                {{ p: pHigh - (range * 0.500), c: '#4caf50', lbl: '50.0%' }},
+                {{ p: pHigh - (range * 0.618), c: '#00bcd4', lbl: '61.8%' }},
+                {{ p: pHigh - (range * 0.786), c: '#2196f3', lbl: '78.6%' }},
+                {{ p: pLow, c: '#787b86', lbl: '100.0%' }}
+            ];
+            const lines = levels.map(lv => candleSeries.createPriceLine({{ price: lv.p, color: lv.c, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.SparseDotted, title: lv.lbl }}));
+
+            const anchor = document.createElement('div');
+            anchor.className = 'tv-widget-item';
+            anchor.style.left = Math.min(pt1.x, pt2.x) + 'px';
+            anchor.style.top = Math.min(pt1.y, pt2.y) + 'px';
+            anchor.style.background = '#1e222d';
+            anchor.style.border = '1px solid #ffd600';
+            anchor.style.padding = '4px 8px';
+            anchor.style.width = '140px';
+            anchor.innerHTML = `<div style="font-size:8.5px; color:#ffd600; font-weight:700;">Fib Retrace #${{toolCounter}}</div><div class="tv-del-btn">✕</div>`;
+            anchor.querySelector('.tv-del-btn').onclick = () => {{ lines.forEach(l => candleSeries.removePriceLine(l)); anchor.remove(); }};
+            makeDraggable(anchor);
+            document.getElementById('activeToolsContainer').appendChild(anchor);
+        }}
+
+        function spawnThreePointFibExtension(pt1, pt2, pt3) {{
+            toolCounter++;
+            const impulse = Math.abs(pt2.price - pt1.price);
+            const isUp = pt2.price >= pt1.price;
+            const levels = [
+                {{ p: isUp ? (pt3.price + impulse * 0.618) : (pt3.price - impulse * 0.618), lbl: 'Ext 61.8%', c: '#00e5ff' }},
+                {{ p: isUp ? (pt3.price + impulse * 1.000) : (pt3.price - impulse * 1.000), lbl: 'Ext 100.0%', c: '#ffd600' }},
+                {{ p: isUp ? (pt3.price + impulse * 1.272) : (pt3.price - impulse * 1.272), lbl: 'Ext 127.2%', c: '#00bfa5' }},
+                {{ p: isUp ? (pt3.price + impulse * 1.618) : (pt3.price - impulse * 1.618), lbl: 'Ext 161.8%', c: '#ff6d00' }}
+            ];
+            const lines = levels.map(lv => candleSeries.createPriceLine({{ price: lv.p, color: lv.c, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, title: lv.lbl }}));
+
+            const anchor = document.createElement('div');
+            anchor.className = 'tv-widget-item';
+            anchor.style.left = pt3.x + 'px';
+            anchor.style.top = pt3.y + 'px';
+            anchor.style.background = '#1e222d';
+            anchor.style.border = '1px solid #00bfa5';
+            anchor.style.padding = '4px 8px';
+            anchor.style.width = '140px';
+            anchor.innerHTML = `<div style="font-size:8.5px; color:#00bfa5; font-weight:700;">Fib Ext #${{toolCounter}}</div><div class="tv-del-btn">✕</div>`;
+            anchor.querySelector('.tv-del-btn').onclick = () => {{ lines.forEach(l => candleSeries.removePriceLine(l)); anchor.remove(); }};
+            makeDraggable(anchor);
+            document.getElementById('activeToolsContainer').appendChild(anchor);
+        }}
+
+        // Tooltip Hover on Breakout Candle
         const historyCards = {history_cards_json};
         const hTag = document.getElementById('historyTag');
 
@@ -641,11 +800,13 @@ html_code = f"""
                 const tagColor = sig.type === 'CE' ? '#00bfa5' : '#f23645';
                 hTag.innerHTML = `
                     <div style="font-weight:bold; color:${{tagColor}}; border-bottom:1px solid #363c4e; padding-bottom:2px; margin-bottom:3px;">
-                        ${{sig.title}}
+                        ${{sig.title}} (${{sig.time_str}})
                     </div>
                     <div><b>Entry:</b> ${{sig.entry.toFixed(1)}}</div>
-                    <div><b>Target:</b> ${{sig.target.toFixed(1)}} (+${{sig.target_pts.toFixed(1)}} pts)</div>
-                    <div><b>Stop Loss:</b> ${{sig.sl.toFixed(1)}} (-${{sig.sl_pts.toFixed(1)}} pts)</div>
+                    <div><b>Stop Loss:</b> ${{sig.sl.toFixed(1)}} (-${{Math.abs(sig.entry - sig.sl).toFixed(1)}} pts)</div>
+                    <div><b>Target 1:</b> ${{sig.target1.toFixed(1)}} (+${{Math.abs(sig.target1 - sig.entry).toFixed(1)}} pts)</div>
+                    <div><b>Target Mid:</b> ${{sig.target_mid.toFixed(1)}} (+${{Math.abs(sig.target_mid - sig.entry).toFixed(1)}} pts)</div>
+                    <div><b>Target Max:</b> ${{sig.target_final.toFixed(1)}} (+${{Math.abs(sig.target_final - sig.entry).toFixed(1)}} pts)</div>
                 `;
             }} else {{
                 hTag.style.display = 'none';
@@ -655,6 +816,7 @@ html_code = f"""
         function makeDraggable(elem) {{
             let isDragging = false, startX, startY, initLeft, initTop;
             function onStart(e) {{
+                if (e.target.classList.contains('tv-del-btn')) return;
                 isDragging = true;
                 const cX = e.type.includes('touch') ? e.touches[0].clientX : e.clientX;
                 const cY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
@@ -681,7 +843,7 @@ html_code = f"""
         }}
         makeDraggable(document.getElementById('strategyBox'));
 
-        // Dynamic State Polling via Upstash
+        // Dynamic State Polling via Upstash Redis
         const redisUrl = "{redis_url_str}";
         const redisToken = "{redis_token_str}";
 
@@ -708,7 +870,8 @@ html_code = f"""
                     if (stData.locked_trade) {{
                         const lt = stData.locked_trade;
                         const isCE = lt.type === 'CE';
-                        const optEntry = lt.opt_entry_ltp || 75.0;
+                        const spotLtp = stData.ltp || lt.entry;
+                        const optLtp = stData.opt_ltp || lt.opt_entry_ltp || 75.0;
                         liveDelta = lt.delta || 0.50;
 
                         document.getElementById('topDeltaVal').innerText = liveDelta.toFixed(2);
@@ -720,36 +883,31 @@ html_code = f"""
                         document.getElementById('hudTypeOptPill').style.background = isCE ? '#089981' : '#f23645';
 
                         document.getElementById('hudEntrySpot').innerText = lt.entry.toFixed(1);
-                        document.getElementById('hudEntryOpt').innerText = "₹" + optEntry.toFixed(2);
+                        document.getElementById('hudEntryOpt').innerText = "₹" + (lt.opt_entry_ltp ? lt.opt_entry_ltp.toFixed(2) : optLtp.toFixed(2));
 
                         const rPts = Math.abs(lt.entry - lt.init_sl);
-                        const optSLPrice = Math.max(0.5, optEntry - (rPts * liveDelta));
                         document.getElementById('hudSLSpot').innerText = lt.init_sl.toFixed(1) + " (-" + rPts.toFixed(1) + " pts)";
-                        document.getElementById('hudSLOpt').innerText = "₹" + optSLPrice.toFixed(2) + " (-₹" + Math.round(rPts * liveDelta * activeQty) + ")";
+                        document.getElementById('hudSLOpt').innerText = "₹" + Math.max(0.5, optLtp - (rPts * liveDelta)).toFixed(2) + " (-₹" + Math.round(rPts * liveDelta * activeQty) + ")";
 
-                        const t1_val = lt.tp1 || (isCE ? lt.entry + 40.0 : lt.entry - 40.0);
+                        const t1_val = lt.tp1;
                         const t1Pts = Math.abs(t1_val - lt.entry);
-                        const optT1Price = optEntry + (t1Pts * liveDelta);
                         document.getElementById('hudT1Spot').innerText = t1_val.toFixed(1) + " (+" + t1Pts.toFixed(1) + " pts)";
-                        document.getElementById('hudT1Opt').innerText = "₹" + optT1Price.toFixed(2) + " (+₹" + Math.round(t1Pts * liveDelta * activeQty) + ")";
+                        document.getElementById('hudT1Opt').innerText = "₹" + (optLtp + (t1Pts * liveDelta)).toFixed(2) + " (+₹" + Math.round(t1Pts * liveDelta * activeQty) + ")";
 
-                        const tMid_val = lt.tp_mid || (isCE ? lt.entry + 70.0 : lt.entry - 70.0);
+                        const tMid_val = lt.tp_mid;
                         const tMidPts = Math.abs(tMid_val - lt.entry);
-                        const optTMidPrice = optEntry + (tMidPts * liveDelta);
                         document.getElementById('hudTMidSpot').innerText = tMid_val.toFixed(1) + " (+" + tMidPts.toFixed(1) + " pts)";
-                        document.getElementById('hudTMidOpt').innerText = "₹" + optTMidPrice.toFixed(2);
+                        document.getElementById('hudTMidOpt').innerText = "₹" + (optLtp + (tMidPts * liveDelta)).toFixed(2);
 
-                        const tFinal_val = lt.tp_final || (isCE ? lt.entry + 110.0 : lt.entry - 110.0);
+                        const tFinal_val = lt.tp_final;
                         const tFinalPts = Math.abs(tFinal_val - lt.entry);
-                        const optTFinalPrice = optEntry + (tFinalPts * liveDelta);
                         document.getElementById('hudTFinalSpot').innerText = tFinal_val.toFixed(1) + " (+" + tFinalPts.toFixed(1) + " pts)";
-                        document.getElementById('hudTFinalOpt').innerText = "₹" + optTFinalPrice.toFixed(2) + " (+₹" + Math.round(tFinalPts * liveDelta * activeQty) + ")";
+                        document.getElementById('hudTFinalOpt').innerText = "₹" + (optLtp + (tFinalPts * liveDelta)).toFixed(2) + " (+₹" + Math.round(tFinalPts * liveDelta * activeQty) + ")";
 
                         const curSL = lt.current_sl || lt.init_sl;
                         const secPts = isCE ? (curSL - lt.entry) : (lt.entry - curSL);
-                        const trailOptPrice = Math.max(0.5, optEntry + (secPts * liveDelta));
                         document.getElementById('hudTrailSpot').innerText = curSL.toFixed(1);
-                        document.getElementById('hudTrailOpt').innerText = "₹" + trailOptPrice.toFixed(2);
+                        document.getElementById('hudTrailOpt').innerText = "₹" + Math.max(0.5, optLtp + (secPts * liveDelta)).toFixed(2);
 
                         const pnlSpotElem = document.getElementById('hudPnLSpot');
                         const pnlOptElem = document.getElementById('hudPnLOpt');
