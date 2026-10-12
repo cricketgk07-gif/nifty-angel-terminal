@@ -2,6 +2,7 @@ import datetime
 import html
 import json
 import math
+import os
 import pandas as pd
 import numpy as np
 import pyotp
@@ -81,7 +82,6 @@ LOT_SIZE_QTY = 65
 
 
 def send_telegram_alert(message: str):
-    """Dispatches immediate push notification directly to Telegram."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -146,53 +146,55 @@ def load_nfo_scrip_master():
 nfo_df = load_nfo_scrip_master()
 
 
+# Cumulative local storage: Keeps all historical candles intact
+@st.cache_resource
+def get_candle_storage():
+    return {"df": None}
+
+
 def fetch_nifty_candles():
     now_dt = datetime.datetime.now(IST)
-    collected_frames = []
-    current_end = now_dt
+    storage = get_candle_storage()
 
-    for _ in range(3):
-        chunk_start = current_end - datetime.timedelta(days=5)
-        from_str = chunk_start.strftime("%Y-%m-%d 09:15")
+    from_str = (now_dt - datetime.timedelta(days=6)).strftime("%Y-%m-%d 09:15")
+    to_str = now_dt.strftime("%Y-%m-%d %H:%M") if now_dt.time() < datetime.time(15, 30) else now_dt.strftime("%Y-%m-%d 15:30")
 
-        if current_end.date() == now_dt.date() and now_dt.time() < datetime.time(15, 30):
-            to_str = current_end.strftime("%Y-%m-%d %H:%M")
-        else:
-            to_str = current_end.strftime("%Y-%m-%d 15:30")
-
-        try:
-            resp = api.getCandleData(
-                {
-                    "exchange": "NSE",
-                    "symboltoken": INDEX_TOKEN,
-                    "interval": "FIVE_MINUTE",
-                    "fromdate": from_str,
-                    "todate": to_str,
-                }
+    try:
+        resp = api.getCandleData(
+            {
+                "exchange": "NSE",
+                "symboltoken": INDEX_TOKEN,
+                "interval": "FIVE_MINUTE",
+                "fromdate": from_str,
+                "todate": to_str,
+            }
+        )
+        if isinstance(resp, dict) and resp.get("status") and resp.get("data"):
+            new_df = pd.DataFrame(
+                resp["data"],
+                columns=["timestamp", "open", "high", "low", "close", "volume"],
             )
-            if isinstance(resp, dict) and resp.get("status") and resp.get("data"):
-                df_chunk = pd.DataFrame(
-                    resp["data"],
-                    columns=["timestamp", "open", "high", "low", "close", "volume"],
-                )
-                collected_frames.append(df_chunk)
-        except Exception:
-            pass
+            new_df["dt"] = pd.to_datetime(new_df["timestamp"])
 
-        current_end = chunk_start
+            if storage["df"] is not None:
+                combined = pd.concat([storage["df"], new_df], ignore_index=True)
+            else:
+                combined = new_df
 
-    if not collected_frames:
+            combined = combined.drop_duplicates(subset=["dt"]).sort_values(by="dt").reset_index(drop=True)
+            storage["df"] = combined
+    except Exception:
+        pass
+
+    df = storage["df"]
+    if df is None or len(df) == 0:
         return None
 
-    df = pd.concat(collected_frames, ignore_index=True)
-    df["dt"] = pd.to_datetime(df["timestamp"])
-    df = df.drop_duplicates(subset=["dt"]).sort_values(by="dt").reset_index(drop=True)
-
+    df = df.copy()
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
 
     df = df[(df["open"] > 1000) & (df["high"] > 1000) & (df["low"] > 1000) & (df["close"] > 1000)].copy()
-
     df = df[
         (df["dt"].dt.time >= datetime.time(9, 15))
         & (df["dt"].dt.time <= datetime.time(15, 30))
@@ -202,9 +204,7 @@ def fetch_nifty_candles():
         return None
 
     t_clean = df["dt"].dt.tz_localize(None)
-    df["time"] = (
-        (t_clean - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
-    ).astype(int)
+    df["time"] = ((t_clean - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)).astype(int)
     df["date"] = df["dt"].dt.date
 
     candle_spread = (df["high"] - df["low"]) + (df["close"] - df["open"]).abs()
@@ -229,15 +229,7 @@ def fetch_nifty_candles():
     return df
 
 
-# Memory cache fallback so UI never drops to initializing screen
-if "cached_df" not in st.session_state:
-    st.session_state.cached_df = None
-
-live_df = fetch_nifty_candles()
-if live_df is not None and len(live_df) > 0:
-    st.session_state.cached_df = live_df
-
-df = st.session_state.cached_df
+df = fetch_nifty_candles()
 if df is None or len(df) == 0:
     st.info("Market data feed is initializing...")
     st.stop()
@@ -491,13 +483,19 @@ def format_step_trailing_alert(trade, opt_symbol, opt_ltp, delta_val, qty, curre
     return msg
 
 
-# Persistent alert tracker across updates
+# Permanent Daily Trade Lock (Prevents flipping between CE & PE mid-session)
+@st.cache_resource
+def get_daily_trade_lock():
+    return {"date": None, "locked_trade": None}
+
+
+daily_lock = get_daily_trade_lock()
+if daily_lock["date"] != today_dt:
+    daily_lock["date"] = today_dt
+    daily_lock["locked_trade"] = None
+
 if "notified_sl_map" not in st.session_state:
     st.session_state.notified_sl_map = {}
-
-# Session Lock for Trade to Prevent Flipping Between CE and PE Mid-day
-if "locked_session_trade" not in st.session_state:
-    st.session_state.locked_session_trade = None
 
 markers = []
 historical_trade_cards = {}
@@ -748,7 +746,8 @@ for session_date, day_df in grouped:
                 if session_date == latest_session_date:
                     trade_executed_in_latest_session = True
                     alarm_signal_triggered = True
-                    st.session_state.locked_session_trade = session_trade.copy()
+                    if daily_lock["locked_trade"] is None:
+                        daily_lock["locked_trade"] = session_trade.copy()
 
                     if not st.session_state.notified_sl_map.get("entry_sent"):
                         entry_msg = format_full_entry_table_card(session_trade, opt_sym, opt_ltp, trade_delta, total_qty)
@@ -825,33 +824,37 @@ for session_date, day_df in grouped:
                 if session_date == latest_session_date:
                     trade_executed_in_latest_session = True
                     alarm_signal_triggered = True
-                    st.session_state.locked_session_trade = session_trade.copy()
+                    if daily_lock["locked_trade"] is None:
+                        daily_lock["locked_trade"] = session_trade.copy()
 
                     if not st.session_state.notified_sl_map.get("entry_sent"):
                         entry_msg = format_full_entry_table_card(session_trade, opt_sym, opt_ltp, trade_delta, total_qty)
                         send_telegram_alert(entry_msg)
                         st.session_state.notified_sl_map["entry_sent"] = True
 
-# Lock Active Contract: Use session locked trade so it NEVER jumps between CE & PE
-if st.session_state.locked_session_trade is not None:
-    active_type = st.session_state.locked_session_trade["type"]
-    active_strike = st.session_state.locked_session_trade["strike"]
-    active_symbol = st.session_state.locked_session_trade["opt_symbol"]
-    active_delta = st.session_state.locked_session_trade["delta"]
-    tok = st.session_state.locked_session_trade.get("opt_token", "")
+# Always prioritize the session locked trade so it NEVER jumps between CE & PE
+if daily_lock["locked_trade"] is not None:
+    trade_to_show = daily_lock["locked_trade"]
+    active_type = trade_to_show["type"]
+    active_strike = trade_to_show["strike"]
+    active_symbol = trade_to_show["opt_symbol"]
+    active_delta = trade_to_show["delta"]
+    tok = trade_to_show.get("opt_token", "")
     live_real_ltp = fetch_option_ltp(active_symbol, tok) if tok else 0.0
     if live_real_ltp <= 0.0:
-        live_real_ltp = st.session_state.locked_session_trade["opt_entry_ltp"]
+        live_real_ltp = trade_to_show["opt_entry_ltp"]
 elif latest_trade_for_hud:
-    active_type = latest_trade_for_hud["type"]
-    active_strike = latest_trade_for_hud["strike"]
-    active_symbol = latest_trade_for_hud["opt_symbol"]
-    active_delta = latest_trade_for_hud["delta"]
-    tok = latest_trade_for_hud.get("opt_token", "")
+    trade_to_show = latest_trade_for_hud
+    active_type = trade_to_show["type"]
+    active_strike = trade_to_show["strike"]
+    active_symbol = trade_to_show["opt_symbol"]
+    active_delta = trade_to_show["delta"]
+    tok = trade_to_show.get("opt_token", "")
     live_real_ltp = fetch_option_ltp(active_symbol, tok) if tok else 0.0
     if live_real_ltp <= 0.0:
-        live_real_ltp = latest_trade_for_hud["opt_entry_ltp"]
+        live_real_ltp = trade_to_show["opt_entry_ltp"]
 else:
+    trade_to_show = None
     active_type = "CE" if spot_price >= curr["vwap"] else "PE"
     active_strike = atm_strike + (step_offset * 50) if active_type == "CE" else atm_strike - (step_offset * 50)
     active_symbol = f"NIFTY {active_strike} {active_type}"
@@ -909,11 +912,8 @@ volume_data = [
     for _, r in df.iterrows()
 ]
 
-# Accurate Strategy HUD Payload
 hud_payload = None
-trade_to_show = st.session_state.locked_session_trade if st.session_state.locked_session_trade else latest_trade_for_hud
-
-if trade_executed_in_latest_session and trade_to_show:
+if trade_to_show:
     is_ce = trade_to_show["type"] == "CE"
     entry_p = trade_to_show["entry"]
     trail_p = trade_to_show["current_sl"]
@@ -960,60 +960,13 @@ if trade_executed_in_latest_session and trade_to_show:
         "raw_secured_pts": secured_pts,
         "theme": "#089981" if is_ce else "#f23645",
     }
-elif (not trade_executed_in_latest_session) and (latest_bar_time >= datetime.time(10, 30)):
+elif latest_bar_time >= datetime.time(10, 30):
     hud_payload = {
         "is_no_trade": True,
         "status": "NO TRADE TODAY",
         "reason": "No valid breakout before 10:30 AM",
         "action": "Capital Protected (Wait for tomorrow)",
         "theme": "#787b86",
-    }
-elif trade_to_show:
-    is_ce = trade_to_show["type"] == "CE"
-    entry_p = trade_to_show["entry"]
-    trail_p = trade_to_show["current_sl"]
-    secured_pts = round(trail_p - entry_p, 1) if is_ce else round(entry_p - trail_p, 1)
-    risk_pts = trade_to_show["risk"]
-    target1_pts = round(abs(trade_to_show["tp1"] - entry_p), 1)
-    target_mid_pts = round(abs(trade_to_show["tp_mid"] - entry_p), 1)
-    target_final_pts = round(abs(trade_to_show["tp_final"] - entry_p), 1)
-
-    is_trade_closed = trade_to_show.get("closed", False)
-    if is_trade_closed:
-        final_pts = trade_to_show.get("exit_pts", secured_pts)
-        final_opt_rs = round(final_pts * active_delta * total_qty)
-        pnl_label = "Final Realized P&L"
-        pts_display = f"{final_pts:+.1f} pts"
-        inr_display = f"{final_opt_rs:+d}"
-        pnl_theme = "#089981" if final_pts >= 0 else "#f23645"
-    else:
-        locked_opt_rs = int(round(secured_pts * active_delta * total_qty))
-        pnl_label = "Secured P&L (at SL)"
-        pts_display = f"{secured_pts:+.1f} pts"
-        inr_display = f"{locked_opt_rs:+d}"
-        pnl_theme = "#089981" if secured_pts >= 0 else "#f23645"
-
-    hud_payload = {
-        "is_no_trade": False,
-        "call_or_put": trade_to_show["call_or_put"],
-        "reason": trade_to_show["reason"],
-        "entry": f"{entry_p:.1f}",
-        "sl_risk": f"{trade_to_show['init_sl']:.1f} (-{risk_pts:.1f} pts)",
-        "target1": f"{trade_to_show['tp1']:.1f} (+{target1_pts:.1f} pts)",
-        "target_mid": f"{trade_to_show['tp_mid']:.1f} (+{target_mid_pts:.1f} pts)",
-        "target_final": f"{trade_to_show['tp_final']:.1f} (+{target_final_pts:.1f} pts)",
-        "trailing_sl": f"{trail_p:.1f}",
-        "trail_stage": trade_to_show["trail_stage"],
-        "pnl_label": pnl_label,
-        "pts_display": pts_display,
-        "inr_display": inr_display,
-        "pnl_theme": pnl_theme,
-        "raw_risk_pts": risk_pts,
-        "raw_target1_pts": target1_pts,
-        "raw_target_mid_pts": target_mid_pts,
-        "raw_target_final_pts": target_final_pts,
-        "raw_secured_pts": secured_pts,
-        "theme": "#089981" if is_ce else "#f23645",
     }
 
 # Serialization
@@ -1035,7 +988,7 @@ chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
-# Embedded Web Terminal with Background Live Stream (No Full Page Flash)
+# Clean Web Terminal (All ghost reload calls completely removed)
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -1704,7 +1657,7 @@ html_code = f"""
             }}
         }}
 
-        // Position memory: Preserve coordinates across updates so HUD never resets
+        // Position memory: Keep dragged location forever
         const savedHUDLeft = localStorage.getItem('nifty_hud_left');
         const savedHUDTop = localStorage.getItem('nifty_hud_top');
         if (savedHUDLeft && savedHUDTop) {{
@@ -1804,25 +1757,6 @@ html_code = f"""
 
         window.addEventListener('resize', resizeChartProperly);
         setTimeout(resizeChartProperly, 200);
-
-        // SILENT LIVE TICK STREAM (No Page Reload, Zero Flash, Zero HUD Jump)
-        // Fetches live updates smoothly without resetting DOM position
-        setInterval(function() {{
-            fetch(window.location.href, {{ headers: {{ 'Accept': 'text/html' }} }})
-            .then(res => res.text())
-            .then(htmlStr => {{
-                const match = htmlStr.match(/var candles_json = (\[.*?\]);/);
-                if (match && match[1]) {{
-                    try {{
-                        const liveCandles = JSON.parse(match[1]);
-                        if (liveCandles && liveCandles.length > 0) {{
-                            const lastBar = liveCandles[liveCandles.length - 1];
-                            candleSeries.update(lastBar);
-                        }}
-                    }} catch(e) {{}}
-                }}
-            }}).catch(e => {{}});
-        }}, 5000);
     </script>
 </body>
 </html>
