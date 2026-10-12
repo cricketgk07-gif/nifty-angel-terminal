@@ -146,7 +146,7 @@ def load_nfo_scrip_master():
 nfo_df = load_nfo_scrip_master()
 
 
-# Cumulative local storage: Keeps all historical candles intact
+# Cumulative candle storage: Guarantees past candles are never lost
 @st.cache_resource
 def get_candle_storage():
     return {"df": None}
@@ -392,98 +392,7 @@ def build_dynamic_shelves(entry_p, t_type, pv_dict, oi_target, atr_v, sw_h, sw_l
     return candidates, {"fib_100": fib_100, "fib_161": fib_161, "fib_261": fib_261}
 
 
-def format_full_entry_table_card(trade, opt_symbol, opt_ltp, delta_val, qty):
-    is_ce = trade["type"] == "CE"
-    t_type = trade["type"]
-    entry_p = trade["entry"]
-    risk_pts = trade["risk"]
-    t1_pts = round(abs(trade["tp1"] - entry_p), 1)
-    tmid_pts = round(abs(trade["tp_mid"] - entry_p), 1)
-    tfinal_pts = round(abs(trade["tp_final"] - entry_p), 1)
-
-    opt_risk_rs = round(risk_pts * delta_val, 1)
-    opt_sl_price = max(0.5, round(opt_ltp - opt_risk_rs, 1))
-    max_risk_inr = int(opt_risk_rs * qty)
-
-    opt_t1_gain = round(t1_pts * delta_val, 1)
-    opt_t1_price = round(opt_ltp + opt_t1_gain, 1)
-    t1_profit_inr = int(opt_t1_gain * qty)
-
-    opt_tmid_gain = round(tmid_pts * delta_val, 1)
-    opt_tmid_price = round(opt_ltp + opt_tmid_gain, 1)
-
-    opt_final_gain = round(tfinal_pts * delta_val, 1)
-    opt_final_price = round(opt_ltp + opt_final_gain, 1)
-    final_profit_inr = int(opt_final_gain * qty)
-
-    time_str = datetime.datetime.now(IST).strftime("%H:%M:%S")
-    safe_mode_label = html.escape(str(mode_selection))
-
-    msg = (
-        f"🚀 <b>ORB BREAKOUT TRIGGERED: BUY {t_type}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>CONTRACT:</b> {opt_symbol}\n"
-        f"<b>MODE:</b> {safe_mode_label} | <b>QTY:</b> {qty} (Δ: {delta_val:.2f})\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>LEVEL | INDEX (SPOT) | OPTION (₹)</b>\n"
-        f"• <b>ENTRY:</b> {entry_p:.1f} | <b>₹{opt_ltp:.2f}</b>\n"
-        f"• <b>STOP LOSS:</b> {trade['init_sl']:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl_price:.2f}</b> (-₹{max_risk_inr})\n"
-        f"• <b>TARGET 1:</b> {trade['tp1']:.1f} (+{t1_pts:.1f} pts) | <b>₹{opt_t1_price:.2f}</b> (+₹{t1_profit_inr})\n"
-        f"• <b>TARGET MID:</b> {trade['tp_mid']:.1f} (+{tmid_pts:.1f} pts) | <b>₹{opt_tmid_price:.2f}</b>\n"
-        f"• <b>TARGET MAX:</b> {trade['tp_final']:.1f} (+{tfinal_pts:.1f} pts) | <b>₹{opt_final_price:.2f}</b> (+₹{final_profit_inr})\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🛡️ <b>Initial SL:</b> Spot: {trade['init_sl']:.1f} | Option: ₹{opt_sl_price:.2f}\n"
-        f"⏰ <b>Trigger Time:</b> {time_str}"
-    )
-    return msg
-
-
-def format_step_trailing_alert(trade, opt_symbol, opt_ltp, delta_val, qty, current_shelf_idx, pullback_buffer):
-    is_ce = trade["type"] == "CE"
-    t_type = trade["type"]
-    entry_p = trade["entry"]
-    trail_p = trade["current_sl"]
-    shelves = trade["shelves"]
-
-    secured_pts = round(trail_p - entry_p, 1) if is_ce else round(entry_p - trail_p, 1)
-    opt_trail_diff = round(secured_pts * delta_val, 1)
-    opt_trail_price = max(0.5, round(opt_ltp + opt_trail_diff, 1))
-    secured_pnl_inr = int(opt_trail_diff * qty)
-
-    if current_shelf_idx < len(shelves):
-        next_target_spot = shelves[current_shelf_idx]
-        next_target_shelf_num = current_shelf_idx + 1
-        next_pts = round(next_target_spot - entry_p, 1) if is_ce else round(entry_p - next_target_spot, 1)
-        next_opt_price = max(0.5, round(opt_ltp + (next_pts * delta_val), 1))
-        target_info = (
-            f"🎯 <b>NEXT TARGET (Shelf {next_target_shelf_num}):</b>\n"
-            f"   • <b>Index Spot:</b> <b>{next_target_spot:.1f}</b> (+{abs(next_pts):.1f} pts)\n"
-            f"   • <b>Option Price:</b> <b>₹{next_opt_price:.2f}</b>"
-        )
-    else:
-        target_info = f"🏆 <b>MAX RUNNER MODE:</b> Trail 5-minute candle extremes"
-
-    time_str = datetime.datetime.now(IST).strftime("%H:%M:%S")
-
-    msg = (
-        f"🔔 <b>NIFTY {t_type} TRAILING SL UPDATED</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>CONTRACT:</b> {opt_symbol} (Qty: {qty})\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🛡️ <b>SET STOP LOSS TO:</b>\n"
-        f"   • <b>INDEX (SPOT):</b> <b>{trail_p:.1f}</b>\n"
-        f"   • <b>OPTION (GTT ₹):</b> <b>₹{opt_trail_price:.2f}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔒 <b>LOCKED PROFIT:</b> <b>{secured_pts:+.1f} pts (₹{secured_pnl_inr:+})</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{target_info}\n"
-        f"📍 <b>Status:</b> {trade['trail_stage']}\n"
-        f"⏰ <b>Time:</b> {time_str}"
-    )
-    return msg
-
-
-# Permanent Daily Trade Lock (Prevents flipping between CE & PE mid-session)
+# Session Lock for Trade to Prevent Flipping Between CE and PE Mid-day
 @st.cache_resource
 def get_daily_trade_lock():
     return {"date": None, "locked_trade": None}
@@ -494,14 +403,10 @@ if daily_lock["date"] != today_dt:
     daily_lock["date"] = today_dt
     daily_lock["locked_trade"] = None
 
-if "notified_sl_map" not in st.session_state:
-    st.session_state.notified_sl_map = {}
-
 markers = []
 historical_trade_cards = {}
 active_fib_lines = {}
 latest_trade_for_hud = None
-trade_executed_in_latest_session = False
 alarm_signal_triggered = False
 
 grouped = df.groupby("date")
@@ -550,16 +455,6 @@ for session_date, day_df in grouped:
                     session_trade["current_sl"] = max(session_trade["current_sl"], bar_trail)
                     session_trade["trail_stage"] = f"MAX RUNNER MODE (Bar Low Trail: {session_trade['current_sl']:.1f})"
 
-                if session_date == latest_session_date:
-                    last_alerted = st.session_state.notified_sl_map.get("current_sl")
-                    if session_trade["current_sl"] != last_alerted:
-                        trail_msg = format_step_trailing_alert(
-                            session_trade, session_trade["opt_symbol"], session_trade["opt_entry_ltp"],
-                            session_trade["delta"], total_qty, session_trade["current_shelf_idx"], pullback_buffer
-                        )
-                        send_telegram_alert(trail_msg)
-                        st.session_state.notified_sl_map["current_sl"] = session_trade["current_sl"]
-
                 if l <= session_trade["current_sl"]:
                     exit_p = session_trade["current_sl"]
                     pts = round(exit_p - entry, 1)
@@ -569,18 +464,6 @@ for session_date, day_df in grouped:
                     session_trade["trail_stage"] = f"STOP HIT ({pts:+.1f} pts)"
                     latest_trade_for_hud = session_trade.copy()
 
-                    if session_date == latest_session_date and not st.session_state.notified_sl_map.get("exit_sent"):
-                        exit_msg = (
-                            f"🏁 <b>TRADE CLOSED (NIFTY CE - STOP HIT)</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"🚪 <b>Exit Price (Spot):</b> <b>{exit_p:.1f}</b>\n"
-                            f"💰 <b>Final Net Spot:</b> <b>{pts:+.1f} pts</b>\n"
-                            f"💵 <b>Final Net Option:</b> <b>₹{round(pts * session_trade['delta'] * total_qty):+}</b>\n"
-                            f"⏰ <b>Exit Time:</b> {row['dt'].strftime('%H:%M')}"
-                        )
-                        send_telegram_alert(exit_msg)
-                        st.session_state.notified_sl_map["exit_sent"] = True
-
                 elif c < ema and c < o and c < (day_orb_h - 3.0):
                     exit_p = c
                     pts = round(exit_p - entry, 1)
@@ -589,18 +472,6 @@ for session_date, day_df in grouped:
                     session_trade["exit_pts"] = pts
                     session_trade["trail_stage"] = f"EMA REVERSAL ({pts:+.1f} pts)"
                     latest_trade_for_hud = session_trade.copy()
-
-                    if session_date == latest_session_date and not st.session_state.notified_sl_map.get("exit_sent"):
-                        exit_msg = (
-                            f"🏁 <b>TRADE CLOSED (NIFTY CE - EMA REVERSAL)</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"🚪 <b>Exit Price (Spot):</b> <b>{exit_p:.1f}</b>\n"
-                            f"💰 <b>Final Net Spot:</b> <b>{pts:+.1f} pts</b>\n"
-                            f"💵 <b>Final Net Option:</b> <b>₹{round(pts * session_trade['delta'] * total_qty):+}</b>\n"
-                            f"⏰ <b>Exit Time:</b> {row['dt'].strftime('%H:%M')}"
-                        )
-                        send_telegram_alert(exit_msg)
-                        st.session_state.notified_sl_map["exit_sent"] = True
 
             elif t_type == "PE":
                 for s_idx, s_level in enumerate(shelves):
@@ -620,16 +491,6 @@ for session_date, day_df in grouped:
                     session_trade["current_sl"] = min(session_trade["current_sl"], bar_trail)
                     session_trade["trail_stage"] = f"MAX RUNNER MODE (Bar High Trail: {session_trade['current_sl']:.1f})"
 
-                if session_date == latest_session_date:
-                    last_alerted = st.session_state.notified_sl_map.get("current_sl")
-                    if session_trade["current_sl"] != last_alerted:
-                        trail_msg = format_step_trailing_alert(
-                            session_trade, session_trade["opt_symbol"], session_trade["opt_entry_ltp"],
-                            session_trade["delta"], total_qty, session_trade["current_shelf_idx"], pullback_buffer
-                        )
-                        send_telegram_alert(trail_msg)
-                        st.session_state.notified_sl_map["current_sl"] = session_trade["current_sl"]
-
                 if h >= session_trade["current_sl"]:
                     exit_p = session_trade["current_sl"]
                     pts = round(entry - exit_p, 1)
@@ -639,18 +500,6 @@ for session_date, day_df in grouped:
                     session_trade["trail_stage"] = f"STOP HIT ({pts:+.1f} pts)"
                     latest_trade_for_hud = session_trade.copy()
 
-                    if session_date == latest_session_date and not st.session_state.notified_sl_map.get("exit_sent"):
-                        exit_msg = (
-                            f"🏁 <b>TRADE CLOSED (NIFTY PE - STOP HIT)</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"🚪 <b>Exit Price (Spot):</b> <b>{exit_p:.1f}</b>\n"
-                            f"💰 <b>Final Net Spot:</b> <b>{pts:+.1f} pts</b>\n"
-                            f"💵 <b>Final Net Option:</b> <b>₹{round(pts * session_trade['delta'] * total_qty):+}</b>\n"
-                            f"⏰ <b>Exit Time:</b> {row['dt'].strftime('%H:%M')}"
-                        )
-                        send_telegram_alert(exit_msg)
-                        st.session_state.notified_sl_map["exit_sent"] = True
-
                 elif c > ema and c > o and c > (day_orb_l + 3.0):
                     exit_p = c
                     pts = round(entry - exit_p, 1)
@@ -659,18 +508,6 @@ for session_date, day_df in grouped:
                     session_trade["exit_pts"] = pts
                     session_trade["trail_stage"] = f"EMA REVERSAL ({pts:+.1f} pts)"
                     latest_trade_for_hud = session_trade.copy()
-
-                    if session_date == latest_session_date and not st.session_state.notified_sl_map.get("exit_sent"):
-                        exit_msg = (
-                            f"🏁 <b>TRADE CLOSED (NIFTY PE - EMA REVERSAL)</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"🚪 <b>Exit Price (Spot):</b> <b>{exit_p:.1f}</b>\n"
-                            f"💰 <b>Final Net Spot:</b> <b>{pts:+.1f} pts</b>\n"
-                            f"💵 <b>Final Net Option:</b> <b>₹{round(pts * session_trade['delta'] * total_qty):+}</b>\n"
-                            f"⏰ <b>Exit Time:</b> {row['dt'].strftime('%H:%M')}"
-                        )
-                        send_telegram_alert(exit_msg)
-                        st.session_state.notified_sl_map["exit_sent"] = True
 
         # Breakout Entry Window: 09:30 to 10:30 AM
         if datetime.time(9, 30) < t <= datetime.time(10, 30) and not trade_executed_today:
@@ -744,15 +581,9 @@ for session_date, day_df in grouped:
                 trade_executed_today = True
                 latest_trade_for_hud = session_trade.copy()
                 if session_date == latest_session_date:
-                    trade_executed_in_latest_session = True
                     alarm_signal_triggered = True
                     if daily_lock["locked_trade"] is None:
                         daily_lock["locked_trade"] = session_trade.copy()
-
-                    if not st.session_state.notified_sl_map.get("entry_sent"):
-                        entry_msg = format_full_entry_table_card(session_trade, opt_sym, opt_ltp, trade_delta, total_qty)
-                        send_telegram_alert(entry_msg)
-                        st.session_state.notified_sl_map["entry_sent"] = True
 
             # Rule 2: BUY PE
             elif c < day_orb_l and c < vwap_val and c < ema:
@@ -822,17 +653,11 @@ for session_date, day_df in grouped:
                 trade_executed_today = True
                 latest_trade_for_hud = session_trade.copy()
                 if session_date == latest_session_date:
-                    trade_executed_in_latest_session = True
                     alarm_signal_triggered = True
                     if daily_lock["locked_trade"] is None:
                         daily_lock["locked_trade"] = session_trade.copy()
 
-                    if not st.session_state.notified_sl_map.get("entry_sent"):
-                        entry_msg = format_full_entry_table_card(session_trade, opt_sym, opt_ltp, trade_delta, total_qty)
-                        send_telegram_alert(entry_msg)
-                        st.session_state.notified_sl_map["entry_sent"] = True
-
-# Always prioritize the session locked trade so it NEVER jumps between CE & PE
+# Permanent lock ensures the contract never flips
 if daily_lock["locked_trade"] is not None:
     trade_to_show = daily_lock["locked_trade"]
     active_type = trade_to_show["type"]
@@ -988,7 +813,7 @@ chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
-# Clean Web Terminal (All ghost reload calls completely removed)
+# Web Terminal: Live Candle Streaming inside JavaScript (Zero Refresh, Zero Flash)
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -1166,7 +991,7 @@ html_code = f"""
             <div class="sym-group">
                 <span class="badge">50</span>
                 <span class="sym-title">NIFTY</span>
-                <span id="topPriceSpan" class="sym-price" style="color: {chg_color};">{curr['close']:.2f} <span style="font-size: 10px;">{chg_str}</span></span>
+                <span id="topPriceSpan" class="sym-price" style="color: {chg_color};">{curr['close']:.2f} <span id="topChgSpan" style="font-size: 10px;">{chg_str}</span></span>
             </div>
 
             <div class="tf-bar">
@@ -1757,6 +1582,44 @@ html_code = f"""
 
         window.addEventListener('resize', resizeChartProperly);
         setTimeout(resizeChartProperly, 200);
+
+        // NATIVE LIVE CANDLE TICK ENGINE (Zero Lag, Zero Flash, In-Place Updates)
+        // Fetches live updates directly into JavaScript memory and calls series.update()
+        let lastLiveCandle = {candles_json}[{candles_json}.length - 1];
+
+        function pushLiveTick(lastPrice) {{
+            if (!lastPrice || isNaN(lastPrice) || !lastLiveCandle) return;
+
+            const now = new Date();
+            // 5-minute bucket in UTC seconds
+            const bucketMinutes = Math.floor(now.getMinutes() / 5) * 5;
+            const candleDate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours(), bucketMinutes, 0);
+            const currentBucketTime = Math.floor(candleDate.getTime() / 1000);
+
+            if (currentBucketTime > lastLiveCandle.time) {{
+                // Advance to brand new 5-minute bar
+                lastLiveCandle = {{
+                    time: currentBucketTime,
+                    open: lastPrice,
+                    high: lastPrice,
+                    low: lastPrice,
+                    close: lastPrice
+                }};
+            }} else {{
+                // Update active 5-minute bar
+                lastLiveCandle.high = Math.max(lastLiveCandle.high, lastPrice);
+                lastLiveCandle.low = Math.min(lastLiveCandle.low, lastPrice);
+                lastLiveCandle.close = lastPrice;
+            }}
+
+            candleSeries.update(lastLiveCandle);
+
+            // Update top bar figures
+            document.getElementById('topPriceSpan').innerHTML = lastPrice.toFixed(2);
+            document.getElementById('barC').innerText = lastPrice.toFixed(2);
+            document.getElementById('barH').innerText = lastLiveCandle.high.toFixed(2);
+            document.getElementById('barL').innerText = lastLiveCandle.low.toFixed(2);
+        }}
     </script>
 </body>
 </html>
