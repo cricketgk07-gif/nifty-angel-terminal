@@ -147,77 +147,91 @@ nfo_df = load_nfo_scrip_master()
 
 
 def fetch_nifty_candles():
+    """Restored stable chunked fetch with future-time prevention."""
     now_dt = datetime.datetime.now(IST)
-    start_dt = now_dt - datetime.timedelta(days=7)
-    from_str = start_dt.strftime("%Y-%m-%d 09:15")
-    
-    if now_dt.time() < datetime.time(15, 30):
-        to_str = now_dt.strftime("%Y-%m-%d %H:%M")
-    else:
-        to_str = now_dt.strftime("%Y-%m-%d 15:30")
+    collected_frames = []
+    current_end = now_dt
 
-    try:
-        resp = api.getCandleData(
-            {
-                "exchange": "NSE",
-                "symboltoken": INDEX_TOKEN,
-                "interval": "FIVE_MINUTE",
-                "fromdate": from_str,
-                "todate": to_str,
-            }
-        )
-        if isinstance(resp, dict) and resp.get("status") and resp.get("data"):
-            df = pd.DataFrame(
-                resp["data"],
-                columns=["timestamp", "open", "high", "low", "close", "volume"],
+    for _ in range(3):
+        chunk_start = current_end - datetime.timedelta(days=5)
+        from_str = chunk_start.strftime("%Y-%m-%d 09:15")
+        
+        # Prevent future-timestamp rejection on current day
+        if current_end.date() == now_dt.date() and now_dt.time() < datetime.time(15, 30):
+            to_str = current_end.strftime("%Y-%m-%d %H:%M")
+        else:
+            to_str = current_end.strftime("%Y-%m-%d 15:30")
+
+        try:
+            resp = api.getCandleData(
+                {
+                    "exchange": "NSE",
+                    "symboltoken": INDEX_TOKEN,
+                    "interval": "FIVE_MINUTE",
+                    "fromdate": from_str,
+                    "todate": to_str,
+                }
             )
-            df["dt"] = pd.to_datetime(df["timestamp"])
-            df = df.drop_duplicates(subset=["dt"]).sort_values(by="dt").reset_index(drop=True)
+            if isinstance(resp, dict) and resp.get("status") and resp.get("data"):
+                df_chunk = pd.DataFrame(
+                    resp["data"],
+                    columns=["timestamp", "open", "high", "low", "close", "volume"],
+                )
+                collected_frames.append(df_chunk)
+        except Exception:
+            pass
 
-            for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = pd.to_numeric(df[col])
+        current_end = chunk_start
 
-            df = df[(df["open"] > 1000) & (df["high"] > 1000) & (df["low"] > 1000) & (df["close"] > 1000)].copy()
+    if not collected_frames:
+        return None
 
-            df = df[
-                (df["dt"].dt.time >= datetime.time(9, 15))
-                & (df["dt"].dt.time <= datetime.time(15, 30))
-            ].copy()
+    df = pd.concat(collected_frames, ignore_index=True)
+    df["dt"] = pd.to_datetime(df["timestamp"])
+    df = df.drop_duplicates(subset=["dt"]).sort_values(by="dt").reset_index(drop=True)
 
-            if len(df) == 0:
-                return None
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col])
 
-            t_clean = df["dt"].dt.tz_localize(None)
-            df["time"] = (
-                (t_clean - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
-            ).astype(int)
-            df["date"] = df["dt"].dt.date
+    df = df[(df["open"] > 1000) & (df["high"] > 1000) & (df["low"] > 1000) & (df["close"] > 1000)].copy()
 
-            candle_spread = (df["high"] - df["low"]) + (df["close"] - df["open"]).abs()
-            raw_vol = df["volume"].apply(lambda v: float(v) if pd.notnull(v) and v > 0 else 0.0)
-            df["calc_vol"] = raw_vol.where(raw_vol > 0, candle_spread * 1250.0 + 500.0)
+    df = df[
+        (df["dt"].dt.time >= datetime.time(9, 15))
+        & (df["dt"].dt.time <= datetime.time(15, 30))
+    ].copy()
 
-            df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
-            df["vol_mult"] = df["tp"] * df["calc_vol"]
-            df["cum_vol"] = df.groupby("date")["calc_vol"].cumsum()
-            df["cum_vp"] = df.groupby("date")["vol_mult"].cumsum()
-            df["vwap"] = df["cum_vp"] / df["cum_vol"]
-            df["vwap"] = df["vwap"].fillna(df["tp"])
+    if len(df) == 0:
+        return None
 
-            df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
+    t_clean = df["dt"].dt.tz_localize(None)
+    df["time"] = (
+        (t_clean - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
+    ).astype(int)
+    df["date"] = df["dt"].dt.date
 
-            high_low = df["high"] - df["low"]
-            high_cp = (df["high"] - df["close"].shift(1)).abs()
-            low_cp = (df["low"] - df["close"].shift(1)).abs()
-            tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
-            df["atr"] = tr.rolling(window=14, min_periods=1).mean().fillna(15.0)
+    candle_spread = (df["high"] - df["low"]) + (df["close"] - df["open"]).abs()
+    raw_vol = df["volume"].apply(lambda v: float(v) if pd.notnull(v) and v > 0 else 0.0)
+    df["calc_vol"] = raw_vol.where(raw_vol > 0, candle_spread * 1250.0 + 500.0)
 
-            return df
-    except Exception:
-        pass
-    return None
+    df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
+    df["vol_mult"] = df["tp"] * df["calc_vol"]
+    df["cum_vol"] = df.groupby("date")["calc_vol"].cumsum()
+    df["cum_vp"] = df.groupby("date")["vol_mult"].cumsum()
+    df["vwap"] = df["cum_vp"] / df["cum_vol"]
+    df["vwap"] = df["vwap"].fillna(df["tp"])
+
+    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
+
+    high_low = df["high"] - df["low"]
+    high_cp = (df["high"] - df["close"].shift(1)).abs()
+    low_cp = (df["low"] - df["close"].shift(1)).abs()
+    tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(window=14, min_periods=1).mean().fillna(15.0)
+
+    return df
 
 
+# Memory cache fallback so UI never gets stuck
 if "cached_df" not in st.session_state:
     st.session_state.cached_df = None
 
@@ -1751,7 +1765,7 @@ html_code = f"""
         window.addEventListener('resize', resizeChartProperly);
         setTimeout(resizeChartProperly, 200);
 
-        // 15s auto-refresh polling directly inside the browser iframe
+        // Active 15s auto-refresh polling directly inside the browser iframe
         setTimeout(function() {{
             try {{
                 window.parent.location.reload();
