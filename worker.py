@@ -82,6 +82,22 @@ def push_to_redis(key, data_obj):
         pass
 
 
+def get_dynamic_budget():
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return BUDGET_CEILING
+    try:
+        url = f"{UPSTASH_REDIS_REST_URL}/get/user_selected_budget"
+        headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
+        r = requests.get(url, headers=headers, timeout=2)
+        if r.status_code == 200:
+            val = r.json().get("result")
+            if val:
+                return float(val)
+    except Exception:
+        pass
+    return BUDGET_CEILING
+
+
 # ==========================================
 # 3. Core Engine
 # ==========================================
@@ -100,9 +116,8 @@ class DedicatedTradingWorker:
         self.nfo_df = self.load_scrip_master()
         self.init_historical_candles()
 
-        # Immediate push so Streamlit loads charts even when markets are closed
+        # Immediate push so dashboard loads even outside market hours
         if self.candles:
-            print(f"Pushed {len(self.candles)} initial candles to Redis.")
             self.sync_state(self.candles[-1]["close"])
 
     def load_scrip_master(self):
@@ -126,7 +141,7 @@ class DedicatedTradingWorker:
 
     def init_historical_candles(self):
         now = datetime.datetime.now(IST)
-        from_str = (now - datetime.timedelta(days=6)).strftime("%Y-%m-%d 09:15")
+        from_str = (now - datetime.timedelta(days=7)).strftime("%Y-%m-%d 09:15")
         to_str = now.strftime("%Y-%m-%d %H:%M")
         try:
             resp = self.api.getCandleData({
@@ -160,7 +175,10 @@ class DedicatedTradingWorker:
             pass
         return 0.0
 
-    def find_budget_strike(self, spot_ref, is_ce, budget_target=BUDGET_CEILING):
+    def find_budget_strike(self, spot_ref, is_ce, budget_target=None):
+        if budget_target is None:
+            budget_target = get_dynamic_budget()
+
         atm = int(round(spot_ref / 50.0) * 50)
         opt_type = "CE" if is_ce else "PE"
 
@@ -234,9 +252,12 @@ class DedicatedTradingWorker:
 
         if datetime.time(9, 30) < t <= datetime.time(10, 30) and not self.locked_trade:
             if close_p > orb_h:
-                strike, sym, tok = self.find_budget_strike(close_p, is_ce=True, budget_target=BUDGET_CEILING)
+                strike, sym, tok = self.find_budget_strike(close_p, is_ce=True)
                 init_sl = round(last_c["low"] - 5.0, 1)
                 opt_ltp = self.fetch_option_ltp(sym, tok) if tok else 0.0
+                risk_pts = round(close_p - init_sl, 1)
+                delta_est = 0.50
+                opt_sl = max(0.5, round(opt_ltp - (risk_pts * delta_est), 1))
 
                 self.locked_trade = {
                     "type": "CE",
@@ -244,6 +265,9 @@ class DedicatedTradingWorker:
                     "entry": close_p,
                     "init_sl": init_sl,
                     "current_sl": init_sl,
+                    "tp1": round(close_p + 40.0, 1),
+                    "tp_mid": round(close_p + 70.0, 1),
+                    "tp_final": round(close_p + 110.0, 1),
                     "closed": False,
                     "symbol": sym,
                     "token": tok,
@@ -254,14 +278,20 @@ class DedicatedTradingWorker:
                     f"🚀 <b>ORB BREAKOUT TRIGGERED: BUY {sym}</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"• <b>ENTRY (Spot):</b> <b>{close_p:.1f}</b> | <b>Option:</b> ₹{opt_ltp:.2f}\n"
-                    f"• <b>STOP LOSS:</b> <b>{init_sl:.1f}</b>\n"
+                    f"• <b>STOP LOSS:</b> <b>{init_sl:.1f}</b> (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b>\n"
+                    f"• <b>TARGET 1:</b> <b>{close_p + 40.0:.1f}</b> (+40.0 pts)\n"
+                    f"• <b>TARGET MID:</b> <b>{close_p + 70.0:.1f}</b> (+70.0 pts)\n"
+                    f"• <b>TARGET MAX:</b> <b>{close_p + 110.0:.1f}</b> (+110.0 pts)\n"
                     f"⏰ <b>Time:</b> {last_c['dt'].strftime('%H:%M:%S')}"
                 )
 
             elif close_p < orb_l:
-                strike, sym, tok = self.find_budget_strike(close_p, is_ce=False, budget_target=BUDGET_CEILING)
+                strike, sym, tok = self.find_budget_strike(close_p, is_ce=False)
                 init_sl = round(last_c["high"] + 5.0, 1)
                 opt_ltp = self.fetch_option_ltp(sym, tok) if tok else 0.0
+                risk_pts = round(init_sl - close_p, 1)
+                delta_est = 0.50
+                opt_sl = max(0.5, round(opt_ltp - (risk_pts * delta_est), 1))
 
                 self.locked_trade = {
                     "type": "PE",
@@ -269,6 +299,9 @@ class DedicatedTradingWorker:
                     "entry": close_p,
                     "init_sl": init_sl,
                     "current_sl": init_sl,
+                    "tp1": round(close_p - 40.0, 1),
+                    "tp_mid": round(close_p - 70.0, 1),
+                    "tp_final": round(close_p - 110.0, 1),
                     "closed": False,
                     "symbol": sym,
                     "token": tok,
@@ -279,7 +312,10 @@ class DedicatedTradingWorker:
                     f"🚀 <b>ORB BREAKDOWN TRIGGERED: BUY {sym}</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"• <b>ENTRY (Spot):</b> <b>{close_p:.1f}</b> | <b>Option:</b> ₹{opt_ltp:.2f}\n"
-                    f"• <b>STOP LOSS:</b> <b>{init_sl:.1f}</b>\n"
+                    f"• <b>STOP LOSS:</b> <b>{init_sl:.1f}</b> (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b>\n"
+                    f"• <b>TARGET 1:</b> <b>{close_p - 40.0:.1f}</b> (+40.0 pts)\n"
+                    f"• <b>TARGET MID:</b> <b>{close_p - 70.0:.1f}</b> (+70.0 pts)\n"
+                    f"• <b>TARGET MAX:</b> <b>{close_p - 110.0:.1f}</b> (+110.0 pts)\n"
                     f"⏰ <b>Time:</b> {last_c['dt'].strftime('%H:%M:%S')}"
                 )
 
@@ -301,7 +337,7 @@ class DedicatedTradingWorker:
 
         recent_candles = [
             {"time": c["time"], "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"]}
-            for c in self.candles[-300:]
+            for c in self.candles[-500:]
         ]
         if self.active_bar:
             recent_candles.append({
@@ -352,7 +388,6 @@ def run_worker():
             sws.on_error = on_error
             sws.on_close = on_close
 
-            # Patch internal callbacks to prevent SDK signature mismatch crashes
             sws._on_error = on_error
             sws._on_close = on_close
 
