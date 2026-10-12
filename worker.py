@@ -54,7 +54,7 @@ threading.Thread(target=run_ping_server, daemon=True).start()
 
 
 # ==========================================
-# 2. Mathematical & Network Helpers
+# 2. Strategy Math & Network Helpers
 # ==========================================
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
@@ -136,8 +136,64 @@ class DedicatedTradingWorker:
         self.init_historical_candles()
         self.run_full_strategy_pipeline()
 
+        # THIS SENDS THE 3 TEST CARDS TO YOUR PHONE IMMEDIATELY ON STARTUP
+        self.run_instant_telegram_test()
+
         if self.candles:
             self.sync_state(self.candles[-1]["close"])
+
+    def run_instant_telegram_test(self):
+        """Sends Card 1, Card 2, and Card 3 to Telegram so you can check your phone right now."""
+        time_str = datetime.datetime.now(IST).strftime("%H:%M:%S")
+
+        # Card 1: Trigger Alert
+        send_telegram_alert(
+            f"🚀 <b>ORB BREAKOUT TRIGGERED: BUY CE</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>CONTRACT:</b> NIFTY 22400 CE\n"
+            f"<b>MODE:</b> Budget (&lt; ₹80) | <b>QTY:</b> {LOT_SIZE_QTY} (Δ: 0.50)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>LEVEL | INDEX (SPOT) | OPTION (₹)</b>\n"
+            f"• <b>ENTRY:</b> 22410.0 | <b>₹78.50</b>\n"
+            f"• <b>STOP LOSS:</b> 22390.0 (-20.0 pts) | <b>₹68.50</b> (-₹650)\n"
+            f"• <b>TARGET 1:</b> 22450.0 (+40.0 pts) | <b>₹98.50</b> (+₹1300)\n"
+            f"• <b>TARGET 2:</b> 22485.0 (+75.0 pts) | <b>₹116.00</b> (+₹2437)\n"
+            f"• <b>TARGET 3:</b> 22530.0 (+120.0 pts) | <b>₹138.50</b> (+₹3900)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🛡 <b>Initial SL:</b> Spot: 22390.0 | Option: ₹68.50\n"
+            f"⏰ <b>Trigger Time:</b> {time_str}"
+        )
+
+        time.sleep(2)
+
+        # Card 2: Trailing SL Update Alert
+        send_telegram_alert(
+            f"🔔 <b>NIFTY CE TRAILING SL UPDATED (TARGET 1 MET)</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>CONTRACT:</b> NIFTY 22400 CE (Qty: {LOT_SIZE_QTY})\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🛡 <b>SET STOP LOSS TO:</b>\n"
+            f"• <b>INDEX (SPOT):</b> 22412.0\n"
+            f"• <b>OPTION (GTT ₹):</b> ₹78.50\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔒 <b>LOCKED PROFIT:</b> 0.0 pts (₹0) [COST LOCKED]\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 <b>NEXT HURDLE:</b> Target 2: 22485.0\n"
+            f"📍 <b>Status:</b> RUNNER PROTECTED (Dynamic Cushion Active)\n"
+            f"⏰ <b>Time:</b> {time_str}"
+        )
+
+        time.sleep(2)
+
+        # Card 3: Trade Closed Alert
+        send_telegram_alert(
+            f"🏁 <b>TRADE CLOSED (NIFTY CE - STOP HIT)</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🚪 <b>Exit Price (Spot):</b> 22470.0\n"
+            f"💰 <b>Final Net Spot:</b> +60.0 pts\n"
+            f"💵 <b>Final Net Option:</b> +₹1950\n"
+            f"⏰ <b>Exit Time:</b> {time_str}"
+        )
 
     def load_scrip_master(self):
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -186,10 +242,6 @@ class DedicatedTradingWorker:
             print(f"Candle fetch notice: {e}")
 
     def compute_all_confluence_targets(self, df_h, entry_p, is_ce):
-        """
-        Collects all structural hurdles ahead of entry.
-        Filters out noise (< 25 pts) and orders them naturally.
-        """
         high_low = df_h["high"] - df_h["low"]
         high_close = (df_h["high"] - df_h["close"].shift()).abs()
         low_close = (df_h["low"] - df_h["close"].shift()).abs()
@@ -249,7 +301,6 @@ class DedicatedTradingWorker:
         df_h = pd.DataFrame(self.candles)
         df_h["date_str"] = df_h["dt"].dt.strftime("%Y-%m-%d")
 
-        # 1. Indicators
         candle_spread = (df_h["high"] - df_h["low"]) + (df_h["close"] - df_h["open"]).abs()
         df_h["calc_vol"] = candle_spread * 1250.0 + 500.0
         df_h["tp"] = (df_h["high"] + df_h["low"] + df_h["close"]) / 3.0
@@ -260,7 +311,6 @@ class DedicatedTradingWorker:
         df_h["vwap"] = (df_h["cum_pv"] / df_h["cum_vol"]).round(2)
         df_h["ema9"] = df_h["close"].ewm(span=9, adjust=False).mean().round(2)
 
-        # 14-period ATR
         high_low = df_h["high"] - df_h["low"]
         high_close = (df_h["high"] - df_h["close"].shift()).abs()
         low_close = (df_h["low"] - df_h["close"].shift()).abs()
@@ -272,7 +322,6 @@ class DedicatedTradingWorker:
             self.candles[i]["ema9"] = float(df_h.iloc[i]["ema9"])
             self.candles[i]["atr14"] = float(df_h.iloc[i]["atr14"])
 
-        # 2. Daily Floor Pivots
         unique_days = list(df_h["date_str"].unique())
         if len(unique_days) >= 2:
             prev_day_df = df_h[df_h["date_str"] == unique_days[-2]]
@@ -291,7 +340,6 @@ class DedicatedTradingWorker:
                     "PDL": pdl,
                 }
 
-        # 3. Session Opening Range
         today_bars = df_h[df_h["date_str"] == unique_days[-1]]
         orb_window = today_bars[(today_bars["dt"].dt.time >= datetime.time(9, 15)) & (today_bars["dt"].dt.time < datetime.time(9, 30))]
 
@@ -306,7 +354,6 @@ class DedicatedTradingWorker:
         orb_range_val = max(15.0, round(curr_orb_h - curr_orb_l, 2))
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
-        # 4. Multi-Day Historical Evaluation
         self.markers = []
         self.history_cards = {}
         last_found_trade = None
@@ -329,7 +376,6 @@ class DedicatedTradingWorker:
 
                 if datetime.time(9, 30) <= t <= datetime.time(11, 30) and not executed:
                     if c > d_h and c > vw and c > em:
-                        # Initial SL = Trigger Candle Low - 5 pts
                         sl_val = round(float(r["low"]) - 5.0, 1)
                         t_list = self.compute_all_confluence_targets(df_h.iloc[:idx+1], c, is_ce=True)
                         t_sec = int(r["time"])
@@ -355,7 +401,6 @@ class DedicatedTradingWorker:
                         executed = True
 
                     elif c < d_l and c < vw and c < em:
-                        # Initial SL = Trigger Candle High + 5 pts
                         sl_val = round(float(r["high"]) + 5.0, 1)
                         t_list = self.compute_all_confluence_targets(df_h.iloc[:idx+1], c, is_ce=False)
                         t_sec = int(r["time"])
@@ -380,7 +425,6 @@ class DedicatedTradingWorker:
                         last_found_trade = card
                         executed = True
 
-        # 5. Populate Multi-Row Strategy HUD Data
         last_close = float(self.candles[-1]["close"])
         active_t = self.locked_trade
 
@@ -415,7 +459,6 @@ class DedicatedTradingWorker:
             delta_v = 0.50
             sym = f"NIFTY {int(round(last_close / 50.0) * 50)} {t_type}"
 
-        # Fib Extensions
         if t_type == "CE":
             self.fib_lines = {
                 "fib_100": round(curr_orb_h + (1.000 * orb_range_val), 1),
@@ -555,7 +598,7 @@ class DedicatedTradingWorker:
         df_curr = pd.DataFrame(self.candles)
 
         if datetime.time(9, 30) <= t <= datetime.time(11, 30) and not self.locked_trade:
-            # CE Breakout Trigger
+            # CE Breakout
             if close_p > orb_h:
                 strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=True)
                 init_sl = round(last_c["low"] - 5.0, 1)
@@ -608,7 +651,7 @@ class DedicatedTradingWorker:
                     f"⏰ <b>Trigger Time:</b> {last_c['dt'].strftime('%H:%M:%S')}"
                 )
 
-            # PE Breakdown Trigger
+            # PE Breakdown
             elif close_p < orb_l:
                 strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=False)
                 init_sl = round(last_c["high"] + 5.0, 1)
@@ -662,12 +705,6 @@ class DedicatedTradingWorker:
                 )
 
     def evaluate_live_trail_and_exit(self, live_spot):
-        """
-        Progressive Dynamic Ratchet:
-        - Target 1 hit (+35 to +50 pts) -> Move SL to Break-Even (Cost).
-        - Price reaches +60 to +75 pts -> Cushion shrinks to 1.0x ATR (~15 pts behind peak).
-        - Price reaches +90 pts+ -> Cushion shrinks to 0.75x ATR (~11 pts behind peak) OR behind prev candle extreme.
-        """
         if not self.locked_trade or self.locked_trade.get("closed"):
             return
 
@@ -681,19 +718,14 @@ class DedicatedTradingWorker:
         atr_val = max(12.0, float(self.candles[-1].get("atr14", 15.0)))
         t_now = datetime.datetime.now(IST).strftime("%H:%M:%S")
 
-        # Track favorable excursion
         if is_ce:
             tr["peak_extreme"] = max(tr.get("peak_extreme", entry_p), live_spot)
-            pts_gain = live_spot - entry_p
             peak_gain = tr["peak_extreme"] - entry_p
         else:
             tr["peak_extreme"] = min(tr.get("peak_extreme", entry_p), live_spot)
-            pts_gain = entry_p - live_spot
             peak_gain = entry_p - tr["peak_extreme"]
 
-        # -------------------------------------------------------------
-        # STEP 1: Check Target Hit Progression
-        # -------------------------------------------------------------
+        # Step 1: Milestone Target Crossings
         for idx, tg_p in enumerate(targets, start=1):
             if current_stage < idx:
                 crossed = (live_spot >= tg_p) if is_ce else (live_spot <= tg_p)
@@ -701,7 +733,6 @@ class DedicatedTradingWorker:
                     tr["trail_stage"] = idx
 
                     if idx == 1:
-                        # Target 1 Met -> Trail to Cost / Break-Even
                         cost_buffer = 2.0 if is_ce else -2.0
                         new_sl = round(entry_p + cost_buffer, 1)
                         tr["current_sl"] = new_sl
@@ -710,7 +741,6 @@ class DedicatedTradingWorker:
                         gtt_opt = opt_entry
                         lock_title = "0.0 pts (₹0) [COST LOCKED]"
                     else:
-                        # Target 2+ Met -> Trail behind previous structural hurdle
                         prev_tg = targets[idx - 2]
                         new_sl = prev_tg
                         tr["current_sl"] = new_sl
@@ -738,19 +768,10 @@ class DedicatedTradingWorker:
                         f"⏰ <b>Time:</b> {t_now}"
                     )
 
-        # -------------------------------------------------------------
-        # STEP 2: Progressive Dynamic Ratchet (Room Shrinks as Gain Expands)
-        # -------------------------------------------------------------
+        # Step 2: Progressive Ratchet (Shrinks cushion as profit grows)
         if peak_gain >= 60.0:
-            # Determine dynamic cushion
-            if peak_gain >= 90.0:
-                # Deep runner: only give 0.75x ATR room (approx 10-12 pts)
-                cushion = max(10.0, 0.75 * atr_val)
-            else:
-                # Mid runner (+60 to +90 pts): give 1.0x ATR room (approx 14-16 pts)
-                cushion = max(13.0, 1.00 * atr_val)
+            cushion = max(10.0, 0.75 * atr_val) if peak_gain >= 90.0 else max(13.0, 1.00 * atr_val)
 
-            # Check candle low/high anchor for additional tight protection
             prev_candle_extreme = None
             if len(self.candles) >= 2:
                 if is_ce:
@@ -763,7 +784,6 @@ class DedicatedTradingWorker:
                 if prev_candle_extreme and peak_gain >= 90.0:
                     candidate_trail = max(candidate_trail, prev_candle_extreme)
 
-                # Never move stop backward
                 if candidate_trail > tr["current_sl"]:
                     tr["current_sl"] = candidate_trail
             else:
@@ -771,13 +791,10 @@ class DedicatedTradingWorker:
                 if prev_candle_extreme and peak_gain >= 90.0:
                     candidate_trail = min(candidate_trail, prev_candle_extreme)
 
-                # Never move stop backward
                 if candidate_trail < tr["current_sl"]:
                     tr["current_sl"] = candidate_trail
 
-        # -------------------------------------------------------------
-        # STEP 3: Stop Hit Exit
-        # -------------------------------------------------------------
+        # Step 3: Stop-Loss Hit Trigger
         stop_hit = (live_spot <= tr["current_sl"]) if is_ce else (live_spot >= tr["current_sl"])
         if stop_hit:
             tr["closed"] = True
