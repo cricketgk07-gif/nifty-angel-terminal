@@ -100,6 +100,11 @@ class DedicatedTradingWorker:
         self.nfo_df = self.load_scrip_master()
         self.init_historical_candles()
 
+        # Immediate push so Streamlit loads charts even when markets are closed
+        if self.candles:
+            print(f"Pushed {len(self.candles)} initial candles to Redis.")
+            self.sync_state(self.candles[-1]["close"])
+
     def load_scrip_master(self):
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
         try:
@@ -136,8 +141,12 @@ class DedicatedTradingWorker:
                     dt = pd.to_datetime(b[0])
                     t_sec = int((dt.tz_localize(None) - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1))
                     self.candles.append({
-                        "time": t_sec, "open": float(b[1]), "high": float(b[2]),
-                        "low": float(b[3]), "close": float(b[4]), "dt": dt
+                        "time": t_sec,
+                        "open": float(b[1]),
+                        "high": float(b[2]),
+                        "low": float(b[3]),
+                        "close": float(b[4]),
+                        "dt": dt,
                     })
         except Exception:
             pass
@@ -193,7 +202,12 @@ class DedicatedTradingWorker:
                 self.candles.append(self.active_bar.copy())
                 self.evaluate_strategy()
             self.active_bar = {
-                "time": t_sec, "open": ltp, "high": ltp, "low": ltp, "close": ltp, "dt": bar_dt
+                "time": t_sec,
+                "open": ltp,
+                "high": ltp,
+                "low": ltp,
+                "close": ltp,
+                "dt": bar_dt,
             }
         else:
             self.active_bar["high"] = max(self.active_bar["high"], ltp)
@@ -225,10 +239,16 @@ class DedicatedTradingWorker:
                 opt_ltp = self.fetch_option_ltp(sym, tok) if tok else 0.0
 
                 self.locked_trade = {
-                    "type": "CE", "strike": strike, "entry": close_p,
-                    "init_sl": init_sl, "current_sl": init_sl, "closed": False,
-                    "symbol": sym, "token": tok, "opt_entry_ltp": opt_ltp,
-                    "time": last_c["time"]
+                    "type": "CE",
+                    "strike": strike,
+                    "entry": close_p,
+                    "init_sl": init_sl,
+                    "current_sl": init_sl,
+                    "closed": False,
+                    "symbol": sym,
+                    "token": tok,
+                    "opt_entry_ltp": opt_ltp,
+                    "time": last_c["time"],
                 }
                 send_telegram_alert(
                     f"🚀 <b>ORB BREAKOUT TRIGGERED: BUY {sym}</b>\n"
@@ -244,10 +264,16 @@ class DedicatedTradingWorker:
                 opt_ltp = self.fetch_option_ltp(sym, tok) if tok else 0.0
 
                 self.locked_trade = {
-                    "type": "PE", "strike": strike, "entry": close_p,
-                    "init_sl": init_sl, "current_sl": init_sl, "closed": False,
-                    "symbol": sym, "token": tok, "opt_entry_ltp": opt_ltp,
-                    "time": last_c["time"]
+                    "type": "PE",
+                    "strike": strike,
+                    "entry": close_p,
+                    "init_sl": init_sl,
+                    "current_sl": init_sl,
+                    "closed": False,
+                    "symbol": sym,
+                    "token": tok,
+                    "opt_entry_ltp": opt_ltp,
+                    "time": last_c["time"],
                 }
                 send_telegram_alert(
                     f"🚀 <b>ORB BREAKDOWN TRIGGERED: BUY {sym}</b>\n"
@@ -279,9 +305,11 @@ class DedicatedTradingWorker:
         ]
         if self.active_bar:
             recent_candles.append({
-                "time": self.active_bar["time"], "open": self.active_bar["open"],
-                "high": self.active_bar["high"], "low": self.active_bar["low"],
-                "close": self.active_bar["close"]
+                "time": self.active_bar["time"],
+                "open": self.active_bar["open"],
+                "high": self.active_bar["high"],
+                "low": self.active_bar["low"],
+                "close": self.active_bar["close"],
             })
 
         payload = {
@@ -289,7 +317,7 @@ class DedicatedTradingWorker:
             "opt_ltp": opt_ltp,
             "candles": recent_candles,
             "locked_trade": self.locked_trade,
-            "updated_at": time.time()
+            "updated_at": time.time(),
         }
         push_to_redis("nifty_live_state", payload)
 
@@ -323,7 +351,7 @@ def run_worker():
             sws.on_data = on_data
             sws.on_error = on_error
             sws.on_close = on_close
-            
+
             # Patch internal callbacks to prevent SDK signature mismatch crashes
             sws._on_error = on_error
             sws._on_close = on_close
