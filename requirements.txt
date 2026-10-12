@@ -6,3 +6,4 @@ requests
 smartapi-python
 websocket-client
 logzero
+python-dotenv
