@@ -87,6 +87,17 @@ def read_from_redis(key="nifty_live_state"):
     return None
 
 
+def write_selected_budget(budget_val):
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return
+    url = f"{UPSTASH_REDIS_REST_URL}/set/user_selected_budget"
+    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
+    try:
+        requests.post(url, headers=headers, data=str(budget_val), timeout=2)
+    except Exception:
+        pass
+
+
 live_state = read_from_redis("nifty_live_state")
 
 if not live_state or "candles" not in live_state or len(live_state["candles"]) == 0:
@@ -143,25 +154,62 @@ curr_orb_l = today_orb["low"].min() if len(today_orb) > 0 else today_df.iloc[0:3
 
 ctrl_cols = st.columns([2.2, 0.9, 6.9])
 
+budget_map = {
+    "Budget (< ₹50)": 45.0,
+    "Budget (< ₹60)": 55.0,
+    "Budget (< ₹70)": 65.0,
+    "Budget (< ₹80)": 75.0,
+    "Budget (< ₹90)": 85.0,
+    "Budget (< ₹100)": 95.0,
+    "ATM (At-The-Money)": 130.0,
+}
+
 with ctrl_cols[0]:
     mode_selection = st.selectbox(
         "Budget",
-        [
-            "Budget (< ₹50)",
-            "Budget (< ₹60)",
-            "Budget (< ₹70)",
-            "Budget (< ₹80)",
-            "Budget (< ₹90)",
-            "Budget (< ₹100)",
-            "ATM (At-The-Money)",
-        ],
+        list(budget_map.keys()),
         index=3,
     )
+    # Write chosen budget to Redis to drive worker.py
+    write_selected_budget(budget_map.get(mode_selection, 75.0))
 
 with ctrl_cols[1]:
     sel_lots = st.number_input("Lots", min_value=1, max_value=100, value=1, step=1)
 
 total_qty = sel_lots * LOT_SIZE_QTY
+
+# Markers and Trade Scanner
+markers = []
+historical_trade_cards = {}
+for session_date, day_df in df.groupby("date"):
+    orb_window = day_df[(day_df["dt"].dt.time >= datetime.time(9, 15)) & (day_df["dt"].dt.time <= datetime.time(9, 30))]
+    if len(orb_window) < 3:
+        continue
+    d_orb_h = orb_window["high"].max()
+    d_orb_l = orb_window["low"].min()
+    executed = False
+    for idx, r in day_df.iterrows():
+        t = r["dt"].time()
+        c = r["close"]
+        if datetime.time(9, 30) < t <= datetime.time(10, 30) and not executed:
+            if c > d_orb_h and c > r["vwap"] and c > r["ema9"]:
+                sl_val = round(r["low"] - 5.0, 1)
+                markers.append({"time": int(r["time"]), "position": "belowBar", "color": "#00bfa5", "shape": "arrowUp", "text": f"BUY CE @ {c:.1f}"})
+                historical_trade_cards[int(r["time"])] = {
+                    "title": "BUY CE (ORB BREAKOUT)", "entry": round(c, 1),
+                    "target": round(c + 70.0, 1), "target_pts": 70.0,
+                    "sl": sl_val, "sl_pts": round(c - sl_val, 1), "type": "CE"
+                }
+                executed = True
+            elif c < d_orb_l and c < r["vwap"] and c < r["ema9"]:
+                sl_val = round(r["high"] + 5.0, 1)
+                markers.append({"time": int(r["time"]), "position": "aboveBar", "color": "#f23645", "shape": "arrowDown", "text": f"BUY PE @ {c:.1f}"})
+                historical_trade_cards[int(r["time"])] = {
+                    "title": "BUY PE (ORB BREAKDOWN)", "entry": round(c, 1),
+                    "target": round(c - 70.0, 1), "target_pts": 70.0,
+                    "sl": sl_val, "sl_pts": round(sl_val - c, 1), "type": "PE"
+                }
+                executed = True
 
 locked_trade = live_state.get("locked_trade")
 active_symbol = locked_trade.get("symbol", f"NIFTY {int(round(spot_price/50)*50)} CE") if locked_trade else f"NIFTY {int(round(spot_price/50)*50)} CE"
@@ -203,6 +251,7 @@ volume_data = [
     for _, r in df.iterrows()
 ]
 
+# 3-Column Strategy HUD Payload
 hud_payload = None
 if locked_trade:
     is_ce = locked_trade["type"] == "CE"
@@ -221,8 +270,8 @@ if locked_trade:
         "target_mid": f"{entry_p + 70:.1f} (+70.0 pts)" if is_ce else f"{entry_p - 70:.1f} (+70.0 pts)",
         "target_final": f"{entry_p + 110:.1f} (+110.0 pts)" if is_ce else f"{entry_p - 110:.1f} (+110.0 pts)",
         "trailing_sl": f"{trail_p:.1f}",
-        "trail_stage": "ACTIVE CLOUD TRADE",
-        "pnl_label": "Secured P&L",
+        "trail_stage": "ACTIVE CLOUD RUNNER",
+        "pnl_label": "Secured P&L (at SL)",
         "pts_display": f"{secured_pts:+.1f} pts",
         "inr_display": f"{int(round(secured_pts * active_delta * total_qty)):+d}",
         "pnl_theme": "#089981" if secured_pts >= 0 else "#f23645",
@@ -246,7 +295,8 @@ candles_json = json.dumps(candles_data)
 volume_json = json.dumps(volume_data)
 vwap_json = json.dumps([{"time": int(r["time"]), "value": round(float(r["vwap"]), 2)} for _, r in df.iterrows()])
 ema_json = json.dumps([{"time": int(r["time"]), "value": round(float(r["ema9"]), 2)} for _, r in df.iterrows()])
-markers_json = json.dumps([])
+markers_json = json.dumps(markers)
+history_cards_json = json.dumps(historical_trade_cards)
 pivots_json = json.dumps(pivot_lines_data)
 hud_json = json.dumps(hud_payload)
 
@@ -256,7 +306,6 @@ chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
-# Upstash REST credentials for browser client
 redis_url_str = UPSTASH_REDIS_REST_URL
 redis_token_str = UPSTASH_REDIS_REST_TOKEN
 
@@ -370,35 +419,12 @@ html_code = f"""
         .text-trail {{ color: #2962ff; font-weight: bold; }}
         .text-stage {{ color: #00e5ff; font-size: 8.5px; font-weight: bold; }}
 
-        .tv-widget-item {{
-            position: absolute; z-index: 55; user-select: none; touch-action: none;
-            font-family: sans-serif; border-radius: 4px; overflow: visible;
-            display: flex; flex-direction: column; width: 220px;
+        .history-signal-tag {{
+            position: absolute; z-index: 55; pointer-events: none; display: none;
+            background: rgba(22, 26, 37, 0.96); border: 1px solid #363c4e; border-radius: 5px;
+            padding: 5px 8px; font-size: 9.5px; color: #d1d4dc; line-height: 1.4;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.7); transform: translate(-50%, -100%);
         }}
-        .tv-pos-zone {{
-            position: relative; padding: 6px 8px; font-size: 9px;
-            display: flex; flex-direction: column; justify-content: center;
-        }}
-        .tv-pos-green {{ background: rgba(8, 153, 129, 0.40); border: 1.5px solid #089981; }}
-        .tv-pos-red {{ background: rgba(242, 54, 69, 0.40); border: 1.5px solid #f23645; }}
-        .tv-touch-circle {{
-            position: absolute; right: 4px; width: 14px; height: 14px;
-            background: #ffffff; border: 2px solid #2962ff; border-radius: 50%;
-            cursor: ns-resize; touch-action: none; z-index: 68;
-        }}
-        .tv-center-handle {{
-            position: absolute; left: 4px; width: 12px; height: 12px;
-            background: #2962ff; border: 2px solid #ffffff; border-radius: 50%;
-            cursor: move; touch-action: none; z-index: 68; top: -5px;
-        }}
-        .tv-del-btn {{
-            position: absolute; top: -9px; right: -9px; z-index: 70;
-            background: #1e222d; border: 1px solid #f23645; color: #f23645;
-            border-radius: 50%; width: 20px; height: 20px; font-size: 11px;
-            display: flex; align-items: center; justify-content: center; cursor: pointer;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.8); font-weight: 800;
-        }}
-        .chart-click-crosshair {{ cursor: crosshair !important; }}
     </style>
 </head>
 <body>
@@ -442,9 +468,15 @@ html_code = f"""
 
     <div id="chartArea"></div>
     <div id="strategyBox" class="draggable-strategy-box" style="display: none;"></div>
-    <div id="activeToolsContainer"></div>
+    <div id="historyTag" class="history-signal-tag"></div>
 
     <script>
+        const activeRealLTP = {live_real_ltp};
+        const activeDelta = {active_delta};
+        const activeLots = {sel_lots};
+        const LOT_SIZE = {LOT_SIZE_QTY};
+        const activeQty = activeLots * LOT_SIZE;
+
         const chartContainer = document.getElementById('chartArea');
         const chart = LightweightCharts.createChart(chartContainer, {{
             width: chartContainer.clientWidth,
@@ -475,6 +507,8 @@ html_code = f"""
         const emaSeries = chart.addLineSeries({{ color: '#2962ff', lineWidth: 1, title: '9-EMA' }});
         emaSeries.setData({ema_json});
 
+        candleSeries.setMarkers({markers_json});
+
         candleSeries.createPriceLine({{ price: {curr_orb_h:.2f}, color: '#089981', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, title: 'ORB HIGH' }});
         candleSeries.createPriceLine({{ price: {curr_orb_l:.2f}, color: '#f23645', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, title: 'ORB LOW' }});
 
@@ -484,24 +518,134 @@ html_code = f"""
             candleSeries.createPriceLine({{ price: pv.R1, color: '#f23645', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, title: 'R1' }});
             candleSeries.createPriceLine({{ price: pv.S1, color: '#089981', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, title: 'S1' }});
             candleSeries.createPriceLine({{ price: pv.PDH, color: '#ffb300', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, title: 'PDH' }});
-            candleSeries.createPriceLine({{ price: pv.PDL, color: '#fb8c00', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, title: 'PDL' }});
+            candleSeries.createPriceLine({{ price: pv.PDL, color: '#fb8c00', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, title: 'PDL' }}} );
         }}
 
-        // Render Strategy HUD
+        // Render 3-Column HUD
         const s = {hud_json};
         const table = document.getElementById('strategyBox');
         if (s) {{
             table.style.display = 'block';
-            table.innerHTML = `
-                <div class="box-drag-handle">::: STRATEGY HUD :::</div>
-                <table>
-                    <tr><td class="label-cell">Session Status</td><td class="val-cell" colspan="2"><span class="tag-pill" style="background:#546e7a;">${{s.status || s.call_or_put}}</span></td></tr>
-                    <tr><td class="label-cell">Reason</td><td class="val-cell" colspan="2" style="font-size:9px; color:#cfd3dc;">${{s.reason}}</td></tr>
-                    <tr><td class="label-cell">Target 1</td><td class="val-cell text-green">${{s.target1 || 'N/A'}}</td></tr>
-                    <tr><td class="label-cell">Trailing SL</td><td class="val-cell text-trail">${{s.trailing_sl || 'N/A'}}</td></tr>
-                </table>
-            `;
+            if (s.is_no_trade) {{
+                table.innerHTML = `
+                    <div class="box-drag-handle">::: STRATEGY HUD :::</div>
+                    <table>
+                        <tr><td class="label-cell">Session Status</td><td class="val-cell" colspan="2"><span class="tag-pill" style="background:#546e7a;">${{s.status}}</span></td></tr>
+                        <tr><td class="label-cell">Reason</td><td class="val-cell" colspan="2" style="font-size:9px; color:#cfd3dc;">${{s.reason}}</td></tr>
+                        <tr><td class="label-cell">Action</td><td class="val-cell text-green" colspan="2">${{s.action}}</td></tr>
+                    </table>
+                `;
+            }} else {{
+                const optRiskPts = Math.round((s.raw_risk_pts * activeDelta) * 10) / 10;
+                const optSLPrice = Math.max(0.0, Math.round((activeRealLTP - optRiskPts) * 10) / 10);
+                const totalMaxRisk = Math.round(optRiskPts * activeQty);
+
+                const optT1Pts = Math.round((s.raw_target1_pts * activeDelta) * 10) / 10;
+                const optT1Price = Math.round((activeRealLTP + optT1Pts) * 10) / 10;
+                const totalT1Profit = Math.round(optT1Pts * activeQty);
+
+                const optMidPts = Math.round((s.raw_target_mid_pts * activeDelta) * 10) / 10;
+                const optMidPrice = Math.round((activeRealLTP + optMidPts) * 10) / 10;
+
+                const optFinalPts = Math.round((s.raw_target_final_pts * activeDelta) * 10) / 10;
+                const optFinalPrice = Math.round((activeRealLTP + optFinalPts) * 10) / 10;
+
+                const optTrailPts = Math.round((s.raw_secured_pts * activeDelta) * 10) / 10;
+                const optTrailPrice = Math.max(0.0, Math.round((activeRealLTP + optTrailPts) * 10) / 10);
+
+                table.innerHTML = `
+                    <div class="box-drag-handle">::: STRATEGY HUD :::</div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Parameter</th>
+                                <th>Index (Spot)</th>
+                                <th>Option ({active_symbol})</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td class="label-cell">Call or Put</td>
+                                <td class="val-cell"><span class="tag-pill" style="background:${{s.theme}}">${{s.call_or_put}}</span></td>
+                                <td class="opt-cell"><span class="tag-pill" style="background:${{s.theme}}">${{s.call_or_put}}</span></td>
+                            </tr>
+                            <tr>
+                                <td class="label-cell">Entry</td>
+                                <td class="val-cell"><b>${{s.entry}}</b></td>
+                                <td class="opt-cell">₹${{activeRealLTP.toFixed(2)}}</td>
+                            </tr>
+                            <tr>
+                                <td class="label-cell">SL (risk pts)</td>
+                                <td class="val-cell text-red">${{s.sl_risk}}</td>
+                                <td class="opt-cell text-red">₹${{optSLPrice.toFixed(2)}} (-₹${{totalMaxRisk}})</td>
+                            </tr>
+                            <tr>
+                                <td class="label-cell">Target 1</td>
+                                <td class="val-cell text-green">${{s.target1}}</td>
+                                <td class="opt-cell text-green">₹${{optT1Price.toFixed(2)}} (+₹${{totalT1Profit}})</td>
+                            </tr>
+                            <tr>
+                                <td class="label-cell">Target Mid</td>
+                                <td class="val-cell text-green">${{s.target_mid}}</td>
+                                <td class="opt-cell text-green">₹${{optMidPrice.toFixed(2)}}</td>
+                            </tr>
+                            <tr>
+                                <td class="label-cell">Target Final</td>
+                                <td class="val-cell text-green"><b>${{s.target_final}}</b></td>
+                                <td class="opt-cell text-green"><b>₹${{optFinalPrice.toFixed(2)}}</b></td>
+                            </tr>
+                            <tr>
+                                <td class="label-cell">Trailing SL</td>
+                                <td class="val-cell text-trail">${{s.trailing_sl}}</td>
+                                <td class="opt-cell text-trail">₹${{optTrailPrice.toFixed(2)}}</td>
+                            </tr>
+                            <tr>
+                                <td class="label-cell">${{s.pnl_label}}</td>
+                                <td class="val-cell" style="color:${{s.pnl_theme}}; font-weight:800;">${{s.pts_display}}</td>
+                                <td class="opt-cell" style="color:${{s.pnl_theme}}; font-weight:800;">₹${{s.inr_display}}</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                `;
+            }}
         }}
+
+        const historyCards = {history_cards_json};
+        const hTag = document.getElementById('historyTag');
+
+        chart.subscribeCrosshairMove(param => {{
+            if (!param.time || !param.seriesData.get(candleSeries)) {{
+                hTag.style.display = 'none';
+                return;
+            }}
+            const bar = param.seriesData.get(candleSeries);
+            document.getElementById('barO').innerText = bar.open.toFixed(2);
+            document.getElementById('barH').innerText = bar.high.toFixed(2);
+            document.getElementById('barL').innerText = bar.low.toFixed(2);
+            document.getElementById('barC').innerText = bar.close.toFixed(2);
+            const vBar = param.seriesData.get(vwapSeries);
+            if (vBar) document.getElementById('barVWAP').innerText = vBar.value.toFixed(2);
+            const eBar = param.seriesData.get(emaSeries);
+            if (eBar) document.getElementById('barEMA').innerText = eBar.value.toFixed(2);
+
+            const sig = historyCards[param.time];
+            if (sig && param.point) {{
+                hTag.style.display = 'block';
+                hTag.style.left = param.point.x + 'px';
+                hTag.style.top = (param.point.y - 12) + 'px';
+                const tagColor = sig.type === 'CE' ? '#00bfa5' : '#f23645';
+                hTag.innerHTML = `
+                    <div style="font-weight:bold; color:${{tagColor}}; border-bottom:1px solid #363c4e; padding-bottom:2px; margin-bottom:3px;">
+                        ${{sig.title}}
+                    </div>
+                    <div><b>Entry:</b> ${{sig.entry.toFixed(1)}}</div>
+                    <div><b>Target:</b> ${{sig.target.toFixed(1)}} (+${{sig.target_pts.toFixed(1)}} pts)</div>
+                    <div><b>Stop Loss:</b> ${{sig.sl.toFixed(1)}} (-${{sig.sl_pts.toFixed(1)}} pts)</div>
+                `;
+            }} else {{
+                hTag.style.display = 'none';
+            }}
+        }});
 
         function makeDraggable(elem) {{
             let isDragging = false, startX, startY, initLeft, initTop;
@@ -532,7 +676,6 @@ html_code = f"""
         }}
         makeDraggable(table);
 
-        // Fetch Live State From Upstash (Polls Every 1.5s Without Full Page Reloads)
         const redisUrl = "{redis_url_str}";
         const redisToken = "{redis_token_str}";
 
