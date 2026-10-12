@@ -176,7 +176,7 @@ total_qty = sel_lots * LOT_SIZE_QTY
 markers = live_state.get("markers", [])
 historical_trade_cards = live_state.get("history_cards", {})
 
-# Calculate Today's ORB Lines and Fibonacci Extensions
+# Calculate Today's ORB Lines and Range
 latest_session_date = df["date"].iloc[-1]
 today_df = df[df["date"] == latest_session_date]
 today_orb = today_df[(today_df["dt"].dt.time >= datetime.time(9, 15)) & (today_df["dt"].dt.time <= datetime.time(9, 30))]
@@ -185,10 +185,9 @@ curr_orb_h = float(today_orb["high"].max()) if len(today_orb) > 0 else float(tod
 curr_orb_l = float(today_orb["low"].min()) if len(today_orb) > 0 else float(today_df.iloc[0:3]["low"].min())
 orb_range_val = max(10.0, curr_orb_h - curr_orb_l)
 
-# Check if there is an active trade in worker or a detected trade today
+# Prioritize Live Worker Trade, or find Today's Detected Trade from history_cards
 locked_trade = live_state.get("locked_trade")
 
-# Search history cards for today's trade if no live trade is active
 today_card = None
 for t_sec, card in historical_trade_cards.items():
     if card.get("date") == str(latest_session_date):
@@ -217,10 +216,10 @@ elif today_card:
     active_symbol = f"NIFTY {strike_val} {t_type}"
     active_delta = 0.50
 else:
-    # Awaiting ORB breakout today
+    # Awaiting breakout: SL is strictly bounded to 20 pts from entry, NOT the opposite range extreme
     t_type = "CE" if spot_price >= curr["vwap"] else "PE"
     entry_p = curr_orb_h if t_type == "CE" else curr_orb_l
-    sl_p = round(curr_orb_l - 5.0 if t_type == "CE" else curr_orb_h + 5.0, 1)
+    sl_p = round(curr_orb_h - 20.0 if t_type == "CE" else curr_orb_l + 20.0, 1)
     trail_p = sl_p
     t1_p = round(curr_orb_h + (1.000 * orb_range_val) if t_type == "CE" else curr_orb_l - (1.000 * orb_range_val), 1)
     tmid_p = round(curr_orb_h + (1.618 * orb_range_val) if t_type == "CE" else curr_orb_l - (1.618 * orb_range_val), 1)
@@ -238,7 +237,7 @@ tmid_pts = round(abs(tmid_p - entry_p), 1)
 tfinal_pts = round(abs(tfinal_p - entry_p), 1)
 secured_pts = round(trail_p - entry_p, 1) if t_type == "CE" else round(entry_p - trail_p, 1)
 
-# Fibonacci Extension Lines for ORB Breakout
+# Fibonacci Extensions for Current Day
 if t_type == "CE":
     fib_100 = round(curr_orb_h + (1.000 * orb_range_val), 1)
     fib_161 = round(curr_orb_h + (1.618 * orb_range_val), 1)
@@ -581,7 +580,7 @@ html_code = f"""
         const emaSeries = chart.addLineSeries({{ color: '#2962ff', lineWidth: 1, title: '9-EMA' }});
         emaSeries.setData({ema_json});
 
-        // Set Historical Breakout Markers straight from Worker
+        // Historical Breakout Markers directly from Worker
         candleSeries.setMarkers({markers_json});
 
         // Current ORB Lines
@@ -931,6 +930,3 @@ html_code = f"""
     </script>
 </body>
 </html>
-"""
-
-components.html(html_code, height=650, scrolling=False)
