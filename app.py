@@ -71,6 +71,17 @@ IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 LOT_SIZE_QTY = 65
 
 
+def norm_cdf(x):
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+
+def compute_contract_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
+    tau = max(days_to_exp / 365.0, 0.001)
+    d1 = (math.log(s / k) + (r + 0.5 * iv ** 2) * tau) / (iv * math.sqrt(tau))
+    ce_delta = norm_cdf(d1)
+    return round(ce_delta if is_ce else (1.0 - ce_delta), 2)
+
+
 def read_from_redis(key="nifty_live_state"):
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
         return None
@@ -109,7 +120,7 @@ df = pd.DataFrame(raw_candles)
 df["dt"] = pd.to_datetime(df["time"], unit="s").dt.tz_localize("UTC").dt.tz_convert(IST)
 df["date"] = df["dt"].dt.date
 
-# VWAP & Indicators
+# VWAP & 9 EMA
 candle_spread = (df["high"] - df["low"]) + (df["close"] - df["open"]).abs()
 df["calc_vol"] = candle_spread * 1250.0 + 500.0
 df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
@@ -170,7 +181,6 @@ with ctrl_cols[0]:
         list(budget_map.keys()),
         index=3,
     )
-    # Write chosen budget to Redis to drive worker.py
     write_selected_budget(budget_map.get(mode_selection, 75.0))
 
 with ctrl_cols[1]:
@@ -178,9 +188,11 @@ with ctrl_cols[1]:
 
 total_qty = sel_lots * LOT_SIZE_QTY
 
-# Markers and Trade Scanner
+# Historical Scanner
 markers = []
 historical_trade_cards = {}
+detected_historical_trades = []
+
 for session_date, day_df in df.groupby("date"):
     orb_window = day_df[(day_df["dt"].dt.time >= datetime.time(9, 15)) & (day_df["dt"].dt.time <= datetime.time(9, 30))]
     if len(orb_window) < 3:
@@ -188,32 +200,102 @@ for session_date, day_df in df.groupby("date"):
     d_orb_h = orb_window["high"].max()
     d_orb_l = orb_window["low"].min()
     executed = False
+
     for idx, r in day_df.iterrows():
         t = r["dt"].time()
         c = r["close"]
-        if datetime.time(9, 30) < t <= datetime.time(10, 30) and not executed:
+        if datetime.time(9, 30) <= t <= datetime.time(11, 30) and not executed:
             if c > d_orb_h and c > r["vwap"] and c > r["ema9"]:
                 sl_val = round(r["low"] - 5.0, 1)
-                markers.append({"time": int(r["time"]), "position": "belowBar", "color": "#00bfa5", "shape": "arrowUp", "text": f"BUY CE @ {c:.1f}"})
-                historical_trade_cards[int(r["time"])] = {
-                    "title": "BUY CE (ORB BREAKOUT)", "entry": round(c, 1),
-                    "target": round(c + 70.0, 1), "target_pts": 70.0,
-                    "sl": sl_val, "sl_pts": round(c - sl_val, 1), "type": "CE"
+                t_sec = int(r["time"])
+                markers.append({
+                    "time": t_sec,
+                    "position": "belowBar",
+                    "color": "#00bfa5",
+                    "shape": "arrowUp",
+                    "text": f"BUY CE @ {c:.1f}",
+                })
+                card_data = {
+                    "title": "BUY CE (ORB BREAKOUT)",
+                    "entry": round(c, 1),
+                    "target": round(c + 70.0, 1),
+                    "target_pts": 70.0,
+                    "sl": sl_val,
+                    "sl_pts": round(c - sl_val, 1),
+                    "type": "CE",
                 }
+                historical_trade_cards[t_sec] = card_data
+                detected_historical_trades.append(card_data)
                 executed = True
+
             elif c < d_orb_l and c < r["vwap"] and c < r["ema9"]:
                 sl_val = round(r["high"] + 5.0, 1)
-                markers.append({"time": int(r["time"]), "position": "aboveBar", "color": "#f23645", "shape": "arrowDown", "text": f"BUY PE @ {c:.1f}"})
-                historical_trade_cards[int(r["time"])] = {
-                    "title": "BUY PE (ORB BREAKDOWN)", "entry": round(c, 1),
-                    "target": round(c - 70.0, 1), "target_pts": 70.0,
-                    "sl": sl_val, "sl_pts": round(sl_val - c, 1), "type": "PE"
+                t_sec = int(r["time"])
+                markers.append({
+                    "time": t_sec,
+                    "position": "aboveBar",
+                    "color": "#f23645",
+                    "shape": "arrowDown",
+                    "text": f"BUY PE @ {c:.1f}",
+                })
+                card_data = {
+                    "title": "BUY PE (ORB BREAKDOWN)",
+                    "entry": round(c, 1),
+                    "target": round(c - 70.0, 1),
+                    "target_pts": 70.0,
+                    "sl": sl_val,
+                    "sl_pts": round(sl_val - c, 1),
+                    "type": "PE",
                 }
+                historical_trade_cards[t_sec] = card_data
+                detected_historical_trades.append(card_data)
                 executed = True
 
 locked_trade = live_state.get("locked_trade")
-active_symbol = locked_trade.get("symbol", f"NIFTY {int(round(spot_price/50)*50)} CE") if locked_trade else f"NIFTY {int(round(spot_price/50)*50)} CE"
-active_delta = 0.50
+
+if locked_trade:
+    t_type = locked_trade.get("type", "CE")
+    entry_p = float(locked_trade.get("entry", spot_price))
+    sl_p = float(locked_trade.get("init_sl", entry_p - 20.0))
+    trail_p = float(locked_trade.get("current_sl", sl_p))
+    t1_p = float(locked_trade.get("tp1", entry_p + 40.0 if t_type == "CE" else entry_p - 40.0))
+    tmid_p = float(locked_trade.get("tp_mid", entry_p + 70.0 if t_type == "CE" else entry_p - 70.0))
+    tfinal_p = float(locked_trade.get("tp_final", entry_p + 110.0 if t_type == "CE" else entry_p - 110.0))
+    strike_val = locked_trade.get("strike", int(round(entry_p / 50.0) * 50))
+    active_symbol = locked_trade.get("symbol", f"NIFTY {strike_val} {t_type}")
+    active_delta = float(locked_trade.get("delta", 0.50))
+elif len(detected_historical_trades) > 0:
+    last_hist = detected_historical_trades[-1]
+    t_type = last_hist["type"]
+    entry_p = float(last_hist["entry"])
+    sl_p = float(last_hist["sl"])
+    trail_p = sl_p
+    t1_p = round(entry_p + 40.0 if t_type == "CE" else entry_p - 40.0, 1)
+    tmid_p = round(entry_p + 70.0 if t_type == "CE" else entry_p - 70.0, 1)
+    tfinal_p = float(last_hist["target"])
+    strike_val = int(round(entry_p / 50.0) * 50)
+    active_symbol = f"NIFTY {strike_val} {t_type}"
+    active_delta = compute_contract_delta(spot_price, strike_val, 4, is_ce=(t_type == "CE"))
+else:
+    t_type = "CE" if spot_price >= curr["vwap"] else "PE"
+    entry_p = spot_price
+    sl_p = round(spot_price - 25.0 if t_type == "CE" else spot_price + 25.0, 1)
+    trail_p = sl_p
+    t1_p = round(spot_price + 40.0 if t_type == "CE" else spot_price - 40.0, 1)
+    tmid_p = round(spot_price + 70.0 if t_type == "CE" else spot_price - 70.0, 1)
+    tfinal_p = round(spot_price + 110.0 if t_type == "CE" else spot_price - 110.0, 1)
+    strike_val = int(round(spot_price / 50.0) * 50)
+    active_symbol = f"NIFTY {strike_val} {t_type}"
+    active_delta = compute_contract_delta(spot_price, strike_val, 4, is_ce=(t_type == "CE"))
+
+if live_real_ltp <= 0.0:
+    live_real_ltp = 75.0
+
+risk_pts = round(abs(entry_p - sl_p), 1)
+t1_pts = round(abs(t1_p - entry_p), 1)
+tmid_pts = round(abs(tmid_p - entry_p), 1)
+tfinal_pts = round(abs(tfinal_p - entry_p), 1)
+secured_pts = round(trail_p - entry_p, 1) if t_type == "CE" else round(entry_p - trail_p, 1)
 
 with ctrl_cols[2]:
     st.markdown(
@@ -223,7 +305,7 @@ with ctrl_cols[2]:
             <div>LTP: <b id="topOptionLTP" style="color:#ffd600; font-size:13px;">₹{live_real_ltp:.2f}</b></div>
             <div>Mode: <b style="color:#ab47bc;">{mode_selection}</b></div>
             <div>Qty: <b style="color:#089981;">{total_qty}</b> ({sel_lots}L)</div>
-            <div>Delta: <b style="color:#00e5ff;">{active_delta:.2f}</b></div>
+            <div>Delta: <b id="topDeltaVal" style="color:#00e5ff;">{active_delta:.2f}</b></div>
             <div>Status: <b style="color:#00e5ff;">CLOUD ENGINE ACTIVE</b></div>
         </div>
         """,
@@ -251,46 +333,6 @@ volume_data = [
     for _, r in df.iterrows()
 ]
 
-# 3-Column Strategy HUD Payload
-hud_payload = None
-if locked_trade:
-    is_ce = locked_trade["type"] == "CE"
-    entry_p = locked_trade["entry"]
-    trail_p = locked_trade.get("current_sl", locked_trade["init_sl"])
-    secured_pts = round(trail_p - entry_p, 1) if is_ce else round(entry_p - trail_p, 1)
-    risk_pts = round(abs(entry_p - locked_trade["init_sl"]), 1)
-
-    hud_payload = {
-        "is_no_trade": False,
-        "call_or_put": "CALL (CE)" if is_ce else "PUT (PE)",
-        "reason": "ORB Breakout via Worker",
-        "entry": f"{entry_p:.1f}",
-        "sl_risk": f"{locked_trade['init_sl']:.1f} (-{risk_pts:.1f} pts)",
-        "target1": f"{entry_p + 40:.1f} (+40.0 pts)" if is_ce else f"{entry_p - 40:.1f} (+40.0 pts)",
-        "target_mid": f"{entry_p + 70:.1f} (+70.0 pts)" if is_ce else f"{entry_p - 70:.1f} (+70.0 pts)",
-        "target_final": f"{entry_p + 110:.1f} (+110.0 pts)" if is_ce else f"{entry_p - 110:.1f} (+110.0 pts)",
-        "trailing_sl": f"{trail_p:.1f}",
-        "trail_stage": "ACTIVE CLOUD RUNNER",
-        "pnl_label": "Secured P&L (at SL)",
-        "pts_display": f"{secured_pts:+.1f} pts",
-        "inr_display": f"{int(round(secured_pts * active_delta * total_qty)):+d}",
-        "pnl_theme": "#089981" if secured_pts >= 0 else "#f23645",
-        "raw_risk_pts": risk_pts,
-        "raw_target1_pts": 40.0,
-        "raw_target_mid_pts": 70.0,
-        "raw_target_final_pts": 110.0,
-        "raw_secured_pts": secured_pts,
-        "theme": "#089981" if is_ce else "#f23645",
-    }
-else:
-    hud_payload = {
-        "is_no_trade": True,
-        "status": "MONITORING ACTIVE",
-        "reason": "Waiting for 09:15-09:30 range breakout",
-        "action": "Worker engine listening in cloud",
-        "theme": "#787b86",
-    }
-
 candles_json = json.dumps(candles_data)
 volume_json = json.dumps(volume_data)
 vwap_json = json.dumps([{"time": int(r["time"]), "value": round(float(r["vwap"]), 2)} for _, r in df.iterrows()])
@@ -298,7 +340,6 @@ ema_json = json.dumps([{"time": int(r["time"]), "value": round(float(r["ema9"]),
 markers_json = json.dumps(markers)
 history_cards_json = json.dumps(historical_trade_cards)
 pivots_json = json.dumps(pivot_lines_data)
-hud_json = json.dumps(hud_payload)
 
 day_open = float(today_df.iloc[0]["open"])
 chg = spot_price - day_open
@@ -395,7 +436,7 @@ html_code = f"""
             background: rgba(19, 23, 34, 0.97); border: 1px solid #2a2e39;
             border-radius: 6px; font-size: 9.5px; color: #d1d4dc; overflow: hidden;
             box-shadow: 0 4px 18px rgba(0,0,0,0.9); cursor: grab; user-select: none;
-            touch-action: none; min-width: 330px;
+            touch-action: none; min-width: 340px;
         }}
         .draggable-strategy-box:active {{ cursor: grabbing; }}
         .box-drag-handle {{
@@ -417,7 +458,6 @@ html_code = f"""
         .text-red {{ color: #f23645; }}
         .text-green {{ color: #089981; }}
         .text-trail {{ color: #2962ff; font-weight: bold; }}
-        .text-stage {{ color: #00e5ff; font-size: 8.5px; font-weight: bold; }}
 
         .history-signal-tag {{
             position: absolute; z-index: 55; pointer-events: none; display: none;
@@ -467,12 +507,66 @@ html_code = f"""
     </div>
 
     <div id="chartArea"></div>
-    <div id="strategyBox" class="draggable-strategy-box" style="display: none;"></div>
+
+    <div id="strategyBox" class="draggable-strategy-box">
+        <div class="box-drag-handle">::: STRATEGY HUD :::</div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Parameter</th>
+                    <th>Index (Spot)</th>
+                    <th id="hudOptionHead">Option ({active_symbol})</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td class="label-cell">Call or Put</td>
+                    <td class="val-cell"><span id="hudTypePill" class="tag-pill" style="background:{'#089981' if t_type == 'CE' else '#f23645'};">{t_type}</span></td>
+                    <td class="opt-cell"><span id="hudTypeOptPill" class="tag-pill" style="background:{'#089981' if t_type == 'CE' else '#f23645'};">{t_type}</span></td>
+                </tr>
+                <tr>
+                    <td class="label-cell">Entry</td>
+                    <td class="val-cell"><b id="hudEntrySpot">{entry_p:.1f}</b></td>
+                    <td class="opt-cell"><b id="hudEntryOpt">₹{live_real_ltp:.2f}</b></td>
+                </tr>
+                <tr>
+                    <td class="label-cell">SL (risk pts)</td>
+                    <td class="val-cell text-red"><span id="hudSLSpot">{sl_p:.1f} (-{risk_pts:.1f} pts)</span></td>
+                    <td class="opt-cell text-red"><span id="hudSLOpt">₹{max(0.5, round(live_real_ltp - (risk_pts * active_delta), 1)):.2f} (-₹{int(round(risk_pts * active_delta * total_qty))})</span></td>
+                </tr>
+                <tr>
+                    <td class="label-cell">Target 1</td>
+                    <td class="val-cell text-green"><span id="hudT1Spot">{t1_p:.1f} (+{t1_pts:.1f} pts)</span></td>
+                    <td class="opt-cell text-green"><span id="hudT1Opt">₹{round(live_real_ltp + (t1_pts * active_delta), 1):.2f} (+₹{int(round(t1_pts * active_delta * total_qty))})</span></td>
+                </tr>
+                <tr>
+                    <td class="label-cell">Target Mid</td>
+                    <td class="val-cell text-green"><span id="hudTMidSpot">{tmid_p:.1f} (+{tmid_pts:.1f} pts)</span></td>
+                    <td class="opt-cell text-green"><span id="hudTMidOpt">₹{round(live_real_ltp + (tmid_pts * active_delta), 1):.2f}</span></td>
+                </tr>
+                <tr>
+                    <td class="label-cell">Target Final</td>
+                    <td class="val-cell text-green"><b id="hudTFinalSpot">{tfinal_p:.1f} (+{tfinal_pts:.1f} pts)</b></td>
+                    <td class="opt-cell text-green"><b id="hudTFinalOpt">₹{round(live_real_ltp + (tfinal_pts * active_delta), 1):.2f} (+₹{int(round(tfinal_pts * active_delta * total_qty))})</b></td>
+                </tr>
+                <tr>
+                    <td class="label-cell">Trailing SL</td>
+                    <td class="val-cell text-trail"><span id="hudTrailSpot">{trail_p:.1f}</span></td>
+                    <td class="opt-cell text-trail"><span id="hudTrailOpt">₹{max(0.5, round(live_real_ltp + (secured_pts * active_delta), 1)):.2f}</span></td>
+                </tr>
+                <tr>
+                    <td class="label-cell">Secured P&L (at SL)</td>
+                    <td class="val-cell" style="color:{'#089981' if secured_pts >= 0 else '#f23645'}; font-weight:800;"><span id="hudPnLSpot">{secured_pts:+.1f} pts</span></td>
+                    <td class="opt-cell" style="color:{'#089981' if secured_pts >= 0 else '#f23645'}; font-weight:800;"><span id="hudPnLOpt">₹{int(round(secured_pts * active_delta * total_qty)):+d}</span></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
     <div id="historyTag" class="history-signal-tag"></div>
 
     <script>
-        const activeRealLTP = {live_real_ltp};
-        const activeDelta = {active_delta};
+        let liveDelta = {active_delta};
         const activeLots = {sel_lots};
         const LOT_SIZE = {LOT_SIZE_QTY};
         const activeQty = activeLots * LOT_SIZE;
@@ -519,95 +613,6 @@ html_code = f"""
             candleSeries.createPriceLine({{ price: pv.S1, color: '#089981', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, title: 'S1' }});
             candleSeries.createPriceLine({{ price: pv.PDH, color: '#ffb300', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, title: 'PDH' }});
             candleSeries.createPriceLine({{ price: pv.PDL, color: '#fb8c00', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, title: 'PDL' }});
-        }}
-
-        // Render 3-Column HUD
-        const s = {hud_json};
-        const table = document.getElementById('strategyBox');
-        if (s) {{
-            table.style.display = 'block';
-            if (s.is_no_trade) {{
-                table.innerHTML = `
-                    <div class="box-drag-handle">::: STRATEGY HUD :::</div>
-                    <table>
-                        <tr><td class="label-cell">Session Status</td><td class="val-cell" colspan="2"><span class="tag-pill" style="background:#546e7a;">${{s.status}}</span></td></tr>
-                        <tr><td class="label-cell">Reason</td><td class="val-cell" colspan="2" style="font-size:9px; color:#cfd3dc;">${{s.reason}}</td></tr>
-                        <tr><td class="label-cell">Action</td><td class="val-cell text-green" colspan="2">${{s.action}}</td></tr>
-                    </table>
-                `;
-            }} else {{
-                const optRiskPts = Math.round((s.raw_risk_pts * activeDelta) * 10) / 10;
-                const optSLPrice = Math.max(0.0, Math.round((activeRealLTP - optRiskPts) * 10) / 10);
-                const totalMaxRisk = Math.round(optRiskPts * activeQty);
-
-                const optT1Pts = Math.round((s.raw_target1_pts * activeDelta) * 10) / 10;
-                const optT1Price = Math.round((activeRealLTP + optT1Pts) * 10) / 10;
-                const totalT1Profit = Math.round(optT1Pts * activeQty);
-
-                const optMidPts = Math.round((s.raw_target_mid_pts * activeDelta) * 10) / 10;
-                const optMidPrice = Math.round((activeRealLTP + optMidPts) * 10) / 10;
-
-                const optFinalPts = Math.round((s.raw_target_final_pts * activeDelta) * 10) / 10;
-                const optFinalPrice = Math.round((activeRealLTP + optFinalPts) * 10) / 10;
-
-                const optTrailPts = Math.round((s.raw_secured_pts * activeDelta) * 10) / 10;
-                const optTrailPrice = Math.max(0.0, Math.round((activeRealLTP + optTrailPts) * 10) / 10);
-
-                table.innerHTML = `
-                    <div class="box-drag-handle">::: STRATEGY HUD :::</div>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Parameter</th>
-                                <th>Index (Spot)</th>
-                                <th>Option ({active_symbol})</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <tr>
-                                <td class="label-cell">Call or Put</td>
-                                <td class="val-cell"><span class="tag-pill" style="background:${{s.theme}}">${{s.call_or_put}}</span></td>
-                                <td class="opt-cell"><span class="tag-pill" style="background:${{s.theme}}">${{s.call_or_put}}</span></td>
-                            </tr>
-                            <tr>
-                                <td class="label-cell">Entry</td>
-                                <td class="val-cell"><b>${{s.entry}}</b></td>
-                                <td class="opt-cell">₹${{activeRealLTP.toFixed(2)}}</td>
-                            </tr>
-                            <tr>
-                                <td class="label-cell">SL (risk pts)</td>
-                                <td class="val-cell text-red">${{s.sl_risk}}</td>
-                                <td class="opt-cell text-red">₹${{optSLPrice.toFixed(2)}} (-₹${{totalMaxRisk}})</td>
-                            </tr>
-                            <tr>
-                                <td class="label-cell">Target 1</td>
-                                <td class="val-cell text-green">${{s.target1}}</td>
-                                <td class="opt-cell text-green">₹${{optT1Price.toFixed(2)}} (+₹${{totalT1Profit}})</td>
-                            </tr>
-                            <tr>
-                                <td class="label-cell">Target Mid</td>
-                                <td class="val-cell text-green">${{s.target_mid}}</td>
-                                <td class="opt-cell text-green">₹${{optMidPrice.toFixed(2)}}</td>
-                            </tr>
-                            <tr>
-                                <td class="label-cell">Target Final</td>
-                                <td class="val-cell text-green"><b>${{s.target_final}}</b></td>
-                                <td class="opt-cell text-green"><b>₹${{optFinalPrice.toFixed(2)}}</b></td>
-                            </tr>
-                            <tr>
-                                <td class="label-cell">Trailing SL</td>
-                                <td class="val-cell text-trail">${{s.trailing_sl}}</td>
-                                <td class="opt-cell text-trail">₹${{optTrailPrice.toFixed(2)}}</td>
-                            </tr>
-                            <tr>
-                                <td class="label-cell">${{s.pnl_label}}</td>
-                                <td class="val-cell" style="color:${{s.pnl_theme}}; font-weight:800;">${{s.pts_display}}</td>
-                                <td class="opt-cell" style="color:${{s.pnl_theme}}; font-weight:800;">₹${{s.inr_display}}</td>
-                            </tr>
-                        </tbody>
-                    </table>
-                `;
-            }}
         }}
 
         const historyCards = {history_cards_json};
@@ -674,8 +679,9 @@ html_code = f"""
             window.addEventListener('touchmove', onMove, {{ passive: true }});
             window.addEventListener('touchend', onEnd);
         }}
-        makeDraggable(table);
+        makeDraggable(document.getElementById('strategyBox'));
 
+        // Dynamic State Polling via Upstash
         const redisUrl = "{redis_url_str}";
         const redisToken = "{redis_token_str}";
 
@@ -698,6 +704,60 @@ html_code = f"""
                     if (stData.opt_ltp) {{
                         const optLtpElem = document.getElementById('topOptionLTP');
                         if (optLtpElem) optLtpElem.innerText = "₹" + stData.opt_ltp.toFixed(2);
+                    }}
+                    if (stData.locked_trade) {{
+                        const lt = stData.locked_trade;
+                        const isCE = lt.type === 'CE';
+                        const optEntry = lt.opt_entry_ltp || 75.0;
+                        liveDelta = lt.delta || 0.50;
+
+                        document.getElementById('topDeltaVal').innerText = liveDelta.toFixed(2);
+                        document.getElementById('hudOptionHead').innerText = "Option (" + lt.symbol + ")";
+                        document.getElementById('topContractSym').innerText = lt.symbol;
+                        document.getElementById('hudTypePill').innerText = lt.type;
+                        document.getElementById('hudTypeOptPill').innerText = lt.type;
+                        document.getElementById('hudTypePill').style.background = isCE ? '#089981' : '#f23645';
+                        document.getElementById('hudTypeOptPill').style.background = isCE ? '#089981' : '#f23645';
+
+                        document.getElementById('hudEntrySpot').innerText = lt.entry.toFixed(1);
+                        document.getElementById('hudEntryOpt').innerText = "₹" + optEntry.toFixed(2);
+
+                        const rPts = Math.abs(lt.entry - lt.init_sl);
+                        const optSLPrice = Math.max(0.5, optEntry - (rPts * liveDelta));
+                        document.getElementById('hudSLSpot').innerText = lt.init_sl.toFixed(1) + " (-" + rPts.toFixed(1) + " pts)";
+                        document.getElementById('hudSLOpt').innerText = "₹" + optSLPrice.toFixed(2) + " (-₹" + Math.round(rPts * liveDelta * activeQty) + ")";
+
+                        const t1_val = lt.tp1 || (isCE ? lt.entry + 40.0 : lt.entry - 40.0);
+                        const t1Pts = Math.abs(t1_val - lt.entry);
+                        const optT1Price = optEntry + (t1Pts * liveDelta);
+                        document.getElementById('hudT1Spot').innerText = t1_val.toFixed(1) + " (+" + t1Pts.toFixed(1) + " pts)";
+                        document.getElementById('hudT1Opt').innerText = "₹" + optT1Price.toFixed(2) + " (+₹" + Math.round(t1Pts * liveDelta * activeQty) + ")";
+
+                        const tMid_val = lt.tp_mid || (isCE ? lt.entry + 70.0 : lt.entry - 70.0);
+                        const tMidPts = Math.abs(tMid_val - lt.entry);
+                        const optTMidPrice = optEntry + (tMidPts * liveDelta);
+                        document.getElementById('hudTMidSpot').innerText = tMid_val.toFixed(1) + " (+" + tMidPts.toFixed(1) + " pts)";
+                        document.getElementById('hudTMidOpt').innerText = "₹" + optTMidPrice.toFixed(2);
+
+                        const tFinal_val = lt.tp_final || (isCE ? lt.entry + 110.0 : lt.entry - 110.0);
+                        const tFinalPts = Math.abs(tFinal_val - lt.entry);
+                        const optTFinalPrice = optEntry + (tFinalPts * liveDelta);
+                        document.getElementById('hudTFinalSpot').innerText = tFinal_val.toFixed(1) + " (+" + tFinalPts.toFixed(1) + " pts)";
+                        document.getElementById('hudTFinalOpt').innerText = "₹" + optTFinalPrice.toFixed(2) + " (+₹" + Math.round(tFinalPts * liveDelta * activeQty) + ")";
+
+                        const curSL = lt.current_sl || lt.init_sl;
+                        const secPts = isCE ? (curSL - lt.entry) : (lt.entry - curSL);
+                        const trailOptPrice = Math.max(0.5, optEntry + (secPts * liveDelta));
+                        document.getElementById('hudTrailSpot').innerText = curSL.toFixed(1);
+                        document.getElementById('hudTrailOpt').innerText = "₹" + trailOptPrice.toFixed(2);
+
+                        const pnlSpotElem = document.getElementById('hudPnLSpot');
+                        const pnlOptElem = document.getElementById('hudPnLOpt');
+                        const sign = secPts >= 0 ? "+" : "";
+                        pnlSpotElem.innerText = sign + secPts.toFixed(1) + " pts";
+                        pnlOptElem.innerText = "₹" + sign + Math.round(secPts * liveDelta * activeQty);
+                        pnlSpotElem.parentElement.style.color = secPts >= 0 ? '#089981' : '#f23645';
+                        pnlOptElem.parentElement.style.color = secPts >= 0 ? '#089981' : '#f23645';
                     }}
                 }}
             }} catch(e) {{}}
