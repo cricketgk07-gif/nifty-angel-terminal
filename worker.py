@@ -54,7 +54,7 @@ threading.Thread(target=run_ping_server, daemon=True).start()
 
 
 # ==========================================
-# 2. Strategy Math & Network Helpers
+# 2. Mathematical & Network Helpers
 # ==========================================
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
@@ -69,7 +69,8 @@ def compute_contract_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
 
 def send_telegram_alert(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+        print("[Telegram Error]: Bot token or Chat ID is missing!")
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -78,9 +79,12 @@ def send_telegram_alert(message: str):
         "disable_web_page_preview": True,
     }
     try:
-        requests.post(url, json=payload, timeout=4)
+        r = requests.post(url, json=payload, timeout=8)
+        print(f"[Telegram Response {r.status_code}]: {r.text}")
+        return r.status_code == 200
     except Exception as e:
-        print(f"Telegram dispatch error: {e}")
+        print(f"[Telegram Exception]: {e}")
+        return False
 
 
 def push_to_redis(key, data_obj):
@@ -111,7 +115,86 @@ def get_dynamic_budget():
 
 
 # ==========================================
-# 3. Strategy Core Engine
+# 3. Boot Verification Test (Ordered Sequence with Explicit Dates)
+# ==========================================
+def fire_immediate_boot_verification():
+    """Demonstrates chronological order: Entry -> Trail Cost -> Trail Ratchet -> Exit with exact date."""
+    now_dt = datetime.datetime.now(IST)
+    date_str = now_dt.strftime("%d-%b-%Y (%A)")
+    time_str = now_dt.strftime("%H:%M:%S")
+
+    # 1. Trigger Entry Alert
+    send_telegram_alert(
+        f"🚀 <b>ORB BREAKDOWN TRIGGERED: BUY PE</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>CONTRACT:</b> NIFTY 22350 PE\n"
+        f"<b>MODE:</b> Budget (&lt; ₹80) | <b>QTY:</b> {LOT_SIZE_QTY} (Δ: 0.50)\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>LEVEL | INDEX (SPOT) | OPTION (₹)</b>\n"
+        f"• <b>ENTRY:</b> 22512.0 | <b>₹75.00</b>\n"
+        f"• <b>STOP LOSS:</b> 22532.0 (-20.0 pts) | <b>₹65.00</b> (-₹650)\n"
+        f"• <b>TARGET 1:</b> 22472.0 (+40.0 pts) | <b>₹95.00</b> (+₹1300)\n"
+        f"• <b>TARGET 2:</b> 22437.0 (+75.0 pts) | <b>₹112.50</b> (+₹2437)\n"
+        f"• <b>TARGET 3:</b> 22392.0 (+120.0 pts) | <b>₹135.00</b> (+₹3900)\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🛡 <b>Initial SL:</b> Spot: 22532.0 | Option: ₹65.00\n"
+        f"📅 <b>Session Date:</b> {date_str}\n"
+        f"⏰ <b>Trigger Time:</b> {time_str}"
+    )
+
+    time.sleep(2)
+
+    # 2. First Trail Alert: Moved to Cost / Break-Even
+    send_telegram_alert(
+        f"🔔 <b>NIFTY PE TRAILING SL UPDATED (TARGET 1 MET)</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>CONTRACT:</b> NIFTY 22350 PE (Qty: {LOT_SIZE_QTY})\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🛡 <b>SET STOP LOSS (GTT) TO:</b>\n"
+        f"• <b>INDEX (SPOT):</b> 22510.0\n"
+        f"• <b>OPTION (GTT ₹):</b> ₹76.00\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔒 <b>LOCKED PROFIT:</b> +2.0 pts (+₹65) [COST LOCKED]\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>NEXT HURDLE:</b> Target 2: 22437.0\n"
+        f"📍 <b>Status:</b> RISK FREE RUNNER\n"
+        f"📅 <b>Date:</b> {date_str} | ⏰ <b>Time:</b> {time_str}"
+    )
+
+    time.sleep(2)
+
+    # 3. Second Trail Alert: Ratcheted Higher
+    send_telegram_alert(
+        f"🔔 <b>NIFTY PE TRAILING SL UPDATED (RATCHETED HIGHER)</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>CONTRACT:</b> NIFTY 22350 PE (Qty: {LOT_SIZE_QTY})\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🛡 <b>UPDATE STOP LOSS (GTT) TO:</b>\n"
+        f"• <b>INDEX (SPOT):</b> 22452.0\n"
+        f"• <b>OPTION (GTT ₹):</b> ₹105.00\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔒 <b>LOCKED PROFIT:</b> +60.0 pts (+₹1950)\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>PEAK REACHED:</b> 22437.0 (Cushion: 15 pts)\n"
+        f"📍 <b>Status:</b> RUNNER TIGHTENED (Targeting Extreme: 22392.0)\n"
+        f"📅 <b>Date:</b> {date_str} | ⏰ <b>Time:</b> {time_str}"
+    )
+
+    time.sleep(2)
+
+    # 4. Exit Alert
+    send_telegram_alert(
+        f"🏁 <b>TRADE CLOSED (NIFTY PE - STOP HIT)</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🚪 <b>Exit Price (Spot):</b> 22452.0\n"
+        f"💰 <b>Final Net Spot:</b> +60.0 pts\n"
+        f"💵 <b>Final Net Option:</b> +₹1950\n"
+        f"📅 <b>Date:</b> {date_str} | ⏰ <b>Exit Time:</b> {time_str}"
+    )
+
+
+# ==========================================
+# 4. Dedicated Strategy Engine
 # ==========================================
 class DedicatedTradingWorker:
     def __init__(self):
@@ -136,64 +219,8 @@ class DedicatedTradingWorker:
         self.init_historical_candles()
         self.run_full_strategy_pipeline()
 
-        # THIS SENDS THE 3 TEST CARDS TO YOUR PHONE IMMEDIATELY ON STARTUP
-        self.run_instant_telegram_test()
-
         if self.candles:
             self.sync_state(self.candles[-1]["close"])
-
-    def run_instant_telegram_test(self):
-        """Sends Card 1, Card 2, and Card 3 to Telegram so you can check your phone right now."""
-        time_str = datetime.datetime.now(IST).strftime("%H:%M:%S")
-
-        # Card 1: Trigger Alert
-        send_telegram_alert(
-            f"🚀 <b>ORB BREAKOUT TRIGGERED: BUY CE</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>CONTRACT:</b> NIFTY 22400 CE\n"
-            f"<b>MODE:</b> Budget (&lt; ₹80) | <b>QTY:</b> {LOT_SIZE_QTY} (Δ: 0.50)\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>LEVEL | INDEX (SPOT) | OPTION (₹)</b>\n"
-            f"• <b>ENTRY:</b> 22410.0 | <b>₹78.50</b>\n"
-            f"• <b>STOP LOSS:</b> 22390.0 (-20.0 pts) | <b>₹68.50</b> (-₹650)\n"
-            f"• <b>TARGET 1:</b> 22450.0 (+40.0 pts) | <b>₹98.50</b> (+₹1300)\n"
-            f"• <b>TARGET 2:</b> 22485.0 (+75.0 pts) | <b>₹116.00</b> (+₹2437)\n"
-            f"• <b>TARGET 3:</b> 22530.0 (+120.0 pts) | <b>₹138.50</b> (+₹3900)\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🛡 <b>Initial SL:</b> Spot: 22390.0 | Option: ₹68.50\n"
-            f"⏰ <b>Trigger Time:</b> {time_str}"
-        )
-
-        time.sleep(2)
-
-        # Card 2: Trailing SL Update Alert
-        send_telegram_alert(
-            f"🔔 <b>NIFTY CE TRAILING SL UPDATED (TARGET 1 MET)</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>CONTRACT:</b> NIFTY 22400 CE (Qty: {LOT_SIZE_QTY})\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🛡 <b>SET STOP LOSS TO:</b>\n"
-            f"• <b>INDEX (SPOT):</b> 22412.0\n"
-            f"• <b>OPTION (GTT ₹):</b> ₹78.50\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔒 <b>LOCKED PROFIT:</b> 0.0 pts (₹0) [COST LOCKED]\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 <b>NEXT HURDLE:</b> Target 2: 22485.0\n"
-            f"📍 <b>Status:</b> RUNNER PROTECTED (Dynamic Cushion Active)\n"
-            f"⏰ <b>Time:</b> {time_str}"
-        )
-
-        time.sleep(2)
-
-        # Card 3: Trade Closed Alert
-        send_telegram_alert(
-            f"🏁 <b>TRADE CLOSED (NIFTY CE - STOP HIT)</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🚪 <b>Exit Price (Spot):</b> 22470.0\n"
-            f"💰 <b>Final Net Spot:</b> +60.0 pts\n"
-            f"💵 <b>Final Net Option:</b> +₹1950\n"
-            f"⏰ <b>Exit Time:</b> {time_str}"
-        )
 
     def load_scrip_master(self):
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -395,7 +422,9 @@ class DedicatedTradingWorker:
                             "type": "CE",
                             "time_str": r["dt"].strftime("%H:%M"),
                             "date": d_str,
+                            "date_readable": r["dt"].strftime("%d-%b-%Y (%A)"),
                         }
+                        self.history_cards[str(t_sec)] = card
                         self.history_cards[t_sec] = card
                         last_found_trade = card
                         executed = True
@@ -420,7 +449,9 @@ class DedicatedTradingWorker:
                             "type": "PE",
                             "time_str": r["dt"].strftime("%H:%M"),
                             "date": d_str,
+                            "date_readable": r["dt"].strftime("%d-%b-%Y (%A)"),
                         }
+                        self.history_cards[str(t_sec)] = card
                         self.history_cards[t_sec] = card
                         last_found_trade = card
                         executed = True
@@ -434,10 +465,12 @@ class DedicatedTradingWorker:
                 "entry": last_found_trade["entry"],
                 "init_sl": last_found_trade["sl"],
                 "current_sl": last_found_trade["sl"],
+                "last_alerted_sl": last_found_trade["sl"],
                 "targets": last_found_trade["targets"],
                 "symbol": f"NIFTY {int(round(last_found_trade['entry'] / 50.0) * 50)} {last_found_trade['type']}",
                 "delta": 0.50,
                 "opt_entry_ltp": 75.0,
+                "date_readable": last_found_trade.get("date_readable", str(self.today)),
             }
 
         if active_t:
@@ -499,6 +532,7 @@ class DedicatedTradingWorker:
             "trail_spot": trail_p,
             "trail_opt": max(0.5, round(opt_entry + (secured_pts * delta_v), 2)),
             "secured_pts": secured_pts,
+            "date_readable": active_t.get("date_readable", str(self.today)) if active_t else str(self.today),
         }
 
     def fetch_option_ltp(self, sym, tok):
@@ -596,6 +630,7 @@ class DedicatedTradingWorker:
         orb_l = self.orb_levels.get("orb_l", 0)
 
         df_curr = pd.DataFrame(self.candles)
+        date_readable = last_c["dt"].strftime("%d-%b-%Y (%A)")
 
         if datetime.time(9, 30) <= t <= datetime.time(11, 30) and not self.locked_trade:
             # CE Breakout
@@ -614,6 +649,7 @@ class DedicatedTradingWorker:
                     "entry": close_p,
                     "init_sl": init_sl,
                     "current_sl": init_sl,
+                    "last_alerted_sl": init_sl,
                     "targets": targets,
                     "trail_stage": 0,
                     "peak_extreme": close_p,
@@ -624,6 +660,7 @@ class DedicatedTradingWorker:
                     "opt_entry_ltp": opt_ltp,
                     "opt_sl": opt_sl,
                     "time": last_c["time"],
+                    "date_readable": date_readable,
                 }
 
                 budget_val = int(round(get_dynamic_budget()))
@@ -648,6 +685,7 @@ class DedicatedTradingWorker:
                     f"{tg_lines}"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"🛡 <b>Initial SL:</b> Spot: {init_sl:.1f} | Option: ₹{opt_sl:.2f}\n"
+                    f"📅 <b>Session Date:</b> {date_readable}\n"
                     f"⏰ <b>Trigger Time:</b> {last_c['dt'].strftime('%H:%M:%S')}"
                 )
 
@@ -667,6 +705,7 @@ class DedicatedTradingWorker:
                     "entry": close_p,
                     "init_sl": init_sl,
                     "current_sl": init_sl,
+                    "last_alerted_sl": init_sl,
                     "targets": targets,
                     "trail_stage": 0,
                     "peak_extreme": close_p,
@@ -677,6 +716,7 @@ class DedicatedTradingWorker:
                     "opt_entry_ltp": opt_ltp,
                     "opt_sl": opt_sl,
                     "time": last_c["time"],
+                    "date_readable": date_readable,
                 }
 
                 budget_val = int(round(get_dynamic_budget()))
@@ -701,6 +741,7 @@ class DedicatedTradingWorker:
                     f"{tg_lines}"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"🛡 <b>Initial SL:</b> Spot: {init_sl:.1f} | Option: ₹{opt_sl:.2f}\n"
+                    f"📅 <b>Session Date:</b> {date_readable}\n"
                     f"⏰ <b>Trigger Time:</b> {last_c['dt'].strftime('%H:%M:%S')}"
                 )
 
@@ -717,6 +758,7 @@ class DedicatedTradingWorker:
         current_stage = tr.get("trail_stage", 0)
         atr_val = max(12.0, float(self.candles[-1].get("atr14", 15.0)))
         t_now = datetime.datetime.now(IST).strftime("%H:%M:%S")
+        date_readable = tr.get("date_readable", datetime.datetime.now(IST).strftime("%d-%b-%Y (%A)"))
 
         if is_ce:
             tr["peak_extreme"] = max(tr.get("peak_extreme", entry_p), live_spot)
@@ -725,50 +767,29 @@ class DedicatedTradingWorker:
             tr["peak_extreme"] = min(tr.get("peak_extreme", entry_p), live_spot)
             peak_gain = entry_p - tr["peak_extreme"]
 
+        sl_updated = False
+        update_reason = ""
+
         # Step 1: Milestone Target Crossings
         for idx, tg_p in enumerate(targets, start=1):
             if current_stage < idx:
                 crossed = (live_spot >= tg_p) if is_ce else (live_spot <= tg_p)
                 if crossed:
                     tr["trail_stage"] = idx
-
                     if idx == 1:
                         cost_buffer = 2.0 if is_ce else -2.0
                         new_sl = round(entry_p + cost_buffer, 1)
                         tr["current_sl"] = new_sl
-                        locked_pts = 0.0
-                        locked_inr = 0
-                        gtt_opt = opt_entry
-                        lock_title = "0.0 pts (₹0) [COST LOCKED]"
+                        update_reason = f"TARGET {idx} MET (COST LOCKED)"
+                        sl_updated = True
                     else:
                         prev_tg = targets[idx - 2]
                         new_sl = prev_tg
                         tr["current_sl"] = new_sl
-                        locked_pts = round(abs(prev_tg - entry_p), 1)
-                        locked_inr = int(round(locked_pts * delta_v * LOT_SIZE_QTY))
-                        gtt_opt = round(opt_entry + (locked_pts * delta_v), 2)
-                        lock_title = f"+{locked_pts:.1f} pts (+₹{locked_inr})"
+                        update_reason = f"TARGET {idx} MET"
+                        sl_updated = True
 
-                    next_idx = idx + 1
-                    next_desc = f"Target {next_idx}: {targets[idx]:.1f}" if idx < len(targets) else "EXTREME CEILING"
-
-                    send_telegram_alert(
-                        f"🔔 <b>NIFTY {tr['type']} TRAILING SL UPDATED (TARGET {idx} MET)</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"<b>CONTRACT:</b> {tr['symbol']} (Qty: {LOT_SIZE_QTY})\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"🛡 <b>SET STOP LOSS TO:</b>\n"
-                        f"• <b>INDEX (SPOT):</b> {tr['current_sl']:.1f}\n"
-                        f"• <b>OPTION (GTT ₹):</b> ₹{gtt_opt:.2f}\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"🔒 <b>LOCKED PROFIT:</b> {lock_title}\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"🎯 <b>NEXT HURDLE:</b> {next_desc}\n"
-                        f"📍 <b>Status:</b> RUNNER PROTECTED\n"
-                        f"⏰ <b>Time:</b> {t_now}"
-                    )
-
-        # Step 2: Progressive Ratchet (Shrinks cushion as profit grows)
+        # Step 2: Progressive Ratchet (Runs when peak gain >= 60 pts)
         if peak_gain >= 60.0:
             cushion = max(10.0, 0.75 * atr_val) if peak_gain >= 90.0 else max(13.0, 1.00 * atr_val)
 
@@ -784,17 +805,46 @@ class DedicatedTradingWorker:
                 if prev_candle_extreme and peak_gain >= 90.0:
                     candidate_trail = max(candidate_trail, prev_candle_extreme)
 
-                if candidate_trail > tr["current_sl"]:
+                if candidate_trail > tr["current_sl"] + 4.0:
                     tr["current_sl"] = candidate_trail
+                    update_reason = f"RATCHETED HIGHER (PEAK: {tr['peak_extreme']:.1f})"
+                    sl_updated = True
             else:
                 candidate_trail = round(tr["peak_extreme"] + cushion, 1)
                 if prev_candle_extreme and peak_gain >= 90.0:
                     candidate_trail = min(candidate_trail, prev_candle_extreme)
 
-                if candidate_trail < tr["current_sl"]:
+                if candidate_trail < tr["current_sl"] - 4.0:
                     tr["current_sl"] = candidate_trail
+                    update_reason = f"RATCHETED HIGHER (PEAK: {tr['peak_extreme']:.1f})"
+                    sl_updated = True
 
-        # Step 3: Stop-Loss Hit Trigger
+        # DISPATCH TRAILING SL ALERT (Before Stop Hit)
+        last_alerted = tr.get("last_alerted_sl", tr["init_sl"])
+        if sl_updated or abs(tr["current_sl"] - last_alerted) >= 4.0:
+            tr["last_alerted_sl"] = tr["current_sl"]
+            cur_sl = tr["current_sl"]
+
+            locked_pts = round((cur_sl - entry_p) if is_ce else (entry_p - cur_sl), 1)
+            locked_inr = int(round(locked_pts * delta_v * LOT_SIZE_QTY))
+            gtt_opt = max(0.5, round(opt_entry + (locked_pts * delta_v), 2))
+            sign = "+" if locked_pts >= 0 else ""
+
+            send_telegram_alert(
+                f"🔔 <b>NIFTY {tr['type']} TRAILING SL UPDATED ({update_reason})</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<b>CONTRACT:</b> {tr['symbol']} (Qty: {LOT_SIZE_QTY})\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🛡 <b>UPDATE STOP LOSS (GTT) TO:</b>\n"
+                f"• <b>INDEX (SPOT):</b> {cur_sl:.1f}\n"
+                f"• <b>OPTION (GTT ₹):</b> ₹{gtt_opt:.2f}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔒 <b>LOCKED PROFIT:</b> {sign}{locked_pts:.1f} pts (₹{sign}{locked_inr})\n"
+                f"📍 <b>Status:</b> RUNNER TIGHTENED\n"
+                f"📅 <b>Date:</b> {date_readable} | ⏰ <b>Time:</b> {t_now}"
+            )
+
+        # Step 3: Exit Condition (Breaches Active Trailed Stop)
         stop_hit = (live_spot <= tr["current_sl"]) if is_ce else (live_spot >= tr["current_sl"])
         if stop_hit:
             tr["closed"] = True
@@ -808,7 +858,7 @@ class DedicatedTradingWorker:
                 f"🚪 <b>Exit Price (Spot):</b> {exit_spot:.1f}\n"
                 f"💰 <b>Final Net Spot:</b> {sign}{final_pts:.1f} pts\n"
                 f"💵 <b>Final Net Option:</b> ₹{sign}{final_inr}\n"
-                f"⏰ <b>Exit Time:</b> {t_now}"
+                f"📅 <b>Date:</b> {date_readable} | ⏰ <b>Exit Time:</b> {t_now}"
             )
 
     def sync_state(self, live_ltp):
@@ -858,9 +908,14 @@ class DedicatedTradingWorker:
 
 
 # ==========================================
-# 4. Resilient Worker Loop
+# 5. Resilient Worker Loop
 # ==========================================
 def run_worker():
+    try:
+        fire_immediate_boot_verification()
+    except Exception as e:
+        print(f"Boot test notice: {e}")
+
     while True:
         try:
             print("Initializing Dedicated Trading Worker...")
