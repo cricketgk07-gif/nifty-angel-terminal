@@ -35,6 +35,11 @@ PORT = int(os.getenv("PORT", 10000))
 # 1. Self-Sustaining Health Server & Auto-Pinger
 # ==========================================
 class HealthHandler(http.server.BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
@@ -171,7 +176,6 @@ class DedicatedTradingWorker:
             self.sync_state(self.candles[-1]["close"])
 
     def authenticate_angel_one(self):
-        """Authenticates with TOTP and generates fresh tokens."""
         try:
             self.api = SmartConnect(API_KEY)
             totp = pyotp.TOTP(TOTP_SECRET).now()
@@ -184,7 +188,6 @@ class DedicatedTradingWorker:
             print(f"[Auth Error]: Failed to generate Angel One session: {e}")
 
     def check_daily_relogin(self):
-        """Checks if a new trading day has started to refresh the 24-hr token."""
         now = datetime.datetime.now(IST)
         if self.last_login_date != now.date() and now.time() >= datetime.time(8, 30):
             print("[Daily Refresh]: Resetting credentials and ORB session for the new trading day...")
@@ -585,7 +588,6 @@ class DedicatedTradingWorker:
         return chosen_strike, chosen_sym, chosen_tok, delta, days_to_exp
 
     def on_tick(self, ltp):
-        # Check if we crossed into a new day at market open to re-authenticate
         if self.check_daily_relogin():
             return
 
