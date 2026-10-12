@@ -1,8 +1,11 @@
 import datetime
 import html
+import http.server
 import json
 import math
 import os
+import socketserver
+import threading
 import time
 import pandas as pd
 import pyotp
@@ -23,10 +26,31 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "6898891302")
 
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
-
 BUDGET_CEILING = float(os.getenv("BUDGET_CEILING", "80.0"))
 
 
+# --- Keep-Alive Health Server for Render ---
+class HealthHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"WORKER_RUNNING_OK")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def run_ping_server():
+    port = int(os.getenv("PORT", 10000))
+    with socketserver.TCPServer(("0.0.0.0", port), HealthHandler) as httpd:
+        httpd.serve_forever()
+
+
+threading.Thread(target=run_ping_server, daemon=True).start()
+
+
+# --- Trading Engine ---
 def send_telegram_alert(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -67,7 +91,6 @@ class DedicatedTradingWorker:
         self.today = datetime.datetime.now(IST).date()
         self.locked_trade = None
         self.nfo_df = self.load_scrip_master()
-
         self.init_historical_candles()
 
     def load_scrip_master(self):
@@ -188,7 +211,7 @@ class DedicatedTradingWorker:
         t = last_c["dt"].time()
         close_p = last_c["close"]
 
-        # Strategy Entry Trigger (09:30 - 10:30 AM)
+        # 09:30 - 10:30 ORB Breakout Rule
         if datetime.time(9, 30) < t <= datetime.time(10, 30) and not self.locked_trade:
             if close_p > orb_h:
                 strike, sym, tok = self.find_budget_strike(close_p, is_ce=True, budget_target=BUDGET_CEILING)
@@ -228,7 +251,7 @@ class DedicatedTradingWorker:
                     f"⏰ <b>Time:</b> {last_c['dt'].strftime('%H:%M:%S')}"
                 )
 
-        # Stop-Loss Check
+        # Stop-Loss Hit Trigger
         if self.locked_trade and not self.locked_trade.get("closed"):
             trade = self.locked_trade
             if trade["type"] == "CE" and last_c["low"] <= trade["current_sl"]:
