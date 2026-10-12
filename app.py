@@ -146,11 +146,15 @@ nfo_df = load_nfo_scrip_master()
 
 
 def fetch_nifty_candles():
-    """Fast, single-call fetch to eliminate broker API rate-limiting hangs."""
     now_dt = datetime.datetime.now(IST)
     start_dt = now_dt - datetime.timedelta(days=7)
     from_str = start_dt.strftime("%Y-%m-%d 09:15")
-    to_str = now_dt.strftime("%Y-%m-%d 15:30")
+    
+    # Query up to the current minute during market hours to prevent future-time rejection
+    if now_dt.time() < datetime.time(15, 30):
+        to_str = now_dt.strftime("%Y-%m-%d %H:%M")
+    else:
+        to_str = now_dt.strftime("%Y-%m-%d 15:30")
 
     try:
         resp = api.getCandleData(
@@ -214,7 +218,14 @@ def fetch_nifty_candles():
     return None
 
 
-df = fetch_nifty_candles()
+if "cached_df" not in st.session_state:
+    st.session_state.cached_df = None
+
+live_df = fetch_nifty_candles()
+if live_df is not None and len(live_df) > 0:
+    st.session_state.cached_df = live_df
+
+df = st.session_state.cached_df
 if df is None or len(df) == 0:
     st.info("Market data feed is initializing...")
     st.stop()
@@ -250,9 +261,6 @@ if len(unique_dates) >= 2:
 
 # Base Strike Anchor
 atm_strike = int(round(spot_price / 50.0) * 50)
-strikes_list = [atm_strike + (x * 50) for x in range(-20, 21)]
-
-# Expiry Filter
 today_dt = datetime.datetime.now(IST).date()
 auto_expiry = "CURRENT"
 
@@ -264,12 +272,12 @@ if not nfo_df.empty:
     elif not all_future.empty:
         auto_expiry = all_future["expiry"].iloc[0]
 
-# Streamlined Top Controls (CE/PE Dropdown Removed)
+# Clean Header Controls
 ctrl_cols = st.columns([2.2, 0.9, 6.9])
 
 with ctrl_cols[0]:
     mode_selection = st.selectbox(
-        "Mode / Budget",
+        "Budget",
         [
             "Budget (< ₹50)",
             "Budget (< ₹60)",
@@ -285,7 +293,7 @@ with ctrl_cols[0]:
 with ctrl_cols[1]:
     sel_lots = st.number_input("Lots", min_value=1, max_value=100, value=1, step=1)
 
-# Black-Scholes Greeks Calculation
+# Helper Functions
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
@@ -299,18 +307,17 @@ exp_slice = nfo_df[nfo_df["expiry"] == auto_expiry] if not nfo_df.empty else pd.
 exp_date_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_dt
 days_to_expiry = max((exp_date_val - today_dt).days, 1)
 
-# Dynamic Budget to Strike Offset Map
 budget_offset_map = {
-    "Budget (< ₹50)": 4,   # 200 pts OTM
-    "Budget (< ₹60)": 3,   # 150 pts OTM
-    "Budget (< ₹70)": 3,   # 150 pts OTM
-    "Budget (< ₹80)": 2,   # 100 pts OTM
-    "Budget (< ₹90)": 2,   # 100 pts OTM
-    "Budget (< ₹100)": 1,  # 50 pts OTM
-    "ATM (At-The-Money)": 0 # 0 pts (ATM)
+    "Budget (< ₹50)": 4,
+    "Budget (< ₹60)": 3,
+    "Budget (< ₹70)": 3,
+    "Budget (< ₹80)": 2,
+    "Budget (< ₹90)": 2,
+    "Budget (< ₹100)": 1,
+    "ATM (At-The-Money)": 0,
 }
-
 step_offset = budget_offset_map.get(mode_selection, 2)
+
 
 def fetch_option_ltp(sym, tok):
     try:
@@ -323,29 +330,7 @@ def fetch_option_ltp(sym, tok):
         pass
     return 0.0
 
-total_qty = sel_lots * LOT_SIZE_QTY
 
-# PCR & OI Levels
-ce_oi_map = {}
-pe_oi_map = {}
-total_ce_oi = 0
-total_pe_oi = 0
-
-for s in strikes_list:
-    dist = abs(strikes_list.index(s) - strikes_list.index(atm_strike))
-    weight = max(1, 40 - dist)
-    c_oi = int(weight * 85000 + (s * 3) + (days_to_expiry * 1100))
-    p_oi = int(weight * 92000 + (s * 2) + (days_to_expiry * 1050))
-    ce_oi_map[s] = c_oi
-    pe_oi_map[s] = p_oi
-    total_ce_oi += c_oi
-    total_pe_oi += p_oi
-
-oi_res_strike = max(ce_oi_map, key=ce_oi_map.get) if ce_oi_map else atm_strike + 200
-oi_sup_strike = max(pe_oi_map, key=pe_oi_map.get) if pe_oi_map else atm_strike - 200
-
-
-# --- STRATEGY ENGINE & DYNAMIC SHELVES ---
 def extract_intraday_swings(day_data, current_idx, window=2):
     swings_h = []
     swings_l = []
@@ -371,7 +356,6 @@ def build_dynamic_shelves(entry_p, t_type, pv_dict, oi_target, atr_v, sw_h, sw_l
     fib_261 = round(orb_h + (2.618 * orb_range), 1) if t_type == "CE" else round(orb_l - (2.618 * orb_range), 1)
 
     candidates = []
-
     if t_type == "CE":
         pool = [
             pv_dict.get("R1"), pv_dict.get("R2"), pv_dict.get("R3"),
@@ -406,8 +390,8 @@ def build_dynamic_shelves(entry_p, t_type, pv_dict, oi_target, atr_v, sw_h, sw_l
     return candidates, {"fib_100": fib_100, "fib_161": fib_161, "fib_261": fib_261}
 
 
+# Dual Alert Templates (Spot Points + Option ₹)
 def format_full_entry_table_card(trade, opt_symbol, opt_ltp, delta_val, qty):
-    """Sends the Strategy HUD table immediately upon trade entry."""
     is_ce = trade["type"] == "CE"
     t_type = trade["type"]
     entry_p = trade["entry"]
@@ -453,7 +437,6 @@ def format_full_entry_table_card(trade, opt_symbol, opt_ltp, delta_val, qty):
 
 
 def format_step_trailing_alert(trade, opt_symbol, opt_ltp, delta_val, qty, current_shelf_idx, pullback_buffer):
-    """Actionable step trailing alert."""
     is_ce = trade["type"] == "CE"
     t_type = trade["type"]
     entry_p = trade["entry"]
@@ -498,18 +481,21 @@ def format_step_trailing_alert(trade, opt_symbol, opt_ltp, delta_val, qty, curre
     return msg
 
 
+# Multi-Day Strategy Evaluation
+total_qty = sel_lots * LOT_SIZE_QTY
+
 if "notified_sl_map" not in st.session_state:
     st.session_state.notified_sl_map = {}
 
 markers = []
 historical_trade_cards = {}
-latest_trade_for_hud = None
-alarm_signal_triggered = False
 active_fib_lines = {}
+latest_trade_for_hud = None
+trade_executed_in_latest_session = False
+alarm_signal_triggered = False
 
 grouped = df.groupby("date")
 latest_session_date = df["date"].iloc[-1]
-trade_executed_in_latest_session = False
 
 for session_date, day_df in grouped:
     orb_window = day_df[day_df["dt"].dt.time <= datetime.time(9, 30)]
@@ -530,6 +516,7 @@ for session_date, day_df in grouped:
         vwap_val = row["vwap"]
         atr_val = row["atr"]
 
+        # Trailing Step-Ladder Engine
         if session_trade and not session_trade["closed"]:
             t_type = session_trade["type"]
             entry = session_trade["entry"]
@@ -545,7 +532,8 @@ for session_date, day_df in grouped:
                             session_trade["trail_stage"] = f"SHELF 1 CLEARED ({s_level:.1f}) -> BE LOCKED"
                         else:
                             prev_shelf = shelves[s_idx - 1]
-                            session_trade["current_sl"] = max(session_trade["current_sl"], round(prev_shelf - pullback_buffer, 1))
+                            target_sl = round(prev_shelf - pullback_buffer, 1)
+                            session_trade["current_sl"] = max(session_trade["current_sl"], target_sl)
                             session_trade["trail_stage"] = f"SHELF {s_idx+1} CLEARED ({s_level:.1f}) -> TRAIL LOCK"
 
                 if session_trade["current_shelf_idx"] >= len(shelves):
@@ -563,7 +551,6 @@ for session_date, day_df in grouped:
                         send_telegram_alert(trail_msg)
                         st.session_state.notified_sl_map["current_sl"] = session_trade["current_sl"]
 
-                # Precise Stop-Loss Fill Assignment
                 if l <= session_trade["current_sl"]:
                     exit_p = session_trade["current_sl"]
                     pts = round(exit_p - entry, 1)
@@ -615,7 +602,8 @@ for session_date, day_df in grouped:
                             session_trade["trail_stage"] = f"SHELF 1 CLEARED ({s_level:.1f}) -> BE LOCKED"
                         else:
                             prev_shelf = shelves[s_idx - 1]
-                            session_trade["current_sl"] = min(session_trade["current_sl"], round(prev_shelf + pullback_buffer, 1))
+                            target_sl = round(prev_shelf + pullback_buffer, 1)
+                            session_trade["current_sl"] = min(session_trade["current_sl"], target_sl)
                             session_trade["trail_stage"] = f"SHELF {s_idx+1} CLEARED ({s_level:.1f}) -> TRAIL LOCK"
 
                 if session_trade["current_shelf_idx"] >= len(shelves):
@@ -633,7 +621,6 @@ for session_date, day_df in grouped:
                         send_telegram_alert(trail_msg)
                         st.session_state.notified_sl_map["current_sl"] = session_trade["current_sl"]
 
-                # Precise Stop-Loss Fill Assignment
                 if h >= session_trade["current_sl"]:
                     exit_p = session_trade["current_sl"]
                     pts = round(entry - exit_p, 1)
@@ -683,7 +670,8 @@ for session_date, day_df in grouped:
             if c > day_orb_h and c > vwap_val and c > ema:
                 init_sl = round(l - 5.0, 1)
                 risk = round(c - init_sl, 1)
-                shelves, fibs = build_dynamic_shelves(c, "CE", pivot_lines_data, oi_res_strike, atr_val, sw_h, sw_l, day_orb_h, day_orb_l)
+                oi_res = atm_strike + 200
+                shelves, fibs = build_dynamic_shelves(c, "CE", pivot_lines_data, oi_res, atr_val, sw_h, sw_l, day_orb_h, day_orb_l)
                 if session_date == latest_session_date:
                     active_fib_lines = fibs
 
@@ -752,7 +740,8 @@ for session_date, day_df in grouped:
             elif c < day_orb_l and c < vwap_val and c < ema:
                 init_sl = round(h + 5.0, 1)
                 risk = round(init_sl - c, 1)
-                shelves, fibs = build_dynamic_shelves(c, "PE", pivot_lines_data, oi_sup_strike, atr_val, sw_h, sw_l, day_orb_h, day_orb_l)
+                oi_sup = atm_strike - 200
+                shelves, fibs = build_dynamic_shelves(c, "PE", pivot_lines_data, oi_sup, atr_val, sw_h, sw_l, day_orb_h, day_orb_l)
                 if session_date == latest_session_date:
                     active_fib_lines = fibs
 
@@ -883,7 +872,7 @@ volume_data = [
     for _, r in df.iterrows()
 ]
 
-# --- STRATEGY HUD PAYLOAD ---
+# Strategy HUD Payload
 hud_payload = None
 if trade_executed_in_latest_session and latest_trade_for_hud:
     is_ce = latest_trade_for_hud["type"] == "CE"
@@ -1007,7 +996,7 @@ chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
-# --- Embedded Lightweight Charts Web Terminal ---
+# Embedded Lightweight Charts Web Terminal
 html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -1578,6 +1567,7 @@ html_code = f"""
             document.getElementById('activeToolsContainer').appendChild(anchor);
         }}
 
+        // Render Strategy HUD
         const s = {hud_json};
         const table = document.getElementById('strategyBox');
 
