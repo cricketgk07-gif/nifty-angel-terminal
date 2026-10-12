@@ -1,10 +1,8 @@
 import datetime
 import html
 import json
-import math
 import os
 import requests
-import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -67,7 +65,6 @@ st.markdown(
 UPSTASH_REDIS_REST_URL = st.secrets.get("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_REDIS_REST_TOKEN = st.secrets.get("UPSTASH_REDIS_REST_TOKEN", "")
 
-IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 LOT_SIZE_QTY = 65
 
 
@@ -104,48 +101,19 @@ if not live_state or "candles" not in live_state or len(live_state["candles"]) =
     st.info("Waiting for Render background worker to populate initial candle data...")
     st.stop()
 
+# Raw arrays directly from worker
 raw_candles = live_state["candles"]
-df = pd.DataFrame(raw_candles)
-df["dt"] = pd.to_datetime(df["time"], unit="s").dt.tz_localize("UTC").dt.tz_convert(IST)
-df["date"] = df["dt"].dt.date
+hud = live_state.get("hud", {})
+pivots = live_state.get("pivots", {})
+orb_levels = live_state.get("orb_levels", {})
+fib_lines = live_state.get("fib_lines", {})
+markers = live_state.get("markers", [])
+history_cards = live_state.get("history_cards", {})
 
-# Technical Indicators
-candle_spread = (df["high"] - df["low"]) + (df["close"] - df["open"]).abs()
-df["calc_vol"] = candle_spread * 1250.0 + 500.0
-df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
-df["vol_mult"] = df["tp"] * df["calc_vol"]
-df["cum_vol"] = df.groupby("date")["calc_vol"].cumsum()
-df["cum_vp"] = df.groupby("date")["vol_mult"].cumsum()
-df["vwap"] = df["cum_vp"] / df["cum_vol"]
-df["vwap"] = df["vwap"].fillna(df["tp"])
-df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
-
-# High-Low Pivots
-unique_dates = sorted(df["date"].unique())
-pivot_lines_data = {}
-if len(unique_dates) >= 2:
-    prev_date = unique_dates[-2]
-    prev_day_df = df[df["date"] == prev_date]
-    if len(prev_day_df) > 0:
-        pdh = round(float(prev_day_df["high"].max()), 2)
-        pdl = round(float(prev_day_df["low"].min()), 2)
-        pdc = round(float(prev_day_df["close"].iloc[-1]), 2)
-        P = round((pdh + pdl + pdc) / 3.0, 2)
-        pivot_lines_data = {
-            "P": P,
-            "R1": round((2.0 * P) - pdl, 2),
-            "S1": round((2.0 * P) - pdh, 2),
-            "R2": round(P + (pdh - pdl), 2),
-            "S2": round(P - (pdh - pdl), 2),
-            "R3": round(pdh + 2.0 * (P - pdl), 2),
-            "S3": round(pdl - 2.0 * (pdh - P), 2),
-            "PDH": pdh,
-            "PDL": pdl,
-        }
-
-curr = df.iloc[-1]
-spot_price = float(live_state.get("ltp", curr["close"]))
-live_real_ltp = float(live_state.get("opt_ltp", 0.0))
+spot_price = float(live_state.get("ltp", raw_candles[-1]["close"]))
+live_real_ltp = float(live_state.get("opt_ltp", hud.get("entry_opt", 75.0)))
+if live_real_ltp <= 0.0:
+    live_real_ltp = float(hud.get("entry_opt", 75.0))
 
 ctrl_cols = st.columns([2.2, 0.9, 6.9])
 
@@ -172,82 +140,32 @@ with ctrl_cols[1]:
 
 total_qty = sel_lots * LOT_SIZE_QTY
 
-# Markers and History directly supplied by Worker
-markers = live_state.get("markers", [])
-historical_trade_cards = live_state.get("history_cards", {})
+# Values directly read from worker's HUD object
+t_type = hud.get("type", "CE")
+active_symbol = hud.get("symbol", "NIFTY 22350 CE")
+active_delta = float(hud.get("delta", 0.50))
 
-# Calculate Today's ORB Lines and Range
-latest_session_date = df["date"].iloc[-1]
-today_df = df[df["date"] == latest_session_date]
-today_orb = today_df[(today_df["dt"].dt.time >= datetime.time(9, 15)) & (today_df["dt"].dt.time <= datetime.time(9, 30))]
+entry_spot = float(hud.get("entry_spot", spot_price))
+entry_opt = float(hud.get("entry_opt", live_real_ltp))
+sl_spot = float(hud.get("sl_spot", entry_spot - 20.0))
+sl_opt = float(hud.get("sl_opt", entry_opt - 10.0))
+risk_pts = float(hud.get("risk_pts", 20.0))
 
-curr_orb_h = float(today_orb["high"].max()) if len(today_orb) > 0 else float(today_df.iloc[0:3]["high"].max())
-curr_orb_l = float(today_orb["low"].min()) if len(today_orb) > 0 else float(today_df.iloc[0:3]["low"].min())
-orb_range_val = max(10.0, curr_orb_h - curr_orb_l)
+t1_spot = float(hud.get("t1_spot", entry_spot + 40.0))
+t1_opt = float(hud.get("t1_opt", entry_opt + 20.0))
+t1_pts = float(hud.get("t1_pts", 40.0))
 
-# Prioritize Live Worker Trade, or find Today's Detected Trade from history_cards
-locked_trade = live_state.get("locked_trade")
+tmid_spot = float(hud.get("tmid_spot", entry_spot + 70.0))
+tmid_opt = float(hud.get("tmid_opt", entry_opt + 35.0))
+tmid_pts = float(hud.get("tmid_pts", 70.0))
 
-today_card = None
-for t_sec, card in historical_trade_cards.items():
-    if card.get("date") == str(latest_session_date):
-        today_card = card
+tfinal_spot = float(hud.get("tfinal_spot", entry_spot + 110.0))
+tfinal_opt = float(hud.get("tfinal_opt", entry_opt + 55.0))
+tfinal_pts = float(hud.get("tfinal_pts", 110.0))
 
-if locked_trade:
-    t_type = locked_trade.get("type", "CE")
-    entry_p = float(locked_trade.get("entry", spot_price))
-    sl_p = float(locked_trade.get("init_sl", entry_p - 20.0))
-    trail_p = float(locked_trade.get("current_sl", sl_p))
-    t1_p = float(locked_trade.get("tp1", entry_p + 40.0 if t_type == "CE" else entry_p - 40.0))
-    tmid_p = float(locked_trade.get("tp_mid", entry_p + 70.0 if t_type == "CE" else entry_p - 70.0))
-    tfinal_p = float(locked_trade.get("tp_final", entry_p + 110.0 if t_type == "CE" else entry_p - 110.0))
-    strike_val = locked_trade.get("strike", int(round(entry_p / 50.0) * 50))
-    active_symbol = locked_trade.get("symbol", f"NIFTY {strike_val} {t_type}")
-    active_delta = float(locked_trade.get("delta", 0.50))
-elif today_card:
-    t_type = today_card["type"]
-    entry_p = float(today_card["entry"])
-    sl_p = float(today_card["sl"])
-    trail_p = sl_p
-    t1_p = float(today_card["target1"])
-    tmid_p = float(today_card["target_mid"])
-    tfinal_p = float(today_card["target_final"])
-    strike_val = int(round(entry_p / 50.0) * 50)
-    active_symbol = f"NIFTY {strike_val} {t_type}"
-    active_delta = 0.50
-else:
-    # Awaiting breakout: SL is strictly bounded to 20 pts from entry, NOT the opposite range extreme
-    t_type = "CE" if spot_price >= curr["vwap"] else "PE"
-    entry_p = curr_orb_h if t_type == "CE" else curr_orb_l
-    sl_p = round(curr_orb_h - 20.0 if t_type == "CE" else curr_orb_l + 20.0, 1)
-    trail_p = sl_p
-    t1_p = round(curr_orb_h + (1.000 * orb_range_val) if t_type == "CE" else curr_orb_l - (1.000 * orb_range_val), 1)
-    tmid_p = round(curr_orb_h + (1.618 * orb_range_val) if t_type == "CE" else curr_orb_l - (1.618 * orb_range_val), 1)
-    tfinal_p = round(curr_orb_h + (2.618 * orb_range_val) if t_type == "CE" else curr_orb_l - (2.618 * orb_range_val), 1)
-    strike_val = int(round(spot_price / 50.0) * 50)
-    active_symbol = f"NIFTY {strike_val} {t_type}"
-    active_delta = 0.50
-
-if live_real_ltp <= 0.0:
-    live_real_ltp = 75.0
-
-risk_pts = round(abs(entry_p - sl_p), 1)
-t1_pts = round(abs(t1_p - entry_p), 1)
-tmid_pts = round(abs(tmid_p - entry_p), 1)
-tfinal_pts = round(abs(tfinal_p - entry_p), 1)
-secured_pts = round(trail_p - entry_p, 1) if t_type == "CE" else round(entry_p - trail_p, 1)
-
-# Fibonacci Extensions for Current Day
-if t_type == "CE":
-    fib_100 = round(curr_orb_h + (1.000 * orb_range_val), 1)
-    fib_161 = round(curr_orb_h + (1.618 * orb_range_val), 1)
-    fib_261 = round(curr_orb_h + (2.618 * orb_range_val), 1)
-else:
-    fib_100 = round(curr_orb_l - (1.000 * orb_range_val), 1)
-    fib_161 = round(curr_orb_l - (1.618 * orb_range_val), 1)
-    fib_261 = round(curr_orb_l - (2.618 * orb_range_val), 1)
-
-fibs_dict = {"fib_100": fib_100, "fib_161": fib_161, "fib_261": fib_261}
+trail_spot = float(hud.get("trail_spot", sl_spot))
+trail_opt = float(hud.get("trail_opt", sl_opt))
+secured_pts = float(hud.get("secured_pts", -risk_pts))
 
 with ctrl_cols[2]:
     st.markdown(
@@ -266,40 +184,34 @@ with ctrl_cols[2]:
 
 candles_data = [
     {
-        "time": int(r["time"]),
-        "open": float(r["open"]),
-        "high": float(r["high"]),
-        "low": float(r["low"]),
-        "close": float(r["close"]),
+        "time": int(c["time"]),
+        "open": float(c["open"]),
+        "high": float(c["high"]),
+        "low": float(c["low"]),
+        "close": float(c["close"]),
     }
-    for _, r in df.iterrows()
+    for c in raw_candles
 ]
 
-vol_max = df["calc_vol"].max() if df["calc_vol"].max() > 0 else 1.0
-volume_data = [
-    {
-        "time": int(r["time"]),
-        "value": round((float(r["calc_vol"]) / vol_max) * 100.0, 2),
-        "color": "rgba(8, 153, 129, 0.55)" if r["close"] >= r["open"] else "rgba(242, 54, 69, 0.55)",
-    }
-    for _, r in df.iterrows()
-]
+vwap_data = [{"time": int(c["time"]), "value": float(c.get("vwap", c["close"]))} for c in raw_candles]
+ema_data = [{"time": int(c["time"]), "value": float(c.get("ema9", c["close"]))} for c in raw_candles]
 
 candles_json = json.dumps(candles_data)
-volume_json = json.dumps(volume_data)
-vwap_json = json.dumps([{"time": int(r["time"]), "value": round(float(r["vwap"]), 2)} for _, r in df.iterrows()])
-ema_json = json.dumps([{"time": int(r["time"]), "value": round(float(r["ema9"]), 2)} for _, r in df.iterrows()])
+vwap_json = json.dumps(vwap_data)
+ema_json = json.dumps(ema_data)
 markers_json = json.dumps(markers)
-history_cards_json = json.dumps(historical_trade_cards)
-pivots_json = json.dumps(pivot_lines_data)
-fibs_json = json.dumps(fibs_dict)
+history_cards_json = json.dumps(history_cards)
+pivots_json = json.dumps(pivots)
+orb_json = json.dumps(orb_levels)
+fibs_json = json.dumps(fib_lines)
 
-day_open = float(today_df.iloc[0]["open"])
+day_open = float(raw_candles[0]["open"])
 chg = spot_price - day_open
 chg_pct = (chg / day_open) * 100
 chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
 chg_color = "#089981" if chg >= 0 else "#f23645"
 
+curr = raw_candles[-1]
 redis_url_str = UPSTASH_REDIS_REST_URL
 redis_token_str = UPSTASH_REDIS_REST_TOKEN
 
@@ -469,8 +381,8 @@ html_code = f"""
                 <span>H: <b id="barH">{curr['high']:.2f}</b></span>
                 <span>L: <b id="barL">{curr['low']:.2f}</b></span>
                 <span>C: <b id="barC">{spot_price:.2f}</b></span>
-                <span>VWAP: <b id="barVWAP" style="color:#ab47bc;">{curr['vwap']:.2f}</b></span>
-                <span>EMA: <b id="barEMA" style="color:#2962ff;">{curr['ema9']:.2f}</b></span>
+                <span>VWAP: <b id="barVWAP" style="color:#ab47bc;">{curr.get('vwap', spot_price):.2f}</b></span>
+                <span>EMA: <b id="barEMA" style="color:#2962ff;">{curr.get('ema9', spot_price):.2f}</b></span>
             </div>
         </div>
 
@@ -505,33 +417,33 @@ html_code = f"""
                 </tr>
                 <tr>
                     <td class="label-cell">Entry</td>
-                    <td class="val-cell"><b id="hudEntrySpot">{entry_p:.1f}</b></td>
-                    <td class="opt-cell"><b id="hudEntryOpt">₹{live_real_ltp:.2f}</b></td>
+                    <td class="val-cell"><b id="hudEntrySpot">{entry_spot:.1f}</b></td>
+                    <td class="opt-cell"><b id="hudEntryOpt">₹{entry_opt:.2f}</b></td>
                 </tr>
                 <tr>
                     <td class="label-cell">SL (risk pts)</td>
-                    <td class="val-cell text-red"><span id="hudSLSpot">{sl_p:.1f} (-{risk_pts:.1f} pts)</span></td>
-                    <td class="opt-cell text-red"><span id="hudSLOpt">₹{max(0.5, round(live_real_ltp - (risk_pts * active_delta), 1)):.2f} (-₹{int(round(risk_pts * active_delta * total_qty))})</span></td>
+                    <td class="val-cell text-red"><span id="hudSLSpot">{sl_spot:.1f} (-{risk_pts:.1f} pts)</span></td>
+                    <td class="opt-cell text-red"><span id="hudSLOpt">₹{sl_opt:.2f} (-₹{int(round(risk_pts * active_delta * total_qty))})</span></td>
                 </tr>
                 <tr>
                     <td class="label-cell">Target 1</td>
-                    <td class="val-cell text-green"><span id="hudT1Spot">{t1_p:.1f} (+{t1_pts:.1f} pts)</span></td>
-                    <td class="opt-cell text-green"><span id="hudT1Opt">₹{round(live_real_ltp + (t1_pts * active_delta), 1):.2f} (+₹{int(round(t1_pts * active_delta * total_qty))})</span></td>
+                    <td class="val-cell text-green"><span id="hudT1Spot">{t1_spot:.1f} (+{t1_pts:.1f} pts)</span></td>
+                    <td class="opt-cell text-green"><span id="hudT1Opt">₹{t1_opt:.2f} (+₹{int(round(t1_pts * active_delta * total_qty))})</span></td>
                 </tr>
                 <tr>
                     <td class="label-cell">Target Mid</td>
-                    <td class="val-cell text-green"><span id="hudTMidSpot">{tmid_p:.1f} (+{tmid_pts:.1f} pts)</span></td>
-                    <td class="opt-cell text-green"><span id="hudTMidOpt">₹{round(live_real_ltp + (tmid_pts * active_delta), 1):.2f}</span></td>
+                    <td class="val-cell text-green"><span id="hudTMidSpot">{tmid_spot:.1f} (+{tmid_pts:.1f} pts)</span></td>
+                    <td class="opt-cell text-green"><span id="hudTMidOpt">₹{tmid_opt:.2f}</span></td>
                 </tr>
                 <tr>
                     <td class="label-cell">Target Final</td>
-                    <td class="val-cell text-green"><b id="hudTFinalSpot">{tfinal_p:.1f} (+{tfinal_pts:.1f} pts)</b></td>
-                    <td class="opt-cell text-green"><b id="hudTFinalOpt">₹{round(live_real_ltp + (tfinal_pts * active_delta), 1):.2f} (+₹{int(round(tfinal_pts * active_delta * total_qty))})</b></td>
+                    <td class="val-cell text-green"><b id="hudTFinalSpot">{tfinal_spot:.1f} (+{tfinal_pts:.1f} pts)</b></td>
+                    <td class="opt-cell text-green"><b id="hudTFinalOpt">₹{tfinal_opt:.2f} (+₹{int(round(tfinal_pts * active_delta * total_qty))})</b></td>
                 </tr>
                 <tr>
                     <td class="label-cell">Trailing SL</td>
-                    <td class="val-cell text-trail"><span id="hudTrailSpot">{trail_p:.1f}</span></td>
-                    <td class="opt-cell text-trail"><span id="hudTrailOpt">₹{max(0.5, round(live_real_ltp + (secured_pts * active_delta), 1)):.2f}</span></td>
+                    <td class="val-cell text-trail"><span id="hudTrailSpot">{trail_spot:.1f}</span></td>
+                    <td class="opt-cell text-trail"><span id="hudTrailOpt">₹{trail_opt:.2f}</span></td>
                 </tr>
                 <tr>
                     <td class="label-cell">Secured P&L (at SL)</td>
@@ -567,13 +479,6 @@ html_code = f"""
         }});
         candleSeries.setData({candles_json});
 
-        const volumeSeries = chart.addHistogramSeries({{
-            priceFormat: {{ type: 'volume' }}, priceScaleId: 'vol_scale',
-            scaleMargins: {{ top: 0.80, bottom: 0.04 }}
-        }});
-        chart.priceScale('vol_scale').applyOptions({{ scaleMargins: {{ top: 0.80, bottom: 0.04 }} }});
-        volumeSeries.setData({volume_json});
-
         const vwapSeries = chart.addLineSeries({{ color: '#ab47bc', lineWidth: 2, title: 'VWAP' }});
         vwapSeries.setData({vwap_json});
 
@@ -583,11 +488,14 @@ html_code = f"""
         // Historical Breakout Markers directly from Worker
         candleSeries.setMarkers({markers_json});
 
-        // Current ORB Lines
-        candleSeries.createPriceLine({{ price: {curr_orb_h:.2f}, color: '#089981', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, title: 'ORB HIGH' }});
-        candleSeries.createPriceLine({{ price: {curr_orb_l:.2f}, color: '#f23645', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, title: 'ORB LOW' }});
+        // Precalculated ORB Lines directly from Worker
+        const orb = {orb_json};
+        if (orb && orb.orb_h) {{
+            candleSeries.createPriceLine({{ price: orb.orb_h, color: '#089981', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, title: 'ORB HIGH' }});
+            candleSeries.createPriceLine({{ price: orb.orb_l, color: '#f23645', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, title: 'ORB LOW' }});
+        }}
 
-        // ORB Fibonacci Extensions
+        // Precalculated Fibonacci Extensions directly from Worker
         const fibs = {fibs_json};
         if (fibs && fibs.fib_100) {{
             candleSeries.createPriceLine({{ price: fibs.fib_100, color: '#ffd600', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Dashed, title: 'EXT 100%' }});
@@ -595,7 +503,7 @@ html_code = f"""
             candleSeries.createPriceLine({{ price: fibs.fib_261, color: '#ff6d00', lineWidth: 1.5, lineStyle: LightweightCharts.LineStyle.Solid, title: 'EXT 261.8% (MAX)' }});
         }}
 
-        // Floor Pivots
+        // Precalculated Floor Pivots directly from Worker
         const pv = {pivots_json};
         if (pv && pv.P) {{
             candleSeries.createPriceLine({{ price: pv.P, color: '#ffd600', lineWidth: 1.5, title: 'PIVOT (P)' }});
@@ -866,55 +774,44 @@ html_code = f"""
                         const optLtpElem = document.getElementById('topOptionLTP');
                         if (optLtpElem) optLtpElem.innerText = "₹" + stData.opt_ltp.toFixed(2);
                     }}
-                    if (stData.locked_trade) {{
-                        const lt = stData.locked_trade;
-                        const isCE = lt.type === 'CE';
-                        const spotLtp = stData.ltp || lt.entry;
-                        const optLtp = stData.opt_ltp || lt.opt_entry_ltp || 75.0;
-                        liveDelta = lt.delta || 0.50;
+                    if (stData.hud) {{
+                        const h = stData.hud;
+                        const isCE = h.type === 'CE';
+                        liveDelta = h.delta || 0.50;
 
                         document.getElementById('topDeltaVal').innerText = liveDelta.toFixed(2);
-                        document.getElementById('hudOptionHead').innerText = "Option (" + lt.symbol + ")";
-                        document.getElementById('topContractSym').innerText = lt.symbol;
-                        document.getElementById('hudTypePill').innerText = lt.type;
-                        document.getElementById('hudTypeOptPill').innerText = lt.type;
+                        document.getElementById('hudOptionHead').innerText = "Option (" + h.symbol + ")";
+                        document.getElementById('topContractSym').innerText = h.symbol;
+                        document.getElementById('hudTypePill').innerText = h.type;
+                        document.getElementById('hudTypeOptPill').innerText = h.type;
                         document.getElementById('hudTypePill').style.background = isCE ? '#089981' : '#f23645';
                         document.getElementById('hudTypeOptPill').style.background = isCE ? '#089981' : '#f23645';
 
-                        document.getElementById('hudEntrySpot').innerText = lt.entry.toFixed(1);
-                        document.getElementById('hudEntryOpt').innerText = "₹" + (lt.opt_entry_ltp ? lt.opt_entry_ltp.toFixed(2) : optLtp.toFixed(2));
+                        document.getElementById('hudEntrySpot').innerText = h.entry_spot.toFixed(1);
+                        document.getElementById('hudEntryOpt').innerText = "₹" + h.entry_opt.toFixed(2);
 
-                        const rPts = Math.abs(lt.entry - lt.init_sl);
-                        document.getElementById('hudSLSpot').innerText = lt.init_sl.toFixed(1) + " (-" + rPts.toFixed(1) + " pts)";
-                        document.getElementById('hudSLOpt').innerText = "₹" + Math.max(0.5, optLtp - (rPts * liveDelta)).toFixed(2) + " (-₹" + Math.round(rPts * liveDelta * activeQty) + ")";
+                        document.getElementById('hudSLSpot').innerText = h.sl_spot.toFixed(1) + " (-" + h.risk_pts.toFixed(1) + " pts)";
+                        document.getElementById('hudSLOpt').innerText = "₹" + h.sl_opt.toFixed(2) + " (-₹" + Math.round(h.risk_pts * liveDelta * activeQty) + ")";
 
-                        const t1_val = lt.tp1;
-                        const t1Pts = Math.abs(t1_val - lt.entry);
-                        document.getElementById('hudT1Spot').innerText = t1_val.toFixed(1) + " (+" + t1Pts.toFixed(1) + " pts)";
-                        document.getElementById('hudT1Opt').innerText = "₹" + (optLtp + (t1Pts * liveDelta)).toFixed(2) + " (+₹" + Math.round(t1Pts * liveDelta * activeQty) + ")";
+                        document.getElementById('hudT1Spot').innerText = h.t1_spot.toFixed(1) + " (+" + h.t1_pts.toFixed(1) + " pts)";
+                        document.getElementById('hudT1Opt').innerText = "₹" + h.t1_opt.toFixed(2) + " (+₹" + Math.round(h.t1_pts * liveDelta * activeQty) + ")";
 
-                        const tMid_val = lt.tp_mid;
-                        const tMidPts = Math.abs(tMid_val - lt.entry);
-                        document.getElementById('hudTMidSpot').innerText = tMid_val.toFixed(1) + " (+" + tMidPts.toFixed(1) + " pts)";
-                        document.getElementById('hudTMidOpt').innerText = "₹" + (optLtp + (tMidPts * liveDelta)).toFixed(2);
+                        document.getElementById('hudTMidSpot').innerText = h.tmid_spot.toFixed(1) + " (+" + h.tmid_pts.toFixed(1) + " pts)";
+                        document.getElementById('hudTMidOpt').innerText = "₹" + h.tmid_opt.toFixed(2);
 
-                        const tFinal_val = lt.tp_final;
-                        const tFinalPts = Math.abs(tFinal_val - lt.entry);
-                        document.getElementById('hudTFinalSpot').innerText = tFinal_val.toFixed(1) + " (+" + tFinalPts.toFixed(1) + " pts)";
-                        document.getElementById('hudTFinalOpt').innerText = "₹" + (optLtp + (tFinalPts * liveDelta)).toFixed(2) + " (+₹" + Math.round(tFinalPts * liveDelta * activeQty) + ")";
+                        document.getElementById('hudTFinalSpot').innerText = h.tfinal_spot.toFixed(1) + " (+" + h.tfinal_pts.toFixed(1) + " pts)";
+                        document.getElementById('hudTFinalOpt').innerText = "₹" + h.tfinal_opt.toFixed(2) + " (+₹" + Math.round(h.tfinal_pts * liveDelta * activeQty) + ")";
 
-                        const curSL = lt.current_sl || lt.init_sl;
-                        const secPts = isCE ? (curSL - lt.entry) : (lt.entry - curSL);
-                        document.getElementById('hudTrailSpot').innerText = curSL.toFixed(1);
-                        document.getElementById('hudTrailOpt').innerText = "₹" + Math.max(0.5, optLtp + (secPts * liveDelta)).toFixed(2);
+                        document.getElementById('hudTrailSpot').innerText = h.trail_spot.toFixed(1);
+                        document.getElementById('hudTrailOpt').innerText = "₹" + h.trail_opt.toFixed(2);
 
                         const pnlSpotElem = document.getElementById('hudPnLSpot');
                         const pnlOptElem = document.getElementById('hudPnLOpt');
-                        const sign = secPts >= 0 ? "+" : "";
-                        pnlSpotElem.innerText = sign + secPts.toFixed(1) + " pts";
-                        pnlOptElem.innerText = "₹" + sign + Math.round(secPts * liveDelta * activeQty);
-                        pnlSpotElem.parentElement.style.color = secPts >= 0 ? '#089981' : '#f23645';
-                        pnlOptElem.parentElement.style.color = secPts >= 0 ? '#089981' : '#f23645';
+                        const sign = h.secured_pts >= 0 ? "+" : "";
+                        pnlSpotElem.innerText = sign + h.secured_pts.toFixed(1) + " pts";
+                        pnlOptElem.innerText = "₹" + sign + Math.round(h.secured_pts * liveDelta * activeQty);
+                        pnlSpotElem.parentElement.style.color = h.secured_pts >= 0 ? '#089981' : '#f23645';
+                        pnlOptElem.parentElement.style.color = h.secured_pts >= 0 ? '#089981' : '#f23645';
                     }}
                 }}
             }} catch(e) {{}}
@@ -930,3 +827,6 @@ html_code = f"""
     </script>
 </body>
 </html>
+"""
+
+components.html(html_code, height=650, scrolling=False)
