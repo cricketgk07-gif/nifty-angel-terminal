@@ -29,7 +29,9 @@ UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 BUDGET_CEILING = float(os.getenv("BUDGET_CEILING", "80.0"))
 
 
-# --- Keep-Alive Health Server for Render ---
+# ==========================================
+# 1. Keep-Alive Health Server for Render
+# ==========================================
 class HealthHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -50,7 +52,9 @@ def run_ping_server():
 threading.Thread(target=run_ping_server, daemon=True).start()
 
 
-# --- Trading Engine ---
+# ==========================================
+# 2. Redis & Telegram Helpers
+# ==========================================
 def send_telegram_alert(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -78,6 +82,9 @@ def push_to_redis(key, data_obj):
         pass
 
 
+# ==========================================
+# 3. Core Engine
+# ==========================================
 class DedicatedTradingWorker:
     def __init__(self):
         self.api = SmartConnect(API_KEY)
@@ -211,7 +218,6 @@ class DedicatedTradingWorker:
         t = last_c["dt"].time()
         close_p = last_c["close"]
 
-        # 09:30 - 10:30 ORB Breakout Rule
         if datetime.time(9, 30) < t <= datetime.time(10, 30) and not self.locked_trade:
             if close_p > orb_h:
                 strike, sym, tok = self.find_budget_strike(close_p, is_ce=True, budget_target=BUDGET_CEILING)
@@ -251,7 +257,6 @@ class DedicatedTradingWorker:
                     f"⏰ <b>Time:</b> {last_c['dt'].strftime('%H:%M:%S')}"
                 )
 
-        # Stop-Loss Hit Trigger
         if self.locked_trade and not self.locked_trade.get("closed"):
             trade = self.locked_trade
             if trade["type"] == "CE" and last_c["low"] <= trade["current_sl"]:
@@ -289,21 +294,44 @@ class DedicatedTradingWorker:
         push_to_redis("nifty_live_state", payload)
 
 
+# ==========================================
+# 4. Resilient Worker Loop
+# ==========================================
 def run_worker():
-    engine = DedicatedTradingWorker()
-    sws = SmartWebSocketV2(engine.auth_token, API_KEY, CLIENT_CODE, engine.feed_token)
+    while True:
+        try:
+            print("Initializing Dedicated Trading Worker...")
+            engine = DedicatedTradingWorker()
+            sws = SmartWebSocketV2(engine.auth_token, API_KEY, CLIENT_CODE, engine.feed_token)
 
-    def on_data(wsapp, msg):
-        if "last_traded_price" in msg:
-            ltp = float(msg["last_traded_price"]) / 100.0
-            engine.on_tick(ltp)
+            def on_data(wsapp, msg):
+                if isinstance(msg, dict) and "last_traded_price" in msg:
+                    ltp = float(msg["last_traded_price"]) / 100.0
+                    engine.on_tick(ltp)
 
-    def on_open(wsapp):
-        sws.subscribe("correl_id_1", 1, [{"exchangeType": 1, "tokens": [INDEX_TOKEN]}])
+            def on_open(wsapp):
+                print("WebSocket Connected Successfully to Angel One")
+                sws.subscribe("correl_id_1", 1, [{"exchangeType": 1, "tokens": [INDEX_TOKEN]}])
 
-    sws.on_open = on_open
-    sws.on_data = on_data
-    sws.connect()
+            def on_error(*args, **kwargs):
+                print("WebSocket Notice/Error:", args)
+
+            def on_close(*args, **kwargs):
+                print("WebSocket Connection Closed:", args)
+
+            sws.on_open = on_open
+            sws.on_data = on_data
+            sws.on_error = on_error
+            sws.on_close = on_close
+            
+            # Patch internal callbacks to prevent SDK signature mismatch crashes
+            sws._on_error = on_error
+            sws._on_close = on_close
+
+            sws.connect()
+        except Exception as e:
+            print(f"Connection paused or reconnecting: {e}")
+            time.sleep(10)
 
 
 if __name__ == "__main__":
