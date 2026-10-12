@@ -151,6 +151,7 @@ class DedicatedTradingWorker:
         self.orb_levels = {}
         self.hud_data = {}
 
+        # Restore state from Redis to prevent duplicate alerts across reboots
         saved_state = read_from_redis("nifty_live_state")
         self.locked_trade = saved_state.get("locked_trade") if saved_state else None
 
@@ -324,7 +325,7 @@ class DedicatedTradingWorker:
         self.history_cards = {}
         last_found_trade = None
 
-        # Rigorous bar-by-bar backtest to verify if trades survived or hit their Stop Loss
+        # Bar-by-bar backtest simulation to verify Stop-Loss vs Targets accurately
         for d_str, day_df in df_h.groupby("date_str"):
             ow = day_df[(day_df["dt"].dt.time >= datetime.time(9, 15)) & (day_df["dt"].dt.time < datetime.time(9, 30))]
             if len(ow) < 3:
@@ -343,7 +344,7 @@ class DedicatedTradingWorker:
                 vw = float(r["vwap"])
                 em = float(r["ema9"])
 
-                # Check if active simulated trade hit stop-loss FIRST
+                # Check if an active simulated trade hit stop-loss FIRST
                 if sim_trade and not sim_trade.get("closed"):
                     if sim_trade["type"] == "CE" and l_bar <= sim_trade["sl"]:
                         sim_trade["closed"] = True
@@ -357,6 +358,7 @@ class DedicatedTradingWorker:
                 # Entry trigger condition
                 if datetime.time(9, 30) <= t <= datetime.time(11, 30) and not sim_trade:
                     if c > d_h and c > vw and c > em:
+                        # Exact Initial SL = Trigger Candle Low - 5 pts
                         sl_val = round(float(r["low"]) - 5.0, 1)
                         t_list = self.compute_all_confluence_targets(df_h.iloc[:idx+1], c, is_ce=True)
                         t_sec = int(r["time"])
@@ -378,13 +380,14 @@ class DedicatedTradingWorker:
                             "date": d_str,
                             "date_readable": r["dt"].strftime("%d-%b-%Y (%A)"),
                             "closed": False,
-                            "outcome": "ACTIVE / RUNNING",
+                            "outcome": "ACTIVE",
                         }
                         self.history_cards[str(t_sec)] = sim_trade
                         self.history_cards[t_sec] = sim_trade
                         last_found_trade = sim_trade
 
                     elif c < d_l and c < vw and c < em:
+                        # Exact Initial SL = Trigger Candle High + 5 pts
                         sl_val = round(float(r["high"]) + 5.0, 1)
                         t_list = self.compute_all_confluence_targets(df_h.iloc[:idx+1], c, is_ce=False)
                         t_sec = int(r["time"])
@@ -406,7 +409,7 @@ class DedicatedTradingWorker:
                             "date": d_str,
                             "date_readable": r["dt"].strftime("%d-%b-%Y (%A)"),
                             "closed": False,
-                            "outcome": "ACTIVE / RUNNING",
+                            "outcome": "ACTIVE",
                         }
                         self.history_cards[str(t_sec)] = sim_trade
                         self.history_cards[t_sec] = sim_trade
@@ -416,7 +419,6 @@ class DedicatedTradingWorker:
         active_t = self.locked_trade
 
         if not active_t and last_found_trade and last_found_trade["date"] == unique_days[-1]:
-            # If the trade already hit its SL on that day, display the stop hit state
             active_t = {
                 "type": last_found_trade["type"],
                 "entry": last_found_trade["entry"],
@@ -443,7 +445,8 @@ class DedicatedTradingWorker:
         else:
             t_type = "CE" if last_close >= float(df_h.iloc[-1]["vwap"]) else "PE"
             entry_p = curr_orb_h if t_type == "CE" else curr_orb_l
-            sl_p = round(curr_orb_h - 20.0 if t_type == "CE" else curr_orb_l + 20.0, 1)
+            last_bar = self.candles[-1]
+            sl_p = round(last_bar["low"] - 5.0 if t_type == "CE" else last_bar["high"] + 5.0, 1)
             trail_p = sl_p
             target_list = self.compute_all_confluence_targets(df_h, entry_p, is_ce=(t_type == "CE"))
             opt_entry = 75.0
@@ -725,7 +728,7 @@ class DedicatedTradingWorker:
         date_readable = tr.get("date_readable", datetime.datetime.now(IST).strftime("%d-%b-%Y (%A)"))
 
         # =================================================================
-        # CRITICAL FIX STEP 1: EVALUATE STOP-LOSS HIT BEFORE UPDATING TRAILS
+        # STEP 1: EVALUATE STOP-LOSS HIT BEFORE ANY TARGET PROCESSING
         # =================================================================
         stop_hit = (live_spot <= tr["current_sl"]) if is_ce else (live_spot >= tr["current_sl"])
         if stop_hit:
@@ -734,8 +737,7 @@ class DedicatedTradingWorker:
             final_pts = round((exit_spot - entry_p) if is_ce else (entry_p - exit_spot), 1)
             final_inr = int(round(final_pts * delta_v * LOT_SIZE_QTY))
             sign = "+" if final_pts >= 0 else ""
-            
-            # Send accurate Stop Hit Alert (displays actual loss if stopped out)
+
             send_telegram_alert(
                 f"🏁 <b>TRADE CLOSED (NIFTY {tr['type']} - STOP HIT)</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -747,7 +749,7 @@ class DedicatedTradingWorker:
             return
 
         # =================================================================
-        # STEP 2: EVALUATE TARGETS & TRAILS ONLY WHEN ACTIVE AND UNSTOPPED
+        # STEP 2: EVALUATE TARGETS & TRAILS ONLY WHEN UNSTOPPED
         # =================================================================
         if is_ce:
             tr["peak_extreme"] = max(tr.get("peak_extreme", entry_p), live_spot)
@@ -808,7 +810,7 @@ class DedicatedTradingWorker:
                     update_reason = f"RATCHETED HIGHER (PEAK: {tr['peak_extreme']:.1f})"
                     sl_updated = True
 
-        # DISPATCH TRAILING SL ALERT (Fires whenever SL changes)
+        # DISPATCH TRAILING SL ALERT (Before Stop Hit)
         last_alerted = tr.get("last_alerted_sl", tr["init_sl"])
         if sl_updated or abs(tr["current_sl"] - last_alerted) >= 4.0:
             tr["last_alerted_sl"] = tr["current_sl"]
