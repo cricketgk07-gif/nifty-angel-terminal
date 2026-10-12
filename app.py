@@ -1,4 +1,5 @@
 import datetime
+import html
 import json
 import math
 import pandas as pd
@@ -150,7 +151,6 @@ def fetch_nifty_candles():
     start_dt = now_dt - datetime.timedelta(days=7)
     from_str = start_dt.strftime("%Y-%m-%d 09:15")
     
-    # Query up to the current minute during market hours to prevent future-time rejection
     if now_dt.time() < datetime.time(15, 30):
         to_str = now_dt.strftime("%Y-%m-%d %H:%M")
     else:
@@ -416,12 +416,14 @@ def format_full_entry_table_card(trade, opt_symbol, opt_ltp, delta_val, qty):
     final_profit_inr = int(opt_final_gain * qty)
 
     time_str = datetime.datetime.now(IST).strftime("%H:%M:%S")
+    # HTML escape mode_selection to prevent Telegram parse rejection
+    safe_mode_label = html.escape(str(mode_selection))
 
     msg = (
         f"🚀 <b>ORB BREAKOUT TRIGGERED: BUY {t_type}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>CONTRACT:</b> {opt_symbol}\n"
-        f"<b>MODE:</b> {mode_selection} | <b>QTY:</b> {qty} (Δ: {delta_val:.2f})\n"
+        f"<b>MODE:</b> {safe_mode_label} | <b>QTY:</b> {qty} (Δ: {delta_val:.2f})\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>LEVEL | INDEX (SPOT) | OPTION (₹)</b>\n"
         f"• <b>ENTRY:</b> {entry_p:.1f} | <b>₹{opt_ltp:.2f}</b>\n"
@@ -532,8 +534,7 @@ for session_date, day_df in grouped:
                             session_trade["trail_stage"] = f"SHELF 1 CLEARED ({s_level:.1f}) -> BE LOCKED"
                         else:
                             prev_shelf = shelves[s_idx - 1]
-                            target_sl = round(prev_shelf - pullback_buffer, 1)
-                            session_trade["current_sl"] = max(session_trade["current_sl"], target_sl)
+                            session_trade["current_sl"] = max(session_trade["current_sl"], round(prev_shelf - pullback_buffer, 1))
                             session_trade["trail_stage"] = f"SHELF {s_idx+1} CLEARED ({s_level:.1f}) -> TRAIL LOCK"
 
                 if session_trade["current_shelf_idx"] >= len(shelves):
@@ -602,8 +603,7 @@ for session_date, day_df in grouped:
                             session_trade["trail_stage"] = f"SHELF 1 CLEARED ({s_level:.1f}) -> BE LOCKED"
                         else:
                             prev_shelf = shelves[s_idx - 1]
-                            target_sl = round(prev_shelf + pullback_buffer, 1)
-                            session_trade["current_sl"] = min(session_trade["current_sl"], target_sl)
+                            session_trade["current_sl"] = min(session_trade["current_sl"], round(prev_shelf + pullback_buffer, 1))
                             session_trade["trail_stage"] = f"SHELF {s_idx+1} CLEARED ({s_level:.1f}) -> TRAIL LOCK"
 
                 if session_trade["current_shelf_idx"] >= len(shelves):
@@ -872,7 +872,7 @@ volume_data = [
     for _, r in df.iterrows()
 ]
 
-# Strategy HUD Payload
+# --- STRATEGY HUD PAYLOAD ---
 hud_payload = None
 if trade_executed_in_latest_session and latest_trade_for_hud:
     is_ce = latest_trade_for_hud["type"] == "CE"
@@ -1749,21 +1749,18 @@ html_code = f"""
 
         window.addEventListener('resize', resizeChartProperly);
         setTimeout(resizeChartProperly, 200);
+
+        // Active 15s auto-refresh polling directly executing inside browser iframe
+        setTimeout(function(){
+            try {
+                window.parent.location.reload();
+            } catch(e) {
+                window.location.reload();
+            }
+        }, 15000);
     </script>
 </body>
 </html>
 """
 
 components.html(html_code, height=650, scrolling=False)
-
-# 15s auto-refresh polling
-st.markdown(
-    """
-    <script>
-        setTimeout(function(){
-            window.location.reload();
-        }, 15000);
-    </script>
-""",
-    unsafe_allow_html=True,
-)
