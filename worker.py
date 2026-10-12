@@ -271,9 +271,7 @@ class DedicatedTradingWorker:
                 orb_h + (1.618 * orb_rng),
                 orb_h + (2.618 * orb_rng),
                 p.get("P"),
-                p.get("R1"),
-                p.get("R2"),
-                p.get("R3"),
+                p.get("R1"), p.get("R2"), p.get("R3"), p.get("R4"), p.get("R5"),
                 p.get("PDH"),
                 recent_swing_h,
                 entry_p + atr3_val,
@@ -287,9 +285,7 @@ class DedicatedTradingWorker:
                 orb_l - (1.618 * orb_rng),
                 orb_l - (2.618 * orb_rng),
                 p.get("P"),
-                p.get("S1"),
-                p.get("S2"),
-                p.get("S3"),
+                p.get("S1"), p.get("S2"), p.get("S3"), p.get("S4"), p.get("S5"),
                 p.get("PDL"),
                 recent_swing_l,
                 entry_p - atr3_val,
@@ -336,12 +332,26 @@ class DedicatedTradingWorker:
                 pdl = round(float(prev_day_df["low"].min()), 2)
                 pdc = round(float(prev_day_df["close"].iloc[-1]), 2)
                 P = round((pdh + pdl + pdc) / 3.0, 2)
+                rng = round(pdh - pdl, 2)
+
+                r1 = round((2.0 * P) - pdl, 2)
+                s1 = round((2.0 * P) - pdh, 2)
+                r2 = round(P + rng, 2)
+                s2 = round(P - rng, 2)
+                r3 = round(pdh + (2.0 * (P - pdl)), 2)
+                s3 = round(pdl - (2.0 * (pdh - P)), 2)
+                r4 = round(r3 + rng, 2)
+                s4 = round(s3 - rng, 2)
+                r5 = round(r4 + rng, 2)
+                s5 = round(s4 - rng, 2)
+
                 self.pivot_lines = {
                     "P": P,
-                    "R1": round((2.0 * P) - pdl, 2),
-                    "S1": round((2.0 * P) - pdh, 2),
-                    "R2": round(P + (pdh - pdl), 2),
-                    "S2": round(P - (pdh - pdl), 2),
+                    "R1": r1, "S1": s1,
+                    "R2": r2, "S2": s2,
+                    "R3": r3, "S3": s3,
+                    "R4": r4, "S4": s4,
+                    "R5": r5, "S5": s5,
                     "PDH": pdh,
                     "PDL": pdl,
                 }
