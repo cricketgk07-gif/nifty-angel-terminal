@@ -140,32 +140,10 @@ with ctrl_cols[1]:
 
 total_qty = sel_lots * LOT_SIZE_QTY
 
-# Values directly read from worker's HUD object
+# Values read directly from worker's HUD
 t_type = hud.get("type", "CE")
-active_symbol = hud.get("symbol", "NIFTY 22350 CE")
+active_symbol = hud.get("symbol", "NIFTY 22400 CE")
 active_delta = float(hud.get("delta", 0.50))
-
-entry_spot = float(hud.get("entry_spot", spot_price))
-entry_opt = float(hud.get("entry_opt", live_real_ltp))
-sl_spot = float(hud.get("sl_spot", entry_spot - 20.0))
-sl_opt = float(hud.get("sl_opt", entry_opt - 10.0))
-risk_pts = float(hud.get("risk_pts", 20.0))
-
-t1_spot = float(hud.get("t1_spot", entry_spot + 40.0))
-t1_opt = float(hud.get("t1_opt", entry_opt + 20.0))
-t1_pts = float(hud.get("t1_pts", 40.0))
-
-tmid_spot = float(hud.get("tmid_spot", entry_spot + 70.0))
-tmid_opt = float(hud.get("tmid_opt", entry_opt + 35.0))
-tmid_pts = float(hud.get("tmid_pts", 70.0))
-
-tfinal_spot = float(hud.get("tfinal_spot", entry_spot + 110.0))
-tfinal_opt = float(hud.get("tfinal_opt", entry_opt + 55.0))
-tfinal_pts = float(hud.get("tfinal_pts", 110.0))
-
-trail_spot = float(hud.get("trail_spot", sl_spot))
-trail_opt = float(hud.get("trail_opt", sl_opt))
-secured_pts = float(hud.get("secured_pts", -risk_pts))
 
 with ctrl_cols[2]:
     st.markdown(
@@ -204,6 +182,7 @@ history_cards_json = json.dumps(history_cards)
 pivots_json = json.dumps(pivots)
 orb_json = json.dumps(orb_levels)
 fibs_json = json.dumps(fib_lines)
+hud_json = json.dumps(hud)
 
 day_open = float(raw_candles[0]["open"])
 chg = spot_price - day_open
@@ -324,11 +303,22 @@ html_code = f"""
         .text-green {{ color: #089981; }}
         .text-trail {{ color: #2962ff; font-weight: bold; }}
 
+        /* Persistent High-Priority Hover Tag */
         .history-signal-tag {{
-            position: absolute; z-index: 55; pointer-events: none; display: none;
-            background: rgba(22, 26, 37, 0.96); border: 1px solid #363c4e; border-radius: 5px;
-            padding: 5px 8px; font-size: 9.5px; color: #d1d4dc; line-height: 1.4;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.7); transform: translate(-50%, -100%);
+            position: absolute;
+            z-index: 99999 !important;
+            pointer-events: none !important;
+            display: none;
+            background: rgba(18, 22, 32, 0.98);
+            border: 1.5px solid #363c4e;
+            border-radius: 6px;
+            padding: 8px 12px;
+            font-size: 10.5px;
+            color: #e0e3eb;
+            line-height: 1.45;
+            box-shadow: 0 8px 26px rgba(0,0,0,0.95);
+            transform: translate(-50%, -105%);
+            min-width: 200px;
         }}
 
         .tv-widget-item {{
@@ -399,61 +389,13 @@ html_code = f"""
     <div id="chartArea"></div>
     <div id="activeToolsContainer"></div>
 
+    <!-- Scalable Multi-Row Strategy HUD Container -->
     <div id="strategyBox" class="draggable-strategy-box">
         <div class="box-drag-handle">::: STRATEGY HUD :::</div>
-        <table>
-            <thead>
-                <tr>
-                    <th>Parameter</th>
-                    <th>Index (Spot)</th>
-                    <th id="hudOptionHead">Option ({active_symbol})</th>
-                </tr>
-            </thead>
-            <tbody>
-                <tr>
-                    <td class="label-cell">Call or Put</td>
-                    <td class="val-cell"><span id="hudTypePill" class="tag-pill" style="background:{'#089981' if t_type == 'CE' else '#f23645'};">{t_type}</span></td>
-                    <td class="opt-cell"><span id="hudTypeOptPill" class="tag-pill" style="background:{'#089981' if t_type == 'CE' else '#f23645'};">{t_type}</span></td>
-                </tr>
-                <tr>
-                    <td class="label-cell">Entry</td>
-                    <td class="val-cell"><b id="hudEntrySpot">{entry_spot:.1f}</b></td>
-                    <td class="opt-cell"><b id="hudEntryOpt">₹{entry_opt:.2f}</b></td>
-                </tr>
-                <tr>
-                    <td class="label-cell">SL (risk pts)</td>
-                    <td class="val-cell text-red"><span id="hudSLSpot">{sl_spot:.1f} (-{risk_pts:.1f} pts)</span></td>
-                    <td class="opt-cell text-red"><span id="hudSLOpt">₹{sl_opt:.2f} (-₹{int(round(risk_pts * active_delta * total_qty))})</span></td>
-                </tr>
-                <tr>
-                    <td class="label-cell">Target 1</td>
-                    <td class="val-cell text-green"><span id="hudT1Spot">{t1_spot:.1f} (+{t1_pts:.1f} pts)</span></td>
-                    <td class="opt-cell text-green"><span id="hudT1Opt">₹{t1_opt:.2f} (+₹{int(round(t1_pts * active_delta * total_qty))})</span></td>
-                </tr>
-                <tr>
-                    <td class="label-cell">Target Mid</td>
-                    <td class="val-cell text-green"><span id="hudTMidSpot">{tmid_spot:.1f} (+{tmid_pts:.1f} pts)</span></td>
-                    <td class="opt-cell text-green"><span id="hudTMidOpt">₹{tmid_opt:.2f}</span></td>
-                </tr>
-                <tr>
-                    <td class="label-cell">Target Final</td>
-                    <td class="val-cell text-green"><b id="hudTFinalSpot">{tfinal_spot:.1f} (+{tfinal_pts:.1f} pts)</b></td>
-                    <td class="opt-cell text-green"><b id="hudTFinalOpt">₹{tfinal_opt:.2f} (+₹{int(round(tfinal_pts * active_delta * total_qty))})</b></td>
-                </tr>
-                <tr>
-                    <td class="label-cell">Trailing SL</td>
-                    <td class="val-cell text-trail"><span id="hudTrailSpot">{trail_spot:.1f}</span></td>
-                    <td class="opt-cell text-trail"><span id="hudTrailOpt">₹{trail_opt:.2f}</span></td>
-                </tr>
-                <tr>
-                    <td class="label-cell">Secured P&L (at SL)</td>
-                    <td class="val-cell" style="color:{'#089981' if secured_pts >= 0 else '#f23645'}; font-weight:800;"><span id="hudPnLSpot">{secured_pts:+.1f} pts</span></td>
-                    <td class="opt-cell" style="color:{'#089981' if secured_pts >= 0 else '#f23645'}; font-weight:800;"><span id="hudPnLOpt">₹{int(round(secured_pts * active_delta * total_qty)):+d}</span></td>
-                </tr>
-            </tbody>
-        </table>
+        <div id="hudTableContainer"></div>
     </div>
 
+    <!-- Hover Tag Overlay Card -->
     <div id="historyTag" class="history-signal-tag"></div>
 
     <script>
@@ -485,7 +427,7 @@ html_code = f"""
         const emaSeries = chart.addLineSeries({{ color: '#2962ff', lineWidth: 1, title: '9-EMA' }});
         emaSeries.setData({ema_json});
 
-        // Historical Breakout Markers directly from Worker
+        // Set Historical Breakout Markers directly from Worker
         candleSeries.setMarkers({markers_json});
 
         // Precalculated ORB Lines directly from Worker
@@ -513,172 +455,73 @@ html_code = f"""
             candleSeries.createPriceLine({{ price: pv.PDL, color: '#fb8c00', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, title: 'PDL' }});
         }}
 
-        // ==========================================
-        // Interactive Drawing Tools System
-        // ==========================================
-        let toolCounter = 0;
-        let currentDrawMode = null;
-        let drawPoints = [];
-        const activePositionWidgets = [];
+        // Dynamic Multi-Row Target HUD Table
+        function renderHUDTable(h) {{
+            if (!h || !h.entry_spot) return;
+            const isCE = h.type === 'CE';
+            const themeCol = isCE ? '#089981' : '#f23645';
+            const totalRiskINR = Math.round(h.risk_pts * liveDelta * activeQty);
 
-        function activateDrawMode(mode) {{
-            currentDrawMode = mode;
-            drawPoints = [];
-            chartContainer.classList.add('chart-click-crosshair');
-            ['btnFibR', 'btnFibE', 'btnLong', 'btnShort'].forEach(b => document.getElementById(b).classList.remove('active-draw'));
-            if (mode === 'FIB_RETRACE') document.getElementById('btnFibR').classList.add('active-draw');
-            if (mode === 'FIB_EXT') document.getElementById('btnFibE').classList.add('active-draw');
-            if (mode === 'LONG') document.getElementById('btnLong').classList.add('active-draw');
-            if (mode === 'SHORT') document.getElementById('btnShort').classList.add('active-draw');
-        }}
-
-        function cancelDrawMode() {{
-            currentDrawMode = null;
-            drawPoints = [];
-            chartContainer.classList.remove('chart-click-crosshair');
-            ['btnFibR', 'btnFibE', 'btnLong', 'btnShort'].forEach(b => document.getElementById(b).classList.remove('active-draw'));
-        }}
-
-        chart.subscribeClick(param => {{
-            if (!currentDrawMode || !param.point) return;
-            const price = candleSeries.coordinateToPrice(param.point.y);
-            if (!price) return;
-            drawPoints.push({{ price: price, x: param.point.x, y: param.point.y }});
-
-            if (currentDrawMode === 'LONG' || currentDrawMode === 'SHORT') {{
-                spawnInteractivePositionWidget(currentDrawMode, price, param.point.x, param.point.y);
-                cancelDrawMode();
-            }} else if (currentDrawMode === 'FIB_RETRACE' && drawPoints.length === 2) {{
-                spawnTwoPointFibRetrace(drawPoints[0], drawPoints[1]);
-                cancelDrawMode();
-            }} else if (currentDrawMode === 'FIB_EXT' && drawPoints.length === 3) {{
-                spawnThreePointFibExtension(drawPoints[0], drawPoints[1], drawPoints[2]);
-                cancelDrawMode();
+            let tgRows = '';
+            if (h.targets && h.targets.length > 0) {{
+                h.targets.forEach(tg => {{
+                    const profitINR = Math.round(tg.pts * liveDelta * activeQty);
+                    tgRows += `
+                        <tr>
+                            <td class="label-cell">${{tg.label}}</td>
+                            <td class="val-cell text-green">${{tg.spot.toFixed(1)}} (+${{tg.pts.toFixed(1)}} pts)</td>
+                            <td class="opt-cell text-green">₹${{tg.opt.toFixed(2)}} (+₹${{profitINR}})</td>
+                        </tr>
+                    `;
+                }});
             }}
-        }});
 
-        function spawnInteractivePositionWidget(type, entryPrice, clickX, clickY) {{
-            toolCounter++;
-            const wId = 'pos_w_' + toolCounter;
-            const wObj = {{ id: wId, type: type, entryPrice: entryPrice, tgtPts: 60.0, slPts: 25.0, domElem: null }};
-            const wElem = document.createElement('div');
-            wElem.className = 'tv-widget-item';
-            wElem.style.left = (clickX - 40) + 'px';
-            wElem.style.top = (clickY - 50) + 'px';
-            wObj.domElem = wElem;
-            activePositionWidgets.push(wObj);
+            const secINR = Math.round(h.secured_pts * liveDelta * activeQty);
+            const sign = h.secured_pts >= 0 ? '+' : '';
+            const pnlCol = h.secured_pts >= 0 ? '#089981' : '#f23645';
 
-            renderSinglePosWidget(wObj);
-            makeDraggable(wElem);
-            document.getElementById('activeToolsContainer').appendChild(wElem);
+            document.getElementById('hudTableContainer').innerHTML = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Index (Spot)</th>
+                            <th>Option (${{h.symbol}})</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td class="label-cell">Call or Put</td>
+                            <td class="val-cell"><span class="tag-pill" style="background:${{themeCol}}">${{h.type}}</span></td>
+                            <td class="opt-cell"><span class="tag-pill" style="background:${{themeCol}}">${{h.type}}</span></td>
+                        </tr>
+                        <tr>
+                            <td class="label-cell">Entry</td>
+                            <td class="val-cell"><b>${{h.entry_spot.toFixed(1)}}</b></td>
+                            <td class="opt-cell"><b>₹${{h.entry_opt.toFixed(2)}}</b></td>
+                        </tr>
+                        <tr>
+                            <td class="label-cell">SL (risk pts)</td>
+                            <td class="val-cell text-red">${{h.sl_spot.toFixed(1)}} (-${{h.risk_pts.toFixed(1)}} pts)</td>
+                            <td class="opt-cell text-red">₹${{h.sl_opt.toFixed(2)}} (-₹${{totalRiskINR}})</td>
+                        </tr>
+                        ${{tgRows}}
+                        <tr>
+                            <td class="label-cell">Trailing SL</td>
+                            <td class="val-cell text-trail">${{h.trail_spot.toFixed(1)}}</td>
+                            <td class="opt-cell text-trail">₹${{h.trail_opt.toFixed(2)}}</td>
+                        </tr>
+                        <tr>
+                            <td class="label-cell">Secured P&L (at SL)</td>
+                            <td class="val-cell" style="color:${{pnlCol}}; font-weight:800;">${{sign}}${{h.secured_pts.toFixed(1)}} pts</td>
+                            <td class="opt-cell" style="color:${{pnlCol}}; font-weight:800;">₹${{sign}}${{secINR}}</td>
+                        </tr>
+                    </tbody>
+                </table>
+            `;
         }}
 
-        function renderSinglePosWidget(wObj) {{
-            const optTgtGain = Math.round((wObj.tgtPts * liveDelta) * 10) / 10;
-            const optStopLoss = Math.round((wObj.slPts * liveDelta) * 10) / 10;
-            const expectedProfit = Math.round(optTgtGain * activeQty);
-            const expectedLoss = Math.round(optStopLoss * activeQty);
-            const rr = (wObj.tgtPts / wObj.slPts).toFixed(2);
-
-            const pHeight = Math.max(30, Math.round(wObj.tgtPts * 1.5));
-            const lHeight = Math.max(26, Math.round(wObj.slPts * 1.5));
-
-            if (wObj.type === 'LONG') {{
-                wObj.domElem.innerHTML = `
-                    <div class="tv-del-btn" onclick="deletePosWidget('${{wObj.id}}')">✕</div>
-                    <div class="tv-pos-zone tv-pos-green" style="height:${{pHeight}}px;">
-                        <span style="font-weight:700; color:#fff;">Target: +${{wObj.tgtPts.toFixed(1)}} pts (₹${{expectedProfit}})</span>
-                        <span style="color:#d1d4dc;">Opt Tgt: ₹${{({live_real_ltp} + optTgtGain).toFixed(2)}} | 1:${{rr}}</span>
-                    </div>
-                    <div style="height:3px; background:#2962ff; position:relative;">
-                        <div class="tv-center-handle"></div>
-                    </div>
-                    <div class="tv-pos-zone tv-pos-red" style="height:${{lHeight}}px;">
-                        <span style="font-weight:700; color:#fff;">Stop: -${{wObj.slPts.toFixed(1)}} pts (₹${{expectedLoss}})</span>
-                        <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, {live_real_ltp} - optStopLoss).toFixed(2)}}</span>
-                    </div>
-                `;
-            }} else {{
-                wObj.domElem.innerHTML = `
-                    <div class="tv-del-btn" onclick="deletePosWidget('${{wObj.id}}')">✕</div>
-                    <div class="tv-pos-zone tv-pos-red" style="height:${{lHeight}}px;">
-                        <span style="font-weight:700; color:#fff;">Stop: -${{wObj.slPts.toFixed(1)}} pts (₹${{expectedLoss}})</span>
-                        <span style="color:#d1d4dc;">Opt SL: ₹${{Math.max(0, {live_real_ltp} - optStopLoss).toFixed(2)}}</span>
-                    </div>
-                    <div style="height:3px; background:#2962ff; position:relative;">
-                        <div class="tv-center-handle"></div>
-                    </div>
-                    <div class="tv-pos-zone tv-pos-green" style="height:${{pHeight}}px;">
-                        <span style="font-weight:700; color:#fff;">Target: +${{wObj.tgtPts.toFixed(1)}} pts (₹${{expectedProfit}})</span>
-                        <span style="color:#d1d4dc;">Opt Tgt: ₹${{({live_real_ltp} + optTgtGain).toFixed(2)}} | 1:${{rr}}</span>
-                    </div>
-                `;
-            }}
-        }}
-
-        function deletePosWidget(id) {{
-            const idx = activePositionWidgets.findIndex(w => w.id === id);
-            if (idx !== -1) {{
-                activePositionWidgets[idx].domElem.remove();
-                activePositionWidgets.splice(idx, 1);
-            }}
-        }}
-
-        function spawnTwoPointFibRetrace(pt1, pt2) {{
-            toolCounter++;
-            const pHigh = Math.max(pt1.price, pt2.price);
-            const pLow = Math.min(pt1.price, pt2.price);
-            const range = pHigh - pLow;
-            const levels = [
-                {{ p: pHigh, c: '#787b86', lbl: '0.0%' }},
-                {{ p: pHigh - (range * 0.236), c: '#f23645', lbl: '23.6%' }},
-                {{ p: pHigh - (range * 0.382), c: '#ff9800', lbl: '38.2%' }},
-                {{ p: pHigh - (range * 0.500), c: '#4caf50', lbl: '50.0%' }},
-                {{ p: pHigh - (range * 0.618), c: '#00bcd4', lbl: '61.8%' }},
-                {{ p: pHigh - (range * 0.786), c: '#2196f3', lbl: '78.6%' }},
-                {{ p: pLow, c: '#787b86', lbl: '100.0%' }}
-            ];
-            const lines = levels.map(lv => candleSeries.createPriceLine({{ price: lv.p, color: lv.c, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.SparseDotted, title: lv.lbl }}));
-
-            const anchor = document.createElement('div');
-            anchor.className = 'tv-widget-item';
-            anchor.style.left = Math.min(pt1.x, pt2.x) + 'px';
-            anchor.style.top = Math.min(pt1.y, pt2.y) + 'px';
-            anchor.style.background = '#1e222d';
-            anchor.style.border = '1px solid #ffd600';
-            anchor.style.padding = '4px 8px';
-            anchor.style.width = '140px';
-            anchor.innerHTML = `<div style="font-size:8.5px; color:#ffd600; font-weight:700;">Fib Retrace #${{toolCounter}}</div><div class="tv-del-btn">✕</div>`;
-            anchor.querySelector('.tv-del-btn').onclick = () => {{ lines.forEach(l => candleSeries.removePriceLine(l)); anchor.remove(); }};
-            makeDraggable(anchor);
-            document.getElementById('activeToolsContainer').appendChild(anchor);
-        }}
-
-        function spawnThreePointFibExtension(pt1, pt2, pt3) {{
-            toolCounter++;
-            const impulse = Math.abs(pt2.price - pt1.price);
-            const isUp = pt2.price >= pt1.price;
-            const levels = [
-                {{ p: isUp ? (pt3.price + impulse * 0.618) : (pt3.price - impulse * 0.618), lbl: 'Ext 61.8%', c: '#00e5ff' }},
-                {{ p: isUp ? (pt3.price + impulse * 1.000) : (pt3.price - impulse * 1.000), lbl: 'Ext 100.0%', c: '#ffd600' }},
-                {{ p: isUp ? (pt3.price + impulse * 1.272) : (pt3.price - impulse * 1.272), lbl: 'Ext 127.2%', c: '#00bfa5' }},
-                {{ p: isUp ? (pt3.price + impulse * 1.618) : (pt3.price - impulse * 1.618), lbl: 'Ext 161.8%', c: '#ff6d00' }}
-            ];
-            const lines = levels.map(lv => candleSeries.createPriceLine({{ price: lv.p, color: lv.c, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, title: lv.lbl }}));
-
-            const anchor = document.createElement('div');
-            anchor.className = 'tv-widget-item';
-            anchor.style.left = pt3.x + 'px';
-            anchor.style.top = pt3.y + 'px';
-            anchor.style.background = '#1e222d';
-            anchor.style.border = '1px solid #00bfa5';
-            anchor.style.padding = '4px 8px';
-            anchor.style.width = '140px';
-            anchor.innerHTML = `<div style="font-size:8.5px; color:#00bfa5; font-weight:700;">Fib Ext #${{toolCounter}}</div><div class="tv-del-btn">✕</div>`;
-            anchor.querySelector('.tv-del-btn').onclick = () => {{ lines.forEach(l => candleSeries.removePriceLine(l)); anchor.remove(); }};
-            makeDraggable(anchor);
-            document.getElementById('activeToolsContainer').appendChild(anchor);
-        }}
+        renderHUDTable({hud_json});
 
         // Tooltip Hover on Breakout Candle
         const historyCards = {history_cards_json};
@@ -699,21 +542,32 @@ html_code = f"""
             const eBar = param.seriesData.get(emaSeries);
             if (eBar) document.getElementById('barEMA').innerText = eBar.value.toFixed(2);
 
-            const sig = historyCards[param.time];
+            // Robust Lookup for both Integer and String Timestamps
+            const timeKey = param.time;
+            const sig = historyCards[timeKey] || historyCards[String(timeKey)];
+
             if (sig && param.point) {{
                 hTag.style.display = 'block';
                 hTag.style.left = param.point.x + 'px';
-                hTag.style.top = (param.point.y - 12) + 'px';
+                hTag.style.top = (param.point.y - 14) + 'px';
                 const tagColor = sig.type === 'CE' ? '#00bfa5' : '#f23645';
+
+                let tgsHtml = '';
+                if (sig.targets && sig.targets.length > 0) {{
+                    sig.targets.forEach((tg, idx) => {{
+                        tgsHtml += `<div><b>Target ${{idx+1}}:</b> ${{tg.toFixed(1)}} (+${{Math.abs(tg - sig.entry).toFixed(1)}} pts)</div>`;
+                    }});
+                }}
+
                 hTag.innerHTML = `
-                    <div style="font-weight:bold; color:${{tagColor}}; border-bottom:1px solid #363c4e; padding-bottom:2px; margin-bottom:3px;">
-                        ${{sig.title}} (${{sig.time_str}})
+                    <div style="font-weight:bold; color:${{tagColor}}; border-bottom:1px solid #363c4e; padding-bottom:3px; margin-bottom:4px; font-size:11px;">
+                        ${{sig.title}}
                     </div>
-                    <div><b>Entry:</b> ${{sig.entry.toFixed(1)}}</div>
-                    <div><b>Stop Loss:</b> ${{sig.sl.toFixed(1)}} (-${{Math.abs(sig.entry - sig.sl).toFixed(1)}} pts)</div>
-                    <div><b>Target 1:</b> ${{sig.target1.toFixed(1)}} (+${{Math.abs(sig.target1 - sig.entry).toFixed(1)}} pts)</div>
-                    <div><b>Target Mid:</b> ${{sig.target_mid.toFixed(1)}} (+${{Math.abs(sig.target_mid - sig.entry).toFixed(1)}} pts)</div>
-                    <div><b>Target Max:</b> ${{sig.target_final.toFixed(1)}} (+${{Math.abs(sig.target_final - sig.entry).toFixed(1)}} pts)</div>
+                    <div><b>Date:</b> ${{sig.date_readable || sig.date}}</div>
+                    <div><b>Time:</b> ${{sig.time_str}}</div>
+                    <div><b>Entry Spot:</b> ${{sig.entry.toFixed(1)}}</div>
+                    <div><b>Initial SL:</b> ${{sig.sl.toFixed(1)}} (-${{Math.abs(sig.entry - sig.sl).toFixed(1)}} pts)</div>
+                    ${{tgsHtml}}
                 `;
             }} else {{
                 hTag.style.display = 'none';
@@ -775,43 +629,10 @@ html_code = f"""
                         if (optLtpElem) optLtpElem.innerText = "₹" + stData.opt_ltp.toFixed(2);
                     }}
                     if (stData.hud) {{
-                        const h = stData.hud;
-                        const isCE = h.type === 'CE';
-                        liveDelta = h.delta || 0.50;
-
+                        liveDelta = stData.hud.delta || 0.50;
                         document.getElementById('topDeltaVal').innerText = liveDelta.toFixed(2);
-                        document.getElementById('hudOptionHead').innerText = "Option (" + h.symbol + ")";
-                        document.getElementById('topContractSym').innerText = h.symbol;
-                        document.getElementById('hudTypePill').innerText = h.type;
-                        document.getElementById('hudTypeOptPill').innerText = h.type;
-                        document.getElementById('hudTypePill').style.background = isCE ? '#089981' : '#f23645';
-                        document.getElementById('hudTypeOptPill').style.background = isCE ? '#089981' : '#f23645';
-
-                        document.getElementById('hudEntrySpot').innerText = h.entry_spot.toFixed(1);
-                        document.getElementById('hudEntryOpt').innerText = "₹" + h.entry_opt.toFixed(2);
-
-                        document.getElementById('hudSLSpot').innerText = h.sl_spot.toFixed(1) + " (-" + h.risk_pts.toFixed(1) + " pts)";
-                        document.getElementById('hudSLOpt').innerText = "₹" + h.sl_opt.toFixed(2) + " (-₹" + Math.round(h.risk_pts * liveDelta * activeQty) + ")";
-
-                        document.getElementById('hudT1Spot').innerText = h.t1_spot.toFixed(1) + " (+" + h.t1_pts.toFixed(1) + " pts)";
-                        document.getElementById('hudT1Opt').innerText = "₹" + h.t1_opt.toFixed(2) + " (+₹" + Math.round(h.t1_pts * liveDelta * activeQty) + ")";
-
-                        document.getElementById('hudTMidSpot').innerText = h.tmid_spot.toFixed(1) + " (+" + h.tmid_pts.toFixed(1) + " pts)";
-                        document.getElementById('hudTMidOpt').innerText = "₹" + h.tmid_opt.toFixed(2);
-
-                        document.getElementById('hudTFinalSpot').innerText = h.tfinal_spot.toFixed(1) + " (+" + h.tfinal_pts.toFixed(1) + " pts)";
-                        document.getElementById('hudTFinalOpt').innerText = "₹" + h.tfinal_opt.toFixed(2) + " (+₹" + Math.round(h.tfinal_pts * liveDelta * activeQty) + ")";
-
-                        document.getElementById('hudTrailSpot').innerText = h.trail_spot.toFixed(1);
-                        document.getElementById('hudTrailOpt').innerText = "₹" + h.trail_opt.toFixed(2);
-
-                        const pnlSpotElem = document.getElementById('hudPnLSpot');
-                        const pnlOptElem = document.getElementById('hudPnLOpt');
-                        const sign = h.secured_pts >= 0 ? "+" : "";
-                        pnlSpotElem.innerText = sign + h.secured_pts.toFixed(1) + " pts";
-                        pnlOptElem.innerText = "₹" + sign + Math.round(h.secured_pts * liveDelta * activeQty);
-                        pnlSpotElem.parentElement.style.color = h.secured_pts >= 0 ? '#089981' : '#f23645';
-                        pnlOptElem.parentElement.style.color = h.secured_pts >= 0 ? '#089981' : '#f23645';
+                        document.getElementById('topContractSym').innerText = stData.hud.symbol;
+                        renderHUDTable(stData.hud);
                     }}
                 }}
             }} catch(e) {{}}
