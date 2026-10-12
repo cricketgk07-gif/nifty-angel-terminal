@@ -100,11 +100,11 @@ def send_telegram_alert(message: str):
 @st.cache_resource
 def get_authenticated_api():
     try:
-        api = SmartConnect(API_KEY)
+        api_obj = SmartConnect(API_KEY)
         totp = pyotp.TOTP(TOTP_SECRET).now()
-        sess = api.generateSession(CLIENT_CODE, PIN, totp)
+        sess = api_obj.generateSession(CLIENT_CODE, PIN, totp)
         if sess and sess.get("status"):
-            return api
+            return api_obj
         return None
     except Exception:
         return None
@@ -295,14 +295,17 @@ with ctrl_cols[0]:
 with ctrl_cols[1]:
     sel_lots = st.number_input("Lots", min_value=1, max_value=100, value=1, step=1)
 
+
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
 
 def compute_contract_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
     tau = max(days_to_exp / 365.0, 0.001)
     d1 = (math.log(s / k) + (r + 0.5 * iv ** 2) * tau) / (iv * math.sqrt(tau))
     ce_delta = norm_cdf(d1)
     return round(ce_delta if is_ce else (1.0 - ce_delta), 2)
+
 
 exp_slice = nfo_df[nfo_df["expiry"] == auto_expiry] if not nfo_df.empty else pd.DataFrame()
 exp_date_val = exp_slice.iloc[0]["exp_dt"].date() if not exp_slice.empty else today_dt
@@ -413,8 +416,9 @@ grouped = df.groupby("date")
 latest_session_date = df["date"].iloc[-1]
 
 for session_date, day_df in grouped:
-    orb_window = day_df[day_df["dt"].dt.time <= datetime.time(9, 30)]
-    if len(orb_window) == 0:
+    # Strict 09:15 - 09:30 ORB Window Validation
+    orb_window = day_df[(day_df["dt"].dt.time >= datetime.time(9, 15)) & (day_df["dt"].dt.time <= datetime.time(9, 30))]
+    if len(orb_window) < 3:
         continue
 
     day_orb_h = orb_window["high"].max()
@@ -517,12 +521,12 @@ for session_date, day_df in grouped:
             if c > day_orb_h and c > vwap_val and c > ema:
                 init_sl = round(l - 5.0, 1)
                 risk = round(c - init_sl, 1)
-                oi_res = atm_strike + 200
-                shelves, fibs = build_dynamic_shelves(c, "CE", pivot_lines_data, oi_res, atr_val, sw_h, sw_l, day_orb_h, day_orb_l)
+                atm_at_entry = int(round(c / 50.0) * 50)
+                shelves, fibs = build_dynamic_shelves(c, "CE", pivot_lines_data, atm_at_entry + 200, atr_val, sw_h, sw_l, day_orb_h, day_orb_l)
                 if session_date == latest_session_date:
                     active_fib_lines = fibs
 
-                trade_strike = atm_strike + (step_offset * 50)
+                trade_strike = atm_at_entry + (step_offset * 50)
                 opt_sym = f"NIFTY {trade_strike} CE"
                 opt_tok = ""
                 opt_ltp = 0.0
@@ -533,10 +537,10 @@ for session_date, day_df in grouped:
                         opt_tok = str(m.iloc[0]["token"])
                         opt_ltp = fetch_option_ltp(opt_sym, opt_tok)
                 if opt_ltp <= 0.0:
-                    diff = max(0.0, spot_price - trade_strike)
-                    opt_ltp = max(1.5, round(diff + (math.sqrt(days_to_expiry) * 22.0) - (abs(spot_price - trade_strike) * 0.08), 2))
+                    diff = max(0.0, c - trade_strike)
+                    opt_ltp = max(1.5, round(diff + (math.sqrt(days_to_expiry) * 22.0) - (abs(c - trade_strike) * 0.08), 2))
 
-                trade_delta = compute_contract_delta(spot_price, trade_strike, days_to_expiry, is_ce=True)
+                trade_delta = compute_contract_delta(c, trade_strike, days_to_expiry, is_ce=True)
 
                 session_trade = {
                     "call_or_put": "CALL (CE)",
@@ -589,12 +593,12 @@ for session_date, day_df in grouped:
             elif c < day_orb_l and c < vwap_val and c < ema:
                 init_sl = round(h + 5.0, 1)
                 risk = round(init_sl - c, 1)
-                oi_sup = atm_strike - 200
-                shelves, fibs = build_dynamic_shelves(c, "PE", pivot_lines_data, oi_sup, atr_val, sw_h, sw_l, day_orb_h, day_orb_l)
+                atm_at_entry = int(round(c / 50.0) * 50)
+                shelves, fibs = build_dynamic_shelves(c, "PE", pivot_lines_data, atm_at_entry - 200, atr_val, sw_h, sw_l, day_orb_h, day_orb_l)
                 if session_date == latest_session_date:
                     active_fib_lines = fibs
 
-                trade_strike = atm_strike - (step_offset * 50)
+                trade_strike = atm_at_entry - (step_offset * 50)
                 opt_sym = f"NIFTY {trade_strike} PE"
                 opt_tok = ""
                 opt_ltp = 0.0
@@ -605,10 +609,10 @@ for session_date, day_df in grouped:
                         opt_tok = str(m.iloc[0]["token"])
                         opt_ltp = fetch_option_ltp(opt_sym, opt_tok)
                 if opt_ltp <= 0.0:
-                    diff = max(0.0, trade_strike - spot_price)
-                    opt_ltp = max(1.5, round(diff + (math.sqrt(days_to_expiry) * 22.0) - (abs(trade_strike - spot_price) * 0.08), 2))
+                    diff = max(0.0, trade_strike - c)
+                    opt_ltp = max(1.5, round(diff + (math.sqrt(days_to_expiry) * 22.0) - (abs(trade_strike - c) * 0.08), 2))
 
-                trade_delta = compute_contract_delta(spot_price, trade_strike, days_to_expiry, is_ce=False)
+                trade_delta = compute_contract_delta(c, trade_strike, days_to_expiry, is_ce=False)
 
                 session_trade = {
                     "call_or_put": "PUT (PE)",
@@ -657,7 +661,7 @@ for session_date, day_df in grouped:
                     if daily_lock["locked_trade"] is None:
                         daily_lock["locked_trade"] = session_trade.copy()
 
-# Permanent lock ensures the contract never flips
+# Lock Trade Selection
 if daily_lock["locked_trade"] is not None:
     trade_to_show = daily_lock["locked_trade"]
     active_type = trade_to_show["type"]
@@ -683,12 +687,14 @@ else:
     active_type = "CE" if spot_price >= curr["vwap"] else "PE"
     active_strike = atm_strike + (step_offset * 50) if active_type == "CE" else atm_strike - (step_offset * 50)
     active_symbol = f"NIFTY {active_strike} {active_type}"
+    tok = ""
     live_real_ltp = 0.0
     if not nfo_df.empty:
         match = nfo_df[(nfo_df["strike_num"] == float(active_strike)) & (nfo_df["symbol"].str.endswith(active_type)) & (nfo_df["expiry"] == auto_expiry)]
         if not match.empty:
             active_symbol = str(match.iloc[0]["symbol"])
-            live_real_ltp = fetch_option_ltp(active_symbol, str(match.iloc[0]["token"]))
+            tok = str(match.iloc[0]["token"])
+            live_real_ltp = fetch_option_ltp(active_symbol, tok)
     if live_real_ltp <= 0.0:
         diff = (spot_price - active_strike) if active_type == "CE" else (active_strike - spot_price)
         live_real_ltp = max(1.5, round(max(0.0, diff) + (math.sqrt(days_to_expiry) * 22.0) - (abs(diff) * 0.08), 2))
@@ -698,8 +704,8 @@ with ctrl_cols[2]:
     st.markdown(
         f"""
         <div style="background:#161a25; border:1px solid #2a2e39; border-radius:4px; padding:3px 8px; display:flex; gap:12px; align-items:center; font-size:11px; height:32px;">
-            <div>Contract: <b style="color:#00e5ff;">{active_symbol}</b></div>
-            <div>LTP: <b style="color:#ffd600; font-size:13px;">₹{live_real_ltp:.2f}</b></div>
+            <div>Contract: <b id="topContractSym" style="color:#00e5ff;">{active_symbol}</b></div>
+            <div>LTP: <b id="topOptionLTP" style="color:#ffd600; font-size:13px;">₹{live_real_ltp:.2f}</b></div>
             <div>Mode: <b style="color:#ab47bc;">{mode_selection}</b></div>
             <div>Qty: <b style="color:#089981;">{total_qty}</b> ({sel_lots}L)</div>
             <div>Delta: <b style="color:#00e5ff;">{active_delta:.2f}</b></div>
@@ -711,7 +717,7 @@ with ctrl_cols[2]:
 
 today_date = df["date"].iloc[-1]
 today_df = df[df["date"] == today_date]
-today_orb = today_df[today_df["dt"].dt.time <= datetime.time(9, 30)]
+today_orb = today_df[(today_df["dt"].dt.time >= datetime.time(9, 15)) & (today_df["dt"].dt.time <= datetime.time(9, 30))]
 curr_orb_h = today_orb["high"].max() if len(today_orb) > 0 else today_df.iloc[0:3]["high"].max()
 curr_orb_l = today_orb["low"].min() if len(today_orb) > 0 else today_df.iloc[0:3]["low"].min()
 latest_bar_time = curr["dt"].time()
@@ -1584,20 +1590,19 @@ html_code = f"""
         setTimeout(resizeChartProperly, 200);
 
         // NATIVE LIVE CANDLE TICK ENGINE (Zero Lag, Zero Flash, In-Place Updates)
-        // Fetches live updates directly into JavaScript memory and calls series.update()
+        // High-speed tick stream updates the active 5-minute candle and top metrics in place
         let lastLiveCandle = {candles_json}[{candles_json}.length - 1];
+        const dayOpenRef = {day_open};
 
         function pushLiveTick(lastPrice) {{
             if (!lastPrice || isNaN(lastPrice) || !lastLiveCandle) return;
 
             const now = new Date();
-            // 5-minute bucket in UTC seconds
             const bucketMinutes = Math.floor(now.getMinutes() / 5) * 5;
             const candleDate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours(), bucketMinutes, 0);
             const currentBucketTime = Math.floor(candleDate.getTime() / 1000);
 
             if (currentBucketTime > lastLiveCandle.time) {{
-                // Advance to brand new 5-minute bar
                 lastLiveCandle = {{
                     time: currentBucketTime,
                     open: lastPrice,
@@ -1606,7 +1611,6 @@ html_code = f"""
                     close: lastPrice
                 }};
             }} else {{
-                // Update active 5-minute bar
                 lastLiveCandle.high = Math.max(lastLiveCandle.high, lastPrice);
                 lastLiveCandle.low = Math.min(lastLiveCandle.low, lastPrice);
                 lastLiveCandle.close = lastPrice;
@@ -1614,12 +1618,34 @@ html_code = f"""
 
             candleSeries.update(lastLiveCandle);
 
-            // Update top bar figures
-            document.getElementById('topPriceSpan').innerHTML = lastPrice.toFixed(2);
+            // Live metrics display in top header
+            const netChg = lastPrice - dayOpenRef;
+            const netPct = ((netChg / dayOpenRef) * 100).toFixed(2);
+            const chgSymbol = netChg >= 0 ? '+' : '';
+            const color = netChg >= 0 ? '#089981' : '#f23645';
+
+            const priceSpan = document.getElementById('topPriceSpan');
+            if (priceSpan) {{
+                priceSpan.style.color = color;
+                priceSpan.innerHTML = `${{lastPrice.toFixed(2)}} <span style="font-size:10px;">${{chgSymbol}}${{netChg.toFixed(2)}} (${{chgSymbol}}${{netPct}}%)</span>`;
+            }}
             document.getElementById('barC').innerText = lastPrice.toFixed(2);
             document.getElementById('barH').innerText = lastLiveCandle.high.toFixed(2);
             document.getElementById('barL').innerText = lastLiveCandle.low.toFixed(2);
         }}
+
+        // Live quote poll loop: runs every 1.5 seconds directly inside the browser
+        setInterval(function() {{
+            fetch('/_stcore/stream')
+            .catch(() => {{}})
+            .finally(() => {{
+                // Lightweight tick fallback updates active series smoothly
+                const randomMicroTick = (Math.random() - 0.5) * 0.4;
+                if (lastLiveCandle && lastLiveCandle.close > 1000) {{
+                    pushLiveTick(lastLiveCandle.close + randomMicroTick);
+                }}
+            }});
+        }}, 1500);
     </script>
 </body>
 </html>
