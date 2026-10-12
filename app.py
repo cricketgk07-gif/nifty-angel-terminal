@@ -416,7 +416,6 @@ def format_full_entry_table_card(trade, opt_symbol, opt_ltp, delta_val, qty):
     final_profit_inr = int(opt_final_gain * qty)
 
     time_str = datetime.datetime.now(IST).strftime("%H:%M:%S")
-    # HTML escape mode_selection to prevent Telegram parse rejection
     safe_mode_label = html.escape(str(mode_selection))
 
     msg = (
@@ -534,7 +533,8 @@ for session_date, day_df in grouped:
                             session_trade["trail_stage"] = f"SHELF 1 CLEARED ({s_level:.1f}) -> BE LOCKED"
                         else:
                             prev_shelf = shelves[s_idx - 1]
-                            session_trade["current_sl"] = max(session_trade["current_sl"], round(prev_shelf - pullback_buffer, 1))
+                            target_sl = round(prev_shelf - pullback_buffer, 1)
+                            session_trade["current_sl"] = max(session_trade["current_sl"], target_sl)
                             session_trade["trail_stage"] = f"SHELF {s_idx+1} CLEARED ({s_level:.1f}) -> TRAIL LOCK"
 
                 if session_trade["current_shelf_idx"] >= len(shelves):
@@ -603,7 +603,8 @@ for session_date, day_df in grouped:
                             session_trade["trail_stage"] = f"SHELF 1 CLEARED ({s_level:.1f}) -> BE LOCKED"
                         else:
                             prev_shelf = shelves[s_idx - 1]
-                            session_trade["current_sl"] = min(session_trade["current_sl"], round(prev_shelf + pullback_buffer, 1))
+                            target_sl = round(prev_shelf + pullback_buffer, 1)
+                            session_trade["current_sl"] = min(session_trade["current_sl"], target_sl)
                             session_trade["trail_stage"] = f"SHELF {s_idx+1} CLEARED ({s_level:.1f}) -> TRAIL LOCK"
 
                 if session_trade["current_shelf_idx"] >= len(shelves):
@@ -872,7 +873,7 @@ volume_data = [
     for _, r in df.iterrows()
 ]
 
-# --- STRATEGY HUD PAYLOAD ---
+# Strategy HUD Payload
 hud_payload = None
 if trade_executed_in_latest_session and latest_trade_for_hud:
     is_ce = latest_trade_for_hud["type"] == "CE"
@@ -1750,14 +1751,14 @@ html_code = f"""
         window.addEventListener('resize', resizeChartProperly);
         setTimeout(resizeChartProperly, 200);
 
-        // Active 15s auto-refresh polling directly executing inside browser iframe
-        setTimeout(function(){
-            try {
+        // 15s auto-refresh polling directly inside the browser iframe
+        setTimeout(function() {{
+            try {{
                 window.parent.location.reload();
-            } catch(e) {
+            }} catch(e) {{
                 window.location.reload();
-            }
-        }, 15000);
+            }}
+        }}, 15000);
     </script>
 </body>
 </html>
