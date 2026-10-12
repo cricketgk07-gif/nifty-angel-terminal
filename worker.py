@@ -53,7 +53,7 @@ threading.Thread(target=run_ping_server, daemon=True).start()
 
 
 # ==========================================
-# 2. Redis, Math & Telegram Helpers
+# 2. Helper Functions
 # ==========================================
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
@@ -110,7 +110,7 @@ def get_dynamic_budget():
 
 
 # ==========================================
-# 3. Core Engine with Historical Signal Engine
+# 3. Engine
 # ==========================================
 class DedicatedTradingWorker:
     def __init__(self):
@@ -181,21 +181,19 @@ class DedicatedTradingWorker:
             pass
 
     def backtest_historical_signals(self):
-        """Worker evaluates ORB strategy on all loaded historical candles."""
         if not self.candles:
             return
 
         df_h = pd.DataFrame(self.candles)
         df_h["date"] = df_h["dt"].dt.date
 
-        # Compute VWAP and EMA9 for signal evaluation
         candle_spread = (df_h["high"] - df_h["low"]) + (df_h["close"] - df_h["open"]).abs()
-        calc_vol = candle_spread * 1250.0 + 500.0
-        tp = (df_h["high"] + df_h["low"] + df_h["close"]) / 3.0
-        df_h["cum_vol"] = df_h.groupby("date")[calc_vol].cumsum() if calc_vol is not None else 1
-        df_h["cum_vp"] = df_h.groupby("date")[tp * calc_vol].cumsum()
+        df_h["calc_vol"] = candle_spread * 1250.0 + 500.0
+        df_h["tp"] = (df_h["high"] + df_h["low"] + df_h["close"]) / 3.0
+        df_h["cum_vol"] = df_h.groupby("date")["calc_vol"].cumsum()
+        df_h["cum_vp"] = df_h.groupby("date").apply(lambda g: (g["tp"] * g["calc_vol"]).cumsum()).reset_index(drop=True)
         df_h["vwap"] = df_h["cum_vp"] / df_h["cum_vol"]
-        df_h["vwap"] = df_h["vwap"].fillna(tp)
+        df_h["vwap"] = df_h["vwap"].fillna(df_h["tp"])
         df_h["ema9"] = df_h["close"].ewm(span=9, adjust=False).mean()
 
         self.markers = []
@@ -220,6 +218,7 @@ class DedicatedTradingWorker:
 
                 if datetime.time(9, 30) < t <= datetime.time(10, 30) and not executed:
                     if c > orb_h and c > vwap_val and c > ema_val:
+                        # Stop loss at breakout candle low - 5 pts (tight risk, NOT 140 pts)
                         sl_val = round(float(r["low"]) - 5.0, 1)
                         t_sec = int(r["time"])
                         self.markers.append({
@@ -243,6 +242,7 @@ class DedicatedTradingWorker:
                         executed = True
 
                     elif c < orb_l and c < vwap_val and c < ema_val:
+                        # Stop loss at breakdown candle high + 5 pts
                         sl_val = round(float(r["high"]) + 5.0, 1)
                         t_sec = int(r["time"])
                         self.markers.append({
@@ -265,8 +265,6 @@ class DedicatedTradingWorker:
                         }
                         executed = True
 
-        print(f"Worker historical scan complete: {len(self.markers)} breakout signals detected across history.")
-
     def fetch_option_ltp(self, sym, tok):
         try:
             res = self.api.ltpData("NFO", sym, tok)
@@ -286,7 +284,7 @@ class DedicatedTradingWorker:
         if self.nfo_df.empty:
             return atm, f"NIFTY {atm} {opt_type}", "", 0.50, 4
 
-        # Strictly skip today's expiry
+        # Strictly roll forward if today is expiry
         future_exp = self.nfo_df[self.nfo_df["exp_dt"].dt.date > self.today].sort_values("exp_dt")
         if future_exp.empty:
             future_exp = self.nfo_df[self.nfo_df["exp_dt"].dt.date >= self.today].sort_values("exp_dt")
@@ -398,15 +396,13 @@ class DedicatedTradingWorker:
                     "time": last_c["time"],
                 }
 
-                # Add live marker immediately
-                new_marker = {
+                self.markers.append({
                     "time": last_c["time"],
                     "position": "belowBar",
                     "color": "#00bfa5",
                     "shape": "arrowUp",
                     "text": f"BUY CE @ {close_p:.1f}",
-                }
-                self.markers.append(new_marker)
+                })
                 self.history_cards[last_c["time"]] = {
                     "title": "BUY CE (ORB BREAKOUT)",
                     "entry": round(close_p, 1),
@@ -461,14 +457,13 @@ class DedicatedTradingWorker:
                     "time": last_c["time"],
                 }
 
-                new_marker = {
+                self.markers.append({
                     "time": last_c["time"],
                     "position": "aboveBar",
                     "color": "#f23645",
                     "shape": "arrowDown",
                     "text": f"BUY PE @ {close_p:.1f}",
-                }
-                self.markers.append(new_marker)
+                })
                 self.history_cards[last_c["time"]] = {
                     "title": "BUY PE (ORB BREAKDOWN)",
                     "entry": round(close_p, 1),
