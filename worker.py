@@ -110,7 +110,7 @@ def get_dynamic_budget():
 
 
 # ==========================================
-# 3. Core Engine
+# 3. Core Engine with Historical Signal Engine
 # ==========================================
 class DedicatedTradingWorker:
     def __init__(self):
@@ -124,8 +124,12 @@ class DedicatedTradingWorker:
         self.active_bar = None
         self.today = datetime.datetime.now(IST).date()
         self.locked_trade = None
+        self.markers = []
+        self.history_cards = {}
+
         self.nfo_df = self.load_scrip_master()
         self.init_historical_candles()
+        self.backtest_historical_signals()
 
         if self.candles:
             self.sync_state(self.candles[-1]["close"])
@@ -176,6 +180,93 @@ class DedicatedTradingWorker:
         except Exception:
             pass
 
+    def backtest_historical_signals(self):
+        """Worker evaluates ORB strategy on all loaded historical candles."""
+        if not self.candles:
+            return
+
+        df_h = pd.DataFrame(self.candles)
+        df_h["date"] = df_h["dt"].dt.date
+
+        # Compute VWAP and EMA9 for signal evaluation
+        candle_spread = (df_h["high"] - df_h["low"]) + (df_h["close"] - df_h["open"]).abs()
+        calc_vol = candle_spread * 1250.0 + 500.0
+        tp = (df_h["high"] + df_h["low"] + df_h["close"]) / 3.0
+        df_h["cum_vol"] = df_h.groupby("date")[calc_vol].cumsum() if calc_vol is not None else 1
+        df_h["cum_vp"] = df_h.groupby("date")[tp * calc_vol].cumsum()
+        df_h["vwap"] = df_h["cum_vp"] / df_h["cum_vol"]
+        df_h["vwap"] = df_h["vwap"].fillna(tp)
+        df_h["ema9"] = df_h["close"].ewm(span=9, adjust=False).mean()
+
+        self.markers = []
+        self.history_cards = {}
+
+        for session_date, day_df in df_h.groupby("date"):
+            orb_window = day_df[(day_df["dt"].dt.time >= datetime.time(9, 15)) & (day_df["dt"].dt.time <= datetime.time(9, 30))]
+            if len(orb_window) < 3:
+                continue
+
+            orb_h = float(orb_window["high"].max())
+            orb_l = float(orb_window["low"].min())
+            orb_range = max(10.0, orb_h - orb_l)
+            executed = False
+
+            for idx in range(len(day_df)):
+                r = day_df.iloc[idx]
+                t = r["dt"].time()
+                c = float(r["close"])
+                vwap_val = float(r["vwap"])
+                ema_val = float(r["ema9"])
+
+                if datetime.time(9, 30) < t <= datetime.time(10, 30) and not executed:
+                    if c > orb_h and c > vwap_val and c > ema_val:
+                        sl_val = round(float(r["low"]) - 5.0, 1)
+                        t_sec = int(r["time"])
+                        self.markers.append({
+                            "time": t_sec,
+                            "position": "belowBar",
+                            "color": "#00bfa5",
+                            "shape": "arrowUp",
+                            "text": f"BUY CE @ {c:.1f}",
+                        })
+                        self.history_cards[t_sec] = {
+                            "title": "BUY CE (ORB BREAKOUT)",
+                            "entry": round(c, 1),
+                            "sl": sl_val,
+                            "target1": round(orb_h + (1.000 * orb_range), 1),
+                            "target_mid": round(orb_h + (1.618 * orb_range), 1),
+                            "target_final": round(orb_h + (2.618 * orb_range), 1),
+                            "type": "CE",
+                            "time_str": r["dt"].strftime("%H:%M"),
+                            "date": str(session_date),
+                        }
+                        executed = True
+
+                    elif c < orb_l and c < vwap_val and c < ema_val:
+                        sl_val = round(float(r["high"]) + 5.0, 1)
+                        t_sec = int(r["time"])
+                        self.markers.append({
+                            "time": t_sec,
+                            "position": "aboveBar",
+                            "color": "#f23645",
+                            "shape": "arrowDown",
+                            "text": f"BUY PE @ {c:.1f}",
+                        })
+                        self.history_cards[t_sec] = {
+                            "title": "BUY PE (ORB BREAKDOWN)",
+                            "entry": round(c, 1),
+                            "sl": sl_val,
+                            "target1": round(orb_l - (1.000 * orb_range), 1),
+                            "target_mid": round(orb_l - (1.618 * orb_range), 1),
+                            "target_final": round(orb_l - (2.618 * orb_range), 1),
+                            "type": "PE",
+                            "time_str": r["dt"].strftime("%H:%M"),
+                            "date": str(session_date),
+                        }
+                        executed = True
+
+        print(f"Worker historical scan complete: {len(self.markers)} breakout signals detected across history.")
+
     def fetch_option_ltp(self, sym, tok):
         try:
             res = self.api.ltpData("NFO", sym, tok)
@@ -195,10 +286,9 @@ class DedicatedTradingWorker:
         if self.nfo_df.empty:
             return atm, f"NIFTY {atm} {opt_type}", "", 0.50, 4
 
-        # Strictly skip today's expiry (exp_dt > self.today) to prevent 0DTE decay
+        # Strictly skip today's expiry
         future_exp = self.nfo_df[self.nfo_df["exp_dt"].dt.date > self.today].sort_values("exp_dt")
         if future_exp.empty:
-            # Fallback if no next-week expiries found in current file
             future_exp = self.nfo_df[self.nfo_df["exp_dt"].dt.date >= self.today].sort_values("exp_dt")
 
         if future_exp.empty:
@@ -270,6 +360,7 @@ class DedicatedTradingWorker:
 
         orb_h = max(c["high"] for c in orb_bars)
         orb_l = min(c["low"] for c in orb_bars)
+        orb_range = max(10.0, orb_h - orb_l)
 
         last_c = self.candles[-1]
         t = last_c["dt"].time()
@@ -286,12 +377,9 @@ class DedicatedTradingWorker:
 
                 risk_pts = round(close_p - init_sl, 1)
                 opt_sl = max(0.5, round(opt_ltp - (risk_pts * delta), 1))
-                t1_p = round(close_p + 40.0, 1)
-                tmid_p = round(close_p + 70.0, 1)
-                tfinal_p = round(close_p + 110.0, 1)
-                opt_t1 = round(opt_ltp + (40.0 * delta), 1)
-                opt_tmid = round(opt_ltp + (70.0 * delta), 1)
-                opt_tfinal = round(opt_ltp + (110.0 * delta), 1)
+                t1_p = round(orb_h + (1.000 * orb_range), 1)
+                tmid_p = round(orb_h + (1.618 * orb_range), 1)
+                tfinal_p = round(orb_h + (2.618 * orb_range), 1)
 
                 self.locked_trade = {
                     "type": "CE",
@@ -310,19 +398,35 @@ class DedicatedTradingWorker:
                     "time": last_c["time"],
                 }
 
-                total_qty = LOT_SIZE_QTY
+                # Add live marker immediately
+                new_marker = {
+                    "time": last_c["time"],
+                    "position": "belowBar",
+                    "color": "#00bfa5",
+                    "shape": "arrowUp",
+                    "text": f"BUY CE @ {close_p:.1f}",
+                }
+                self.markers.append(new_marker)
+                self.history_cards[last_c["time"]] = {
+                    "title": "BUY CE (ORB BREAKOUT)",
+                    "entry": round(close_p, 1),
+                    "sl": init_sl,
+                    "target1": t1_p,
+                    "target_mid": tmid_p,
+                    "target_final": tfinal_p,
+                    "type": "CE",
+                    "time_str": last_c["dt"].strftime("%H:%M"),
+                    "date": str(self.today),
+                }
+
                 send_telegram_alert(
                     f"🚀 <b>ORB BREAKOUT TRIGGERED: BUY {sym}</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"<b>CONTRACT:</b> {sym} (Δ: {delta:.2f})\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"<b>LEVEL | INDEX (SPOT) | OPTION (₹)</b>\n"
                     f"• <b>ENTRY:</b> {close_p:.1f} | <b>₹{opt_ltp:.2f}</b>\n"
-                    f"• <b>STOP LOSS:</b> {init_sl:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b> (-₹{int(round(risk_pts * delta * total_qty))})\n"
-                    f"• <b>TARGET 1:</b> {t1_p:.1f} (+40.0 pts) | <b>₹{opt_t1:.2f}</b> (+₹{int(round(40.0 * delta * total_qty))})\n"
-                    f"• <b>TARGET MID:</b> {tmid_p:.1f} (+70.0 pts) | <b>₹{opt_tmid:.2f}</b>\n"
-                    f"• <b>TARGET MAX:</b> {tfinal_p:.1f} (+110.0 pts) | <b>₹{opt_tfinal:.2f}</b> (+₹{int(round(110.0 * delta * total_qty))})\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"• <b>STOP LOSS:</b> {init_sl:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b>\n"
+                    f"• <b>TARGET 1:</b> {t1_p:.1f} | <b>TARGET MAX:</b> {tfinal_p:.1f}\n"
                     f"⏰ <b>Trigger Time:</b> {last_c['dt'].strftime('%H:%M:%S')}"
                 )
 
@@ -336,12 +440,9 @@ class DedicatedTradingWorker:
 
                 risk_pts = round(init_sl - close_p, 1)
                 opt_sl = max(0.5, round(opt_ltp - (risk_pts * delta), 1))
-                t1_p = round(close_p - 40.0, 1)
-                tmid_p = round(close_p - 70.0, 1)
-                tfinal_p = round(close_p - 110.0, 1)
-                opt_t1 = round(opt_ltp + (40.0 * delta), 1)
-                opt_tmid = round(opt_ltp + (70.0 * delta), 1)
-                opt_tfinal = round(opt_ltp + (110.0 * delta), 1)
+                t1_p = round(orb_l - (1.000 * orb_range), 1)
+                tmid_p = round(orb_l - (1.618 * orb_range), 1)
+                tfinal_p = round(orb_l - (2.618 * orb_range), 1)
 
                 self.locked_trade = {
                     "type": "PE",
@@ -360,19 +461,34 @@ class DedicatedTradingWorker:
                     "time": last_c["time"],
                 }
 
-                total_qty = LOT_SIZE_QTY
+                new_marker = {
+                    "time": last_c["time"],
+                    "position": "aboveBar",
+                    "color": "#f23645",
+                    "shape": "arrowDown",
+                    "text": f"BUY PE @ {close_p:.1f}",
+                }
+                self.markers.append(new_marker)
+                self.history_cards[last_c["time"]] = {
+                    "title": "BUY PE (ORB BREAKDOWN)",
+                    "entry": round(close_p, 1),
+                    "sl": init_sl,
+                    "target1": t1_p,
+                    "target_mid": tmid_p,
+                    "target_final": tfinal_p,
+                    "type": "PE",
+                    "time_str": last_c["dt"].strftime("%H:%M"),
+                    "date": str(self.today),
+                }
+
                 send_telegram_alert(
                     f"🚀 <b>ORB BREAKDOWN TRIGGERED: BUY {sym}</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"<b>CONTRACT:</b> {sym} (Δ: {delta:.2f})\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"<b>LEVEL | INDEX (SPOT) | OPTION (₹)</b>\n"
                     f"• <b>ENTRY:</b> {close_p:.1f} | <b>₹{opt_ltp:.2f}</b>\n"
-                    f"• <b>STOP LOSS:</b> {init_sl:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b> (-₹{int(round(risk_pts * delta * total_qty))})\n"
-                    f"• <b>TARGET 1:</b> {t1_p:.1f} (+40.0 pts) | <b>₹{opt_t1:.2f}</b> (+₹{int(round(40.0 * delta * total_qty))})\n"
-                    f"• <b>TARGET MID:</b> {tmid_p:.1f} (+70.0 pts) | <b>₹{opt_tmid:.2f}</b>\n"
-                    f"• <b>TARGET MAX:</b> {tfinal_p:.1f} (+110.0 pts) | <b>₹{opt_tfinal:.2f}</b> (+₹{int(round(110.0 * delta * total_qty))})\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"• <b>STOP LOSS:</b> {init_sl:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b>\n"
+                    f"• <b>TARGET 1:</b> {t1_p:.1f} | <b>TARGET MAX:</b> {tfinal_p:.1f}\n"
                     f"⏰ <b>Trigger Time:</b> {last_c['dt'].strftime('%H:%M:%S')}"
                 )
 
@@ -380,22 +496,10 @@ class DedicatedTradingWorker:
             trade = self.locked_trade
             if trade["type"] == "CE" and last_c["low"] <= trade["current_sl"]:
                 trade["closed"] = True
-                pts = round(trade["current_sl"] - trade["entry"], 1)
-                opt_gain = round(pts * trade.get("delta", 0.50), 1)
-                send_telegram_alert(
-                    f"🏁 <b>STOP HIT: {trade['symbol']} CLOSED</b>\n"
-                    f"• <b>Exit Spot:</b> {trade['current_sl']:.1f} ({pts:+.1f} pts)\n"
-                    f"• <b>Option Gain:</b> ₹{opt_gain:+.2f} per qty"
-                )
+                send_telegram_alert(f"🏁 <b>STOP HIT: {trade['symbol']} CLOSED @ {trade['current_sl']:.1f}</b>")
             elif trade["type"] == "PE" and last_c["high"] >= trade["current_sl"]:
                 trade["closed"] = True
-                pts = round(trade["entry"] - trade["current_sl"], 1)
-                opt_gain = round(pts * trade.get("delta", 0.50), 1)
-                send_telegram_alert(
-                    f"🏁 <b>STOP HIT: {trade['symbol']} CLOSED</b>\n"
-                    f"• <b>Exit Spot:</b> {trade['current_sl']:.1f} ({pts:+.1f} pts)\n"
-                    f"• <b>Option Gain:</b> ₹{opt_gain:+.2f} per qty"
-                )
+                send_telegram_alert(f"🏁 <b>STOP HIT: {trade['symbol']} CLOSED @ {trade['current_sl']:.1f}</b>")
 
     def sync_state(self, live_ltp):
         opt_ltp = 0.0
@@ -422,6 +526,8 @@ class DedicatedTradingWorker:
             "opt_ltp": opt_ltp,
             "candles": recent_candles,
             "locked_trade": self.locked_trade,
+            "markers": self.markers,
+            "history_cards": self.history_cards,
             "updated_at": time.time(),
         }
         push_to_redis("nifty_live_state", payload)
