@@ -28,10 +28,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "6898891302")
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 BUDGET_CEILING = float(os.getenv("BUDGET_CEILING", "80.0"))
+PORT = int(os.getenv("PORT", 10000))
 
 
 # ==========================================
-# 1. Health Ping Server for Render
+# 1. Self-Sustaining Health Server & Auto-Pinger
 # ==========================================
 class HealthHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -45,12 +46,24 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
 
 
 def run_ping_server():
-    port = int(os.getenv("PORT", 10000))
-    with socketserver.TCPServer(("0.0.0.0", port), HealthHandler) as httpd:
+    with socketserver.TCPServer(("0.0.0.0", PORT), HealthHandler) as httpd:
         httpd.serve_forever()
 
 
 threading.Thread(target=run_ping_server, daemon=True).start()
+
+
+def self_ping_keepalive():
+    """Pings localhost every 8 minutes to prevent Render from idling out."""
+    while True:
+        time.sleep(480)
+        try:
+            requests.get(f"http://127.0.0.1:{PORT}/", timeout=5)
+        except Exception:
+            pass
+
+
+threading.Thread(target=self_ping_keepalive, daemon=True).start()
 
 
 # ==========================================
@@ -69,7 +82,6 @@ def compute_contract_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
 
 def send_telegram_alert(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[Telegram Error]: Bot token or Chat ID is missing!")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -80,10 +92,8 @@ def send_telegram_alert(message: str):
     }
     try:
         r = requests.post(url, json=payload, timeout=6)
-        print(f"[Telegram Response {r.status_code}]: {r.text}")
         return r.status_code == 200
-    except Exception as e:
-        print(f"[Telegram Exception]: {e}")
+    except Exception:
         return False
 
 
@@ -94,8 +104,8 @@ def push_to_redis(key, data_obj):
     headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
     try:
         requests.post(url, headers=headers, data=json.dumps(data_obj), timeout=3)
-    except Exception as e:
-        print(f"Redis write error: {e}")
+    except Exception:
+        pass
 
 
 def read_from_redis(key="nifty_live_state"):
@@ -135,12 +145,6 @@ def get_dynamic_budget():
 # ==========================================
 class DedicatedTradingWorker:
     def __init__(self):
-        self.api = SmartConnect(API_KEY)
-        totp = pyotp.TOTP(TOTP_SECRET).now()
-        self.session = self.api.generateSession(CLIENT_CODE, PIN, totp)
-        self.auth_token = self.session["data"]["jwtToken"]
-        self.feed_token = self.api.getfeedToken()
-
         self.candles = []
         self.active_bar = None
         self.today = datetime.datetime.now(IST).date()
@@ -150,8 +154,12 @@ class DedicatedTradingWorker:
         self.fib_lines = {}
         self.orb_levels = {}
         self.hud_data = {}
+        self.auth_token = None
+        self.feed_token = None
+        self.last_login_date = None
 
-        # Restore state from Redis to prevent duplicate alerts across reboots
+        self.authenticate_angel_one()
+
         saved_state = read_from_redis("nifty_live_state")
         self.locked_trade = saved_state.get("locked_trade") if saved_state else None
 
@@ -161,6 +169,33 @@ class DedicatedTradingWorker:
 
         if self.candles:
             self.sync_state(self.candles[-1]["close"])
+
+    def authenticate_angel_one(self):
+        """Authenticates with TOTP and generates fresh tokens."""
+        try:
+            self.api = SmartConnect(API_KEY)
+            totp = pyotp.TOTP(TOTP_SECRET).now()
+            self.session = self.api.generateSession(CLIENT_CODE, PIN, totp)
+            self.auth_token = self.session["data"]["jwtToken"]
+            self.feed_token = self.api.getfeedToken()
+            self.last_login_date = datetime.datetime.now(IST).date()
+            print(f"[Auth Success]: SmartAPI tokens refreshed for {self.last_login_date}")
+        except Exception as e:
+            print(f"[Auth Error]: Failed to generate Angel One session: {e}")
+
+    def check_daily_relogin(self):
+        """Checks if a new trading day has started to refresh the 24-hr token."""
+        now = datetime.datetime.now(IST)
+        if self.last_login_date != now.date() and now.time() >= datetime.time(8, 30):
+            print("[Daily Refresh]: Resetting credentials and ORB session for the new trading day...")
+            self.today = now.date()
+            self.authenticate_angel_one()
+            self.locked_trade = None
+            self.nfo_df = self.load_scrip_master()
+            self.init_historical_candles()
+            self.run_full_strategy_pipeline()
+            return True
+        return False
 
     def load_scrip_master(self):
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -194,6 +229,7 @@ class DedicatedTradingWorker:
                 "todate": to_str,
             })
             if resp and resp.get("status") and resp.get("data"):
+                self.candles = []
                 for b in resp["data"]:
                     dt = pd.to_datetime(b[0])
                     t_sec = int((dt.tz_localize(None) - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1))
@@ -325,7 +361,6 @@ class DedicatedTradingWorker:
         self.history_cards = {}
         last_found_trade = None
 
-        # Bar-by-bar backtest simulation to verify Stop-Loss vs Targets accurately
         for d_str, day_df in df_h.groupby("date_str"):
             ow = day_df[(day_df["dt"].dt.time >= datetime.time(9, 15)) & (day_df["dt"].dt.time < datetime.time(9, 30))]
             if len(ow) < 3:
@@ -344,7 +379,6 @@ class DedicatedTradingWorker:
                 vw = float(r["vwap"])
                 em = float(r["ema9"])
 
-                # Check if an active simulated trade hit stop-loss FIRST
                 if sim_trade and not sim_trade.get("closed"):
                     if sim_trade["type"] == "CE" and l_bar <= sim_trade["sl"]:
                         sim_trade["closed"] = True
@@ -355,10 +389,8 @@ class DedicatedTradingWorker:
                         sim_trade["outcome"] = "STOP HIT (LOSS)"
                         sim_trade["exit_price"] = sim_trade["sl"]
 
-                # Entry trigger condition
                 if datetime.time(9, 30) <= t <= datetime.time(11, 30) and not sim_trade:
                     if c > d_h and c > vw and c > em:
-                        # Exact Initial SL = Trigger Candle Low - 5 pts
                         sl_val = round(float(r["low"]) - 5.0, 1)
                         t_list = self.compute_all_confluence_targets(df_h.iloc[:idx+1], c, is_ce=True)
                         t_sec = int(r["time"])
@@ -387,7 +419,6 @@ class DedicatedTradingWorker:
                         last_found_trade = sim_trade
 
                     elif c < d_l and c < vw and c < em:
-                        # Exact Initial SL = Trigger Candle High + 5 pts
                         sl_val = round(float(r["high"]) + 5.0, 1)
                         t_list = self.compute_all_confluence_targets(df_h.iloc[:idx+1], c, is_ce=False)
                         t_sec = int(r["time"])
@@ -554,6 +585,10 @@ class DedicatedTradingWorker:
         return chosen_strike, chosen_sym, chosen_tok, delta, days_to_exp
 
     def on_tick(self, ltp):
+        # Check if we crossed into a new day at market open to re-authenticate
+        if self.check_daily_relogin():
+            return
+
         now = datetime.datetime.now(IST)
         bucket_min = (now.minute // 5) * 5
         bar_dt = now.replace(minute=bucket_min, second=0, microsecond=0)
@@ -708,11 +743,6 @@ class DedicatedTradingWorker:
                 )
 
     def evaluate_live_trail_and_exit(self, live_spot):
-        """
-        STRICT EXECUTION ORDER:
-        1. Check Stop-Loss FIRST. If price crossed current_sl -> EXIT IMMEDIATELY AS STOP HIT.
-        2. Evaluate targets and trailing updates ONLY if stop loss is untouched.
-        """
         if not self.locked_trade or self.locked_trade.get("closed"):
             return
 
@@ -727,9 +757,7 @@ class DedicatedTradingWorker:
         t_now = datetime.datetime.now(IST).strftime("%H:%M:%S")
         date_readable = tr.get("date_readable", datetime.datetime.now(IST).strftime("%d-%b-%Y (%A)"))
 
-        # =================================================================
-        # STEP 1: EVALUATE STOP-LOSS HIT BEFORE ANY TARGET PROCESSING
-        # =================================================================
+        # Step 1: Check Stop Loss Hit FIRST
         stop_hit = (live_spot <= tr["current_sl"]) if is_ce else (live_spot >= tr["current_sl"])
         if stop_hit:
             tr["closed"] = True
@@ -748,9 +776,7 @@ class DedicatedTradingWorker:
             )
             return
 
-        # =================================================================
-        # STEP 2: EVALUATE TARGETS & TRAILS ONLY WHEN UNSTOPPED
-        # =================================================================
+        # Step 2: Evaluate Targets & Progressive Trails
         if is_ce:
             tr["peak_extreme"] = max(tr.get("peak_extreme", entry_p), live_spot)
             peak_gain = tr["peak_extreme"] - entry_p
@@ -761,7 +787,6 @@ class DedicatedTradingWorker:
         sl_updated = False
         update_reason = ""
 
-        # Check Milestone Target Crossings
         for idx, tg_p in enumerate(targets, start=1):
             if current_stage < idx:
                 crossed = (live_spot >= tg_p) if is_ce else (live_spot <= tg_p)
@@ -780,7 +805,6 @@ class DedicatedTradingWorker:
                         update_reason = f"TARGET {idx} MET"
                         sl_updated = True
 
-        # Progressive Dynamic Ratchet (Runs when peak gain >= 60 pts)
         if peak_gain >= 60.0:
             cushion = max(10.0, 0.75 * atr_val) if peak_gain >= 90.0 else max(13.0, 1.00 * atr_val)
 
@@ -810,7 +834,6 @@ class DedicatedTradingWorker:
                     update_reason = f"RATCHETED HIGHER (PEAK: {tr['peak_extreme']:.1f})"
                     sl_updated = True
 
-        # DISPATCH TRAILING SL ALERT (Before Stop Hit)
         last_alerted = tr.get("last_alerted_sl", tr["init_sl"])
         if sl_updated or abs(tr["current_sl"] - last_alerted) >= 4.0:
             tr["last_alerted_sl"] = tr["current_sl"]
@@ -887,7 +910,7 @@ class DedicatedTradingWorker:
 def run_worker():
     while True:
         try:
-            print("Initializing Dedicated Trading Worker in LIVE PRODUCTION MODE...")
+            print("Starting Trading Worker with Auto-Relogin and Keepalive...")
             engine = DedicatedTradingWorker()
             sws = SmartWebSocketV2(engine.auth_token, API_KEY, CLIENT_CODE, engine.feed_token)
 
