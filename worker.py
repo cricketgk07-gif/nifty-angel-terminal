@@ -7,17 +7,15 @@ import os
 import socketserver
 import threading
 import time
-import numpy as np
 import pandas as pd
 import pyotp
 import requests
-import zoneinfo
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 INDEX_TOKEN = "99926000"
 LOT_SIZE_QTY = 65
-IST = zoneinfo.ZoneInfo("Asia/Kolkata")
+IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 API_KEY = os.getenv("API_KEY", "")
 CLIENT_CODE = os.getenv("CLIENT_CODE", "")
@@ -183,7 +181,7 @@ class DedicatedTradingWorker:
             self.auth_token = self.session["data"]["jwtToken"]
             self.feed_token = self.api.getfeedToken()
             self.last_login_date = datetime.datetime.now(IST).date()
-            print(f"[Auth Success]: SmartAPI tokens generated for {self.last_login_date}")
+            print(f"[Auth Success]: SmartAPI session generated for {self.last_login_date}")
         except Exception as e:
             print(f"[Auth Error]: Session generation failed: {e}")
 
@@ -221,22 +219,25 @@ class DedicatedTradingWorker:
             if resp and resp.get("status") and resp.get("data"):
                 self.candles = []
                 for b in resp["data"]:
-                    dt = pd.to_datetime(b[0])
-                    if dt.tzinfo is None:
-                        dt = dt.tz_localize("Asia/Kolkata")
+                    # Angel One timestamps come as "2026-10-13T09:15:00+05:30" or "YYYY-MM-DD HH:MM"
+                    dt_parsed = pd.to_datetime(b[0])
+                    if dt_parsed.tzinfo is None:
+                        dt_ist = dt_parsed.tz_localize(IST)
                     else:
-                        dt = dt.astimezone(IST)
-                    t_sec = int(dt.timestamp())
+                        dt_ist = dt_parsed.astimezone(IST)
+                    
+                    t_sec = int(dt_ist.timestamp())
                     self.candles.append({
                         "time": t_sec,
                         "open": float(b[1]),
                         "high": float(b[2]),
                         "low": float(b[3]),
                         "close": float(b[4]),
-                        "dt": dt,
+                        "dt": dt_ist,
                     })
+                print(f"[Candles Loaded]: {len(self.candles)} candles initialized.")
         except Exception as e:
-            print(f"Candle history warning: {e}")
+            print(f"[Candles Error]: {e}")
 
     def compute_all_confluence_targets(self, df_h, entry_p, is_ce):
         high_low = df_h["high"] - df_h["low"]
@@ -490,7 +491,7 @@ class DedicatedTradingWorker:
             delta_v = 0.50
             sym = f"NIFTY {int(round(last_close / 50.0) * 50)} {t_type}"
 
-        # Populate Fib lines properly
+        # Setup Fib Lines
         if t_type == "CE":
             self.fib_lines = {
                 "fib_100": round(curr_orb_h + (1.000 * orb_range_val), 1),
@@ -906,7 +907,7 @@ class DedicatedTradingWorker:
 
 
 # ==========================================
-# 4. Supervisor Loop & Stream Reconnect
+# 4. Supervisor Loop & Active Stream Recovery
 # ==========================================
 def run_worker():
     while True:
