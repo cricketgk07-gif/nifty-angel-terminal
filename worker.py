@@ -85,17 +85,15 @@ def compute_contract_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
 
 
 def is_market_hours():
-    """STRICT CHECK: Only allow actions between 09:15 and 15:30 IST on weekdays."""
     now = datetime.datetime.now(IST)
-    if now.weekday() >= 5:  # Saturday or Sunday
+    if now.weekday() >= 5:
         return False
     return datetime.time(9, 15) <= now.time() <= datetime.time(15, 30)
 
 
 def send_telegram_alert(message: str):
-    # HARD BLOCK: Never send alerts outside active market hours!
     if not is_market_hours():
-        print(f"[Alert Blocked]: Message suppressed because market is closed: {message[:40]}...")
+        print(f"[Alert Suppressed]: Market closed, blocked: {message[:40]}...")
         return False
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -171,11 +169,10 @@ class DedicatedTradingWorker:
         self.fib_lines = {}
         self.orb_levels = {}
         self.hud_data = {}
-        
-        # State: Strictly 1 trade per day
+
         self.locked_trade = None
         self.trade_taken_today = False
-        
+
         self.auth_token = None
         self.feed_token = None
         self.last_login_date = None
@@ -186,11 +183,10 @@ class DedicatedTradingWorker:
         saved_state = read_from_redis("nifty_live_state") or {}
         self.history_cards = saved_state.get("history_cards", {})
         self.markers = saved_state.get("markers", [])
-        
+
         today_str = self.today.strftime("%Y-%m-%d")
-        
-        # If market is closed right now (after 15:30), purge active trade state
         now_time = datetime.datetime.now(IST).time()
+
         if now_time > datetime.time(15, 30) or now_time < datetime.time(9, 15):
             self.locked_trade = None
             self.trade_taken_today = (saved_state.get("trade_date") == today_str)
@@ -371,7 +367,21 @@ class DedicatedTradingWorker:
         orb_range_val = max(15.0, round(curr_orb_h - curr_orb_l, 2))
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
-        # Scan history to build chart cards (DISPLAY ONLY - never sends alerts!)
+        # Fibonacci Projections: Upside for CE or Default Standby, Downside for PE
+        is_active_pe = self.locked_trade and self.locked_trade.get("type") == "PE"
+        if is_active_pe:
+            self.fib_lines = {
+                "fib_100": round(curr_orb_l - (1.000 * orb_range_val), 1),
+                "fib_161": round(curr_orb_l - (1.618 * orb_range_val), 1),
+                "fib_261": round(curr_orb_l - (2.618 * orb_range_val), 1),
+            }
+        else:
+            self.fib_lines = {
+                "fib_100": round(curr_orb_h + (1.000 * orb_range_val), 1),
+                "fib_161": round(curr_orb_h + (1.618 * orb_range_val), 1),
+                "fib_261": round(curr_orb_h + (2.618 * orb_range_val), 1),
+            }
+
         for d_str, day_df in df_h.groupby("date_str"):
             day_times = day_df["dt"].apply(lambda d: d.astimezone(IST).time())
             ow = day_df[(day_times >= datetime.time(9, 15)) & (day_times < datetime.time(9, 30))]
@@ -448,7 +458,6 @@ class DedicatedTradingWorker:
                             "outcome": "HISTORICAL",
                         }
 
-        # HUD strictly reflects the active trade during live market hours
         if is_market_hours() and self.locked_trade and not self.locked_trade.get("closed"):
             tr = self.locked_trade
             t_type = tr["type"]
@@ -492,16 +501,6 @@ class DedicatedTradingWorker:
             }
         else:
             self.hud_data = {}
-
-        if self.orb_levels:
-            curr_orb_h = self.orb_levels["orb_h"]
-            curr_orb_l = self.orb_levels["orb_l"]
-            orb_range_val = self.orb_levels["range"]
-            self.fib_lines = {
-                "fib_100": round(curr_orb_h + (1.000 * orb_range_val), 1),
-                "fib_161": round(curr_orb_h + (1.618 * orb_range_val), 1),
-                "fib_261": round(curr_orb_h + (2.618 * orb_range_val), 1),
-            }
 
     def background_option_poller(self):
         while True:
@@ -561,7 +560,6 @@ class DedicatedTradingWorker:
         return chosen_strike, chosen_sym, chosen_tok, delta, days_to_exp
 
     def on_tick(self, ltp):
-        # Discard any ticks outside market hours
         if not is_market_hours():
             return
 
@@ -612,7 +610,7 @@ class DedicatedTradingWorker:
             close_time_dt = last_c["dt"].astimezone(IST) + datetime.timedelta(minutes=5)
             close_time_str = close_time_dt.strftime("%H:%M:%S")
 
-            # CE Breakout
+            # CE Breakout: Breakout Candle Low - 5.0
             if close_p > orb_h and prev_c["close"] <= orb_h:
                 self.trade_taken_today = True
                 strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=True)
@@ -670,7 +668,7 @@ class DedicatedTradingWorker:
                     f"⏰ <b>Trigger Time (Candle Close):</b> {close_time_str}"
                 )
 
-            # PE Breakdown
+            # PE Breakdown: Breakout Candle High + 5.0
             elif close_p < orb_l and prev_c["close"] >= orb_l:
                 self.trade_taken_today = True
                 strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=False)
@@ -751,7 +749,6 @@ class DedicatedTradingWorker:
             final_inr = int(round(final_pts * delta_v * LOT_SIZE_QTY))
             sign = "+" if final_pts >= 0 else ""
 
-            # KILL ACTIVE TRADE PERMANENTLY
             tr["closed"] = True
             self.locked_trade = None
             self.hud_data = {}
@@ -894,7 +891,6 @@ def run_worker():
                 while True:
                     time.sleep(30)
                     now = datetime.datetime.now(IST)
-                    # Pre-market auto-reset at 08:30 AM every morning
                     if engine.last_login_date != now.date() and now.time() >= datetime.time(8, 30):
                         print("[Supervisor]: Pre-market 08:30 AM reached. Resetting daily session completely...")
                         engine.today = now.date()
