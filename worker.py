@@ -32,7 +32,7 @@ PORT = int(os.getenv("PORT", 10000))
 
 
 # ==========================================
-# 1. Health Server & Self-Pinger
+# 1. Health Server & Keepalive Pinger
 # ==========================================
 class HealthHandler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
@@ -165,14 +165,23 @@ class DedicatedTradingWorker:
 
         self.authenticate_angel_one()
 
-        saved_state = read_from_redis("nifty_live_state")
-        self.locked_trade = saved_state.get("locked_trade") if saved_state else None
+        # Preserve historical cards and markers from Redis
+        saved_state = read_from_redis("nifty_live_state") or {}
+        self.history_cards = saved_state.get("history_cards", {})
+        self.markers = saved_state.get("markers", [])
+
+        # Only retain locked trade if it belongs to today and is actively running
+        saved_trade = saved_state.get("locked_trade")
+        today_str = datetime.datetime.now(IST).strftime("%d-%b-%Y")
+        if saved_trade and not saved_trade.get("closed") and today_str in saved_trade.get("date_readable", ""):
+            self.locked_trade = saved_trade
+        else:
+            self.locked_trade = None
 
         self.nfo_df = self.load_scrip_master()
         self.init_historical_candles()
         self.run_full_strategy_pipeline()
 
-        # Background thread to refresh option contract LTP without stalling tick processing
         threading.Thread(target=self.background_option_poller, daemon=True).start()
 
         if self.candles:
@@ -367,10 +376,7 @@ class DedicatedTradingWorker:
         orb_range_val = max(15.0, round(curr_orb_h - curr_orb_l, 2))
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
-        self.markers = []
-        self.history_cards = {}
-        last_found_trade = None
-
+        # Preserves all historical trade markers and hover tags across sessions
         for d_str, day_df in df_h.groupby("date_str"):
             day_times = day_df["dt"].apply(lambda d: d.astimezone(IST).time())
             ow = day_df[(day_times >= datetime.time(9, 15)) & (day_times < datetime.time(9, 30))]
@@ -385,38 +391,29 @@ class DedicatedTradingWorker:
                 r = day_df.iloc[idx]
                 t_open = r["dt"].astimezone(IST).time()
                 c = float(r["close"])
-                h_bar = float(r["high"])
-                l_bar = float(r["low"])
                 vw = float(r["vwap"])
                 em = float(r["ema9"])
 
-                if sim_trade and not sim_trade.get("closed"):
-                    if sim_trade["type"] == "CE" and l_bar <= sim_trade["sl"]:
-                        sim_trade["closed"] = True
-                        sim_trade["outcome"] = "STOP HIT (LOSS)"
-                        sim_trade["exit_price"] = sim_trade["sl"]
-                    elif sim_trade["type"] == "PE" and h_bar >= sim_trade["sl"]:
-                        sim_trade["closed"] = True
-                        sim_trade["outcome"] = "STOP HIT (LOSS)"
-                        sim_trade["exit_price"] = sim_trade["sl"]
-
+                # Check all candles between 09:30 and 11:30
                 if datetime.time(9, 30) <= t_open <= datetime.time(11, 30) and not sim_trade:
                     candle_close_time = (r["dt"].astimezone(IST) + datetime.timedelta(minutes=5)).strftime("%H:%M")
                     atr_margin = max(15.0, float(r.get("atr14", 18.0)))
+                    t_sec = int(r["time"])
 
                     if c > d_h and c > vw and c > em:
                         candle_sl = float(r["low"]) - 5.0
                         sl_val = round(min(candle_sl, c - atr_margin), 1)
                         t_list = self.compute_all_confluence_targets(df_h.iloc[:idx+1], c, is_ce=True)
-                        t_sec = int(r["time"])
 
-                        self.markers.append({
-                            "time": t_sec,
-                            "position": "belowBar",
-                            "color": "#00bfa5",
-                            "shape": "arrowUp",
-                            "text": f"BUY CE @ {c:.1f}",
-                        })
+                        marker_exists = any(m["time"] == t_sec for m in self.markers)
+                        if not marker_exists:
+                            self.markers.append({
+                                "time": t_sec,
+                                "position": "belowBar",
+                                "color": "#00bfa5",
+                                "shape": "arrowUp",
+                                "text": f"BUY CE @ {c:.1f}",
+                            })
                         sim_trade = {
                             "title": "BUY CE (ORB BREAKOUT)",
                             "entry": round(c, 1),
@@ -430,22 +427,21 @@ class DedicatedTradingWorker:
                             "outcome": "ACTIVE",
                         }
                         self.history_cards[str(t_sec)] = sim_trade
-                        self.history_cards[t_sec] = sim_trade
-                        last_found_trade = sim_trade
 
                     elif c < d_l and c < vw and c < em:
                         candle_sl = float(r["high"]) + 5.0
                         sl_val = round(max(candle_sl, c + atr_margin), 1)
                         t_list = self.compute_all_confluence_targets(df_h.iloc[:idx+1], c, is_ce=False)
-                        t_sec = int(r["time"])
 
-                        self.markers.append({
-                            "time": t_sec,
-                            "position": "aboveBar",
-                            "color": "#f23645",
-                            "shape": "arrowDown",
-                            "text": f"BUY PE @ {c:.1f}",
-                        })
+                        marker_exists = any(m["time"] == t_sec for m in self.markers)
+                        if not marker_exists:
+                            self.markers.append({
+                                "time": t_sec,
+                                "position": "aboveBar",
+                                "color": "#f23645",
+                                "shape": "arrowDown",
+                                "text": f"BUY PE @ {c:.1f}",
+                            })
                         sim_trade = {
                             "title": "BUY PE (ORB BREAKDOWN)",
                             "entry": round(c, 1),
@@ -459,94 +455,63 @@ class DedicatedTradingWorker:
                             "outcome": "ACTIVE",
                         }
                         self.history_cards[str(t_sec)] = sim_trade
-                        self.history_cards[t_sec] = sim_trade
-                        last_found_trade = sim_trade
 
-        last_close = float(self.candles[-1]["close"])
-        active_t = self.locked_trade
+        # Top HUD display logic: only populates when a trade is actively running
+        if self.locked_trade and not self.locked_trade.get("closed"):
+            tr = self.locked_trade
+            t_type = tr["type"]
+            entry_p = float(tr["entry"])
+            sl_p = float(tr["init_sl"])
+            trail_p = float(tr.get("current_sl", sl_p))
+            target_list = tr.get("targets", [])
+            opt_entry = float(tr.get("opt_entry_ltp", 75.0))
+            delta_v = float(tr.get("delta", 0.50))
+            sym = tr.get("symbol", f"NIFTY {t_type}")
 
-        if not active_t and last_found_trade and last_found_trade["date"] == unique_days[-1]:
-            active_t = {
-                "type": last_found_trade["type"],
-                "entry": last_found_trade["entry"],
-                "init_sl": last_found_trade["sl"],
-                "current_sl": last_found_trade.get("exit_price", last_found_trade["sl"]),
-                "last_alerted_sl": last_found_trade["sl"],
-                "targets": last_found_trade["targets"],
-                "symbol": f"NIFTY {int(round(last_found_trade['entry'] / 50.0) * 50)} {last_found_trade['type']}",
-                "delta": 0.50,
-                "opt_entry_ltp": 75.0,
-                "date_readable": last_found_trade.get("date_readable", str(self.today)),
-                "closed": last_found_trade.get("closed", False),
+            risk_pts = round(abs(entry_p - sl_p), 1)
+            secured_pts = round(trail_p - entry_p, 1) if t_type == "CE" else round(entry_p - trail_p, 1)
+
+            hud_targets = []
+            for idx_tg, tg_spot in enumerate(target_list, start=1):
+                tg_pts = round(abs(tg_spot - entry_p), 1)
+                tg_opt = round(opt_entry + (tg_pts * delta_v), 2)
+                hud_targets.append({
+                    "label": f"Target {idx_tg}",
+                    "spot": tg_spot,
+                    "pts": tg_pts,
+                    "opt": tg_opt,
+                })
+
+            self.hud_data = {
+                "type": t_type,
+                "symbol": sym,
+                "delta": delta_v,
+                "entry_spot": entry_p,
+                "entry_opt": opt_entry,
+                "sl_spot": sl_p,
+                "sl_opt": max(0.5, round(opt_entry - (risk_pts * delta_v), 2)),
+                "risk_pts": risk_pts,
+                "targets": hud_targets,
+                "trail_spot": trail_p,
+                "trail_opt": max(0.5, round(opt_entry + (secured_pts * delta_v), 2)),
+                "secured_pts": secured_pts,
+                "date_readable": tr.get("date_readable", str(self.today)),
+                "trade_closed": False,
             }
-
-        if active_t:
-            t_type = active_t["type"]
-            entry_p = float(active_t["entry"])
-            sl_p = float(active_t["init_sl"])
-            trail_p = float(active_t.get("current_sl", sl_p))
-            target_list = active_t.get("targets", [])
-            opt_entry = float(active_t.get("opt_entry_ltp", 75.0))
-            delta_v = float(active_t.get("delta", 0.50))
-            sym = active_t.get("symbol", f"NIFTY {int(round(entry_p / 50.0) * 50)} {t_type}")
         else:
-            t_type = "CE" if last_close >= float(df_h.iloc[-1]["vwap"]) else "PE"
-            entry_p = curr_orb_h if t_type == "CE" else curr_orb_l
-            last_bar = self.candles[-1]
-            atr_margin = max(15.0, float(last_bar.get("atr14", 18.0)))
-            sl_p = round(entry_p - atr_margin if t_type == "CE" else entry_p + atr_margin, 1)
-            trail_p = sl_p
-            target_list = self.compute_all_confluence_targets(df_h, entry_p, is_ce=(t_type == "CE"))
-            opt_entry = 75.0
-            delta_v = 0.50
-            sym = f"NIFTY {int(round(last_close / 50.0) * 50)} {t_type}"
+            self.hud_data = {}
 
-        if t_type == "CE":
+        if self.orb_levels:
+            curr_orb_h = self.orb_levels["orb_h"]
+            curr_orb_l = self.orb_levels["orb_l"]
+            orb_range_val = self.orb_levels["range"]
             self.fib_lines = {
                 "fib_100": round(curr_orb_h + (1.000 * orb_range_val), 1),
                 "fib_161": round(curr_orb_h + (1.618 * orb_range_val), 1),
                 "fib_261": round(curr_orb_h + (2.618 * orb_range_val), 1),
             }
-        else:
-            self.fib_lines = {
-                "fib_100": round(curr_orb_l - (1.000 * orb_range_val), 1),
-                "fib_161": round(curr_orb_l - (1.618 * orb_range_val), 1),
-                "fib_261": round(curr_orb_l - (2.618 * orb_range_val), 1),
-            }
-
-        risk_pts = round(abs(entry_p - sl_p), 1)
-        secured_pts = round(trail_p - entry_p, 1) if t_type == "CE" else round(entry_p - trail_p, 1)
-
-        hud_targets = []
-        for idx_tg, tg_spot in enumerate(target_list, start=1):
-            tg_pts = round(abs(tg_spot - entry_p), 1)
-            tg_opt = round(opt_entry + (tg_pts * delta_v), 2)
-            hud_targets.append({
-                "label": f"Target {idx_tg}",
-                "spot": tg_spot,
-                "pts": tg_pts,
-                "opt": tg_opt,
-            })
-
-        self.hud_data = {
-            "type": t_type,
-            "symbol": sym,
-            "delta": delta_v,
-            "entry_spot": entry_p,
-            "entry_opt": opt_entry,
-            "sl_spot": sl_p,
-            "sl_opt": max(0.5, round(opt_entry - (risk_pts * delta_v), 2)),
-            "risk_pts": risk_pts,
-            "targets": hud_targets,
-            "trail_spot": trail_p,
-            "trail_opt": max(0.5, round(opt_entry + (secured_pts * delta_v), 2)),
-            "secured_pts": secured_pts,
-            "date_readable": active_t.get("date_readable", str(self.today)) if active_t else str(self.today),
-            "trade_closed": active_t.get("closed", False) if active_t else False,
-        }
 
     def background_option_poller(self):
-        """Dedicated background poller with a strict 2-second timeout."""
         while True:
             time.sleep(12)
             if self.locked_trade and self.locked_trade.get("token") and not self.locked_trade.get("closed"):
@@ -585,7 +550,6 @@ class DedicatedTradingWorker:
             if not row.empty:
                 sym = str(row.iloc[0]["symbol"])
                 tok = str(row.iloc[0]["token"])
-                # Estimate LTP using Spot-Strike difference to prevent blocking network requests
                 est_ltp = max(5.0, abs(spot_ref - k) * 0.5 + 40.0)
                 candidates.append((k, sym, tok, est_ltp))
 
@@ -882,8 +846,7 @@ class DedicatedTradingWorker:
 
     def sync_state(self, live_ltp):
         opt_ltp = 0.0
-        if self.locked_trade:
-            # Estimate option premium instantly using Spot delta (zero network delay)
+        if self.locked_trade and not self.locked_trade.get("closed"):
             pts_gain = (live_ltp - self.locked_trade["entry"]) if self.locked_trade["type"] == "CE" else (self.locked_trade["entry"] - live_ltp)
             opt_ltp = max(0.5, round(self.locked_trade.get("opt_entry_ltp", 75.0) + (pts_gain * self.locked_trade.get("delta", 0.50)), 2))
 
@@ -914,7 +877,7 @@ class DedicatedTradingWorker:
             "ltp": live_ltp,
             "opt_ltp": opt_ltp,
             "candles": recent_candles,
-            "locked_trade": self.locked_trade,
+            "locked_trade": self.locked_trade if (self.locked_trade and not self.locked_trade.get("closed")) else None,
             "markers": self.markers,
             "history_cards": self.history_cards,
             "pivots": self.pivot_lines,
@@ -927,7 +890,7 @@ class DedicatedTradingWorker:
 
 
 # ==========================================
-# 4. Supervisor Loop & Active Stream Recovery
+# 4. Supervisor Loop & Pre-Market Re-Login
 # ==========================================
 def run_worker():
     while True:
@@ -939,8 +902,9 @@ def run_worker():
                 while True:
                     time.sleep(30)
                     now = datetime.datetime.now(IST)
+                    # Pre-market auto-reset at 08:30 AM every morning
                     if engine.last_login_date != now.date() and now.time() >= datetime.time(8, 30):
-                        print("[Supervisor]: Scheduled pre-market re-authentication trigger reached.")
+                        print("[Supervisor]: Scheduled pre-market trigger reached. Regenerating daily session...")
                         engine.today = now.date()
                         engine.authenticate_angel_one()
                         engine.locked_trade = None
