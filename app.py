@@ -12,6 +12,21 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# Force browser to ping Streamlit rerun every 3 seconds for real-time tick flow
+components.html(
+    """
+    <script>
+      window.parent.setTimeout(() => {
+        const refreshBtn = window.parent.document.querySelector('button[kind="secondary"]');
+        // Trigger soft rerun without reloading full page
+        window.parent.postMessage({type: 'streamlit:render'}, '*');
+      }, 3000);
+    </script>
+    """,
+    height=0,
+    width=0,
+)
+
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 BUDGET_CEILING_DEFAULT = float(os.getenv("BUDGET_CEILING", "80.0"))
@@ -45,11 +60,11 @@ def write_redis_key(key: str, value):
 
 
 # -------------------------------------------------------------
-# Read Live Trading State
+# Read Live Trading State from Redis
 # -------------------------------------------------------------
 state_data = read_redis_key("nifty_live_state") or {}
 
-ltp = float(state_data.get("ltp", 25000.0))
+ltp = float(state_data.get("ltp", 0.0))
 opt_ltp = float(state_data.get("opt_ltp", 0.0))
 candles = state_data.get("candles", [])
 markers = state_data.get("markers", [])
@@ -64,7 +79,7 @@ saved_budget = read_redis_key("user_selected_budget")
 current_budget = float(saved_budget) if saved_budget is not None else BUDGET_CEILING_DEFAULT
 
 # -------------------------------------------------------------
-# Header Bar & Budget Controls
+# Header Bar & Live Point Monitor
 # -------------------------------------------------------------
 col_title, col_budget, col_refresh = st.columns([3, 2, 1])
 
@@ -72,7 +87,7 @@ with col_title:
     st.markdown(
         f"<h3 style='margin:0; padding:0; color:#e0e0e0; font-family:sans-serif;'>"
         f"NIFTY 50 Opening Range Terminal "
-        f"<span style='color:#00e676; font-size:18px;'>₹{ltp:.2f}</span>"
+        f"<span style='color:#00e676; font-size:22px; font-weight:bold; margin-left:10px;'>₹{ltp:.2f}</span>"
         f"</h3>",
         unsafe_allow_html=True,
     )
@@ -91,7 +106,7 @@ with col_budget:
         st.rerun()
 
 with col_refresh:
-    if st.button("🔄 Refresh"):
+    if st.button("🔄 Force Refresh"):
         st.rerun()
 
 # -------------------------------------------------------------
@@ -161,7 +176,7 @@ if hud:
     )
 
 # -------------------------------------------------------------
-# Lightweight Charts Injection with Levels up to R5 / S5
+# Lightweight Charts Component (Pivots up to R5/S5)
 # -------------------------------------------------------------
 candles_json = json.dumps(candles)
 markers_json = json.dumps(markers)
@@ -277,9 +292,7 @@ html_code = f"""
       candleSeries.setMarkers(markersData);
     }}
 
-    // ==========================================
-    // Render Complete Pivot Lines up to R5 / S5
-    // ==========================================
+    // Pivots P, R1-R5, S1-S5, PDH, PDL
     const pivotConfig = {{
       'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
       'R1':  {{ color: '#ef5350', title: 'R1' }},
@@ -309,7 +322,7 @@ html_code = f"""
       }}
     }});
 
-    // Render ORB Boundaries
+    // ORB Lines
     if (orbLevels && orbLevels.orb_h) {{
       candleSeries.createPriceLine({{
         price: parseFloat(orbLevels.orb_h),
@@ -331,7 +344,7 @@ html_code = f"""
       }});
     }}
 
-    // Render Fibonacci Projection Lines
+    // Fib Projections
     if (fibLines) {{
       Object.entries(fibLines).forEach(([fKey, fVal]) => {{
         if (fVal) {{
@@ -347,7 +360,7 @@ html_code = f"""
       }});
     }}
 
-    // Signal Hover Card Handler
+    // Hover Card Logic
     chart.subscribeCrosshairMove(param => {{
       if (!param || !param.time || !param.point) {{
         hoverCard.style.display = 'none';
