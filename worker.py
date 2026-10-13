@@ -84,7 +84,20 @@ def compute_contract_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
     return round(ce_delta if is_ce else (1.0 - ce_delta), 2)
 
 
+def is_market_hours():
+    """STRICT CHECK: Only allow actions between 09:15 and 15:30 IST on weekdays."""
+    now = datetime.datetime.now(IST)
+    if now.weekday() >= 5:  # Saturday or Sunday
+        return False
+    return datetime.time(9, 15) <= now.time() <= datetime.time(15, 30)
+
+
 def send_telegram_alert(message: str):
+    # HARD BLOCK: Never send alerts outside active market hours!
+    if not is_market_hours():
+        print(f"[Alert Blocked]: Message suppressed because market is closed: {message[:40]}...")
+        return False
+
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -175,17 +188,21 @@ class DedicatedTradingWorker:
         self.markers = saved_state.get("markers", [])
         
         today_str = self.today.strftime("%Y-%m-%d")
-        if saved_state.get("trade_date") == today_str:
-            self.trade_taken_today = saved_state.get("trade_taken_today", False)
-            if not saved_state.get("trade_closed", False):
-                self.locked_trade = saved_state.get("locked_trade")
+        
+        # If market is closed right now (after 15:30), purge active trade state
+        now_time = datetime.datetime.now(IST).time()
+        if now_time > datetime.time(15, 30) or now_time < datetime.time(9, 15):
+            self.locked_trade = None
+            self.trade_taken_today = (saved_state.get("trade_date") == today_str)
+        else:
+            if saved_state.get("trade_date") == today_str:
+                self.trade_taken_today = saved_state.get("trade_taken_today", False)
+                if not saved_state.get("trade_closed", False):
+                    self.locked_trade = saved_state.get("locked_trade")
 
         self.nfo_df = self.load_scrip_master()
         self.init_historical_candles()
         self.run_full_strategy_pipeline()
-
-        # AUDIT FROM 09:15: If bot booted late, identify the real 09:30 breakout first
-        self.sync_breakout_from_history()
 
         threading.Thread(target=self.background_option_poller, daemon=True).start()
 
@@ -354,7 +371,7 @@ class DedicatedTradingWorker:
         orb_range_val = max(15.0, round(curr_orb_h - curr_orb_l, 2))
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
-        # Scan historical chart days to populate markers & cards
+        # Scan history to build chart cards (DISPLAY ONLY - never sends alerts!)
         for d_str, day_df in df_h.groupby("date_str"):
             day_times = day_df["dt"].apply(lambda d: d.astimezone(IST).time())
             ow = day_df[(day_times >= datetime.time(9, 15)) & (day_times < datetime.time(9, 30))]
@@ -400,8 +417,8 @@ class DedicatedTradingWorker:
                             "time_str": candle_close_time,
                             "date": d_str,
                             "date_readable": r["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)"),
-                            "closed": True if d_str != unique_days[-1] else self.trade_taken_today,
-                            "outcome": "HISTORICAL" if d_str != unique_days[-1] else ("CLOSED" if self.trade_taken_today else "ACTIVE"),
+                            "closed": True,
+                            "outcome": "HISTORICAL",
                         }
 
                     elif c < d_l and prev_c >= d_l and c < vw and c < em:
@@ -427,12 +444,12 @@ class DedicatedTradingWorker:
                             "time_str": candle_close_time,
                             "date": d_str,
                             "date_readable": r["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)"),
-                            "closed": True if d_str != unique_days[-1] else self.trade_taken_today,
-                            "outcome": "HISTORICAL" if d_str != unique_days[-1] else ("CLOSED" if self.trade_taken_today else "ACTIVE"),
+                            "closed": True,
+                            "outcome": "HISTORICAL",
                         }
 
-        # Update HUD only if an active trade exists
-        if self.locked_trade and not self.locked_trade.get("closed"):
+        # HUD strictly reflects the active trade during live market hours
+        if is_market_hours() and self.locked_trade and not self.locked_trade.get("closed"):
             tr = self.locked_trade
             t_type = tr["type"]
             entry_p = float(tr["entry"])
@@ -486,119 +503,10 @@ class DedicatedTradingWorker:
                 "fib_261": round(curr_orb_h + (2.618 * orb_range_val), 1),
             }
 
-    def sync_breakout_from_history(self):
-        """Audits today's candles from 09:15 onwards to lock the real initial breakout."""
-        if self.trade_taken_today or self.locked_trade or not self.candles:
-            return
-
-        today_str = self.today.strftime("%Y-%m-%d")
-        df_curr = pd.DataFrame(self.candles)
-        df_curr["date_str"] = df_curr["dt"].apply(lambda d: d.astimezone(IST).strftime("%Y-%m-%d"))
-        today_df = df_curr[df_curr["date_str"] == today_str]
-
-        if len(today_df) < 4:
-            return  # Has not completed first breakout candle yet
-
-        orb_h = self.orb_levels.get("orb_h", 999999)
-        orb_l = self.orb_levels.get("orb_l", 0)
-
-        for idx in range(len(today_df)):
-            r = today_df.iloc[idx]
-            t_open = r["dt"].astimezone(IST).time()
-            c = float(r["close"])
-            vw = float(r.get("vwap", c))
-            em = float(r.get("ema9", c))
-
-            if datetime.time(9, 30) <= t_open <= datetime.time(11, 30):
-                prev_c = float(today_df.iloc[idx - 1]["close"]) if idx > 0 else c
-
-                # Real CE Breakout occurred in history
-                if c > orb_h and prev_c <= orb_h and c > vw and c > em:
-                    self.trade_taken_today = True
-                    strike, sym, tok, delta, days_exp = self.find_budget_strike(c, is_ce=True)
-                    init_sl = round(float(r["low"]) - 5.0, 1)
-                    targets = self.compute_all_confluence_targets(today_df.iloc[:idx+1], c, is_ce=True)
-
-                    # Check if trade was already stopped out in subsequent candles
-                    stopped_out = False
-                    for subsequent_idx in range(idx + 1, len(today_df)):
-                        sub_low = float(today_df.iloc[subsequent_idx]["low"])
-                        if sub_low <= init_sl:
-                            stopped_out = True
-                            break
-
-                    if stopped_out:
-                        print(f"[History Audit]: Today's breakout @ {c:.1f} was already stopped out. Session marked CLOSED.")
-                        self.locked_trade = None
-                        self.hud_data = {}
-                    else:
-                        print(f"[History Audit]: Locking today's genuine breakout from 09:30 candle @ {c:.1f}")
-                        self.locked_trade = {
-                            "type": "CE",
-                            "strike": strike,
-                            "entry": c,
-                            "init_sl": init_sl,
-                            "current_sl": init_sl,
-                            "last_alerted_sl": init_sl,
-                            "targets": targets,
-                            "trail_stage": 0,
-                            "peak_extreme": c,
-                            "closed": False,
-                            "symbol": sym,
-                            "token": tok,
-                            "delta": delta,
-                            "opt_entry_ltp": 75.0,
-                            "opt_sl": max(0.5, round(75.0 - ((c - init_sl) * delta), 2)),
-                            "time": int(r["time"]),
-                            "date_readable": r["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)"),
-                        }
-                    break
-
-                # Real PE Breakdown occurred in history
-                elif c < orb_l and prev_c >= orb_l and c < vw and c < em:
-                    self.trade_taken_today = True
-                    strike, sym, tok, delta, days_exp = self.find_budget_strike(c, is_ce=False)
-                    init_sl = round(float(r["high"]) + 5.0, 1)
-                    targets = self.compute_all_confluence_targets(today_df.iloc[:idx+1], c, is_ce=False)
-
-                    stopped_out = False
-                    for subsequent_idx in range(idx + 1, len(today_df)):
-                        sub_high = float(today_df.iloc[subsequent_idx]["high"])
-                        if sub_high >= init_sl:
-                            stopped_out = True
-                            break
-
-                    if stopped_out:
-                        print(f"[History Audit]: Today's breakdown @ {c:.1f} was already stopped out. Session marked CLOSED.")
-                        self.locked_trade = None
-                        self.hud_data = {}
-                    else:
-                        print(f"[History Audit]: Locking today's genuine breakdown from 09:30 candle @ {c:.1f}")
-                        self.locked_trade = {
-                            "type": "PE",
-                            "strike": strike,
-                            "entry": c,
-                            "init_sl": init_sl,
-                            "current_sl": init_sl,
-                            "last_alerted_sl": init_sl,
-                            "targets": targets,
-                            "trail_stage": 0,
-                            "peak_extreme": c,
-                            "closed": False,
-                            "symbol": sym,
-                            "token": tok,
-                            "delta": delta,
-                            "opt_entry_ltp": 75.0,
-                            "opt_sl": max(0.5, round(75.0 - ((init_sl - c) * delta), 2)),
-                            "time": int(r["time"]),
-                            "date_readable": r["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)"),
-                        }
-                    break
-
     def background_option_poller(self):
         while True:
             time.sleep(15)
-            if self.locked_trade and not self.locked_trade.get("closed") and self.locked_trade.get("token"):
+            if is_market_hours() and self.locked_trade and not self.locked_trade.get("closed") and self.locked_trade.get("token"):
                 try:
                     res = self.api.ltpData("NFO", self.locked_trade["symbol"], self.locked_trade["token"])
                     if isinstance(res, dict) and res.get("status") and res.get("data"):
@@ -653,6 +561,10 @@ class DedicatedTradingWorker:
         return chosen_strike, chosen_sym, chosen_tok, delta, days_to_exp
 
     def on_tick(self, ltp):
+        # Discard any ticks outside market hours
+        if not is_market_hours():
+            return
+
         now = datetime.datetime.now(IST)
         bucket_min = (now.minute // 5) * 5
         bar_dt = now.replace(minute=bucket_min, second=0, microsecond=0)
@@ -680,7 +592,8 @@ class DedicatedTradingWorker:
         self.sync_state(ltp)
 
     def evaluate_live_breakout(self):
-        # HARD STOP: If already traded today, NEVER enter again
+        if not is_market_hours():
+            return
         if self.trade_taken_today or self.locked_trade or len(self.candles) < 2:
             return
 
@@ -699,7 +612,7 @@ class DedicatedTradingWorker:
             close_time_dt = last_c["dt"].astimezone(IST) + datetime.timedelta(minutes=5)
             close_time_str = close_time_dt.strftime("%H:%M:%S")
 
-            # CE Breakout: First time crossing above ORB High
+            # CE Breakout
             if close_p > orb_h and prev_c["close"] <= orb_h:
                 self.trade_taken_today = True
                 strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=True)
@@ -757,7 +670,7 @@ class DedicatedTradingWorker:
                     f"⏰ <b>Trigger Time (Candle Close):</b> {close_time_str}"
                 )
 
-            # PE Breakdown: First time crossing below ORB Low
+            # PE Breakdown
             elif close_p < orb_l and prev_c["close"] >= orb_l:
                 self.trade_taken_today = True
                 strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=False)
@@ -816,7 +729,8 @@ class DedicatedTradingWorker:
                 )
 
     def evaluate_live_trail_and_exit(self, live_spot):
-        # ABSOLUTE SAFETY: If trade is closed or None, NEVER trail or alert
+        if not is_market_hours():
+            return
         if not self.locked_trade or self.locked_trade.get("closed"):
             return
 
@@ -921,7 +835,7 @@ class DedicatedTradingWorker:
 
     def sync_state(self, live_ltp):
         opt_ltp = 0.0
-        if self.locked_trade and not self.locked_trade.get("closed"):
+        if is_market_hours() and self.locked_trade and not self.locked_trade.get("closed"):
             pts_gain = (live_ltp - self.locked_trade["entry"]) if self.locked_trade["type"] == "CE" else (self.locked_trade["entry"] - live_ltp)
             opt_ltp = max(0.5, round(self.locked_trade.get("opt_entry_ltp", 75.0) + (pts_gain * self.locked_trade.get("delta", 0.50)), 2))
 
@@ -952,7 +866,7 @@ class DedicatedTradingWorker:
             "ltp": live_ltp,
             "opt_ltp": opt_ltp,
             "candles": recent_candles,
-            "locked_trade": self.locked_trade if (self.locked_trade and not self.locked_trade.get("closed")) else None,
+            "locked_trade": self.locked_trade if (is_market_hours() and self.locked_trade and not self.locked_trade.get("closed")) else None,
             "trade_taken_today": self.trade_taken_today,
             "trade_closed": self.trade_taken_today and (self.locked_trade is None),
             "trade_date": self.today.strftime("%Y-%m-%d"),
@@ -961,7 +875,7 @@ class DedicatedTradingWorker:
             "pivots": self.pivot_lines,
             "orb_levels": self.orb_levels,
             "fib_lines": self.fib_lines,
-            "hud": self.hud_data,
+            "hud": self.hud_data if is_market_hours() else {},
             "updated_at": time.time(),
         }
         push_to_redis("nifty_live_state", payload)
