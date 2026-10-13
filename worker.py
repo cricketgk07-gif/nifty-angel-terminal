@@ -245,13 +245,6 @@ class DedicatedTradingWorker:
             print(f"[Candles Error]: {e}")
 
     def compute_all_confluence_targets(self, df_h, entry_p, is_ce):
-        high_low = df_h["high"] - df_h["low"]
-        high_close = (df_h["high"] - df_h["close"].shift()).abs()
-        low_close = (df_h["low"] - df_h["close"].shift()).abs()
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        atr14 = float(tr.rolling(14, min_periods=1).mean().iloc[-1])
-        atr3_val = 3.0 * max(10.0, atr14)
-
         recent_swing_h = float(df_h["high"].iloc[-20:].max())
         recent_swing_l = float(df_h["low"].iloc[-20:].min())
 
@@ -271,7 +264,6 @@ class DedicatedTradingWorker:
                 p.get("R1"), p.get("R2"), p.get("R3"), p.get("R4"), p.get("R5"),
                 p.get("PDH"),
                 recent_swing_h,
-                entry_p + atr3_val,
             ]
             valid = sorted(list(set([round(x, 1) for x in candidates if x is not None and x >= entry_p + min_filter])))
             if not valid:
@@ -285,7 +277,6 @@ class DedicatedTradingWorker:
                 p.get("S1"), p.get("S2"), p.get("S3"), p.get("S4"), p.get("S5"),
                 p.get("PDL"),
                 recent_swing_l,
-                entry_p - atr3_val,
             ]
             valid = sorted(list(set([round(x, 1) for x in candidates if x is not None and x <= entry_p - min_filter])), reverse=True)
             if not valid:
@@ -368,7 +359,6 @@ class DedicatedTradingWorker:
         orb_range_val = max(15.0, round(curr_orb_h - curr_orb_l, 2))
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
-        # Scan for the single valid initial breakout of the session
         todays_first_breakout = None
 
         for d_str, day_df in df_h.groupby("date_str"):
@@ -389,15 +379,13 @@ class DedicatedTradingWorker:
                 em = float(r["ema9"])
 
                 if datetime.time(9, 30) <= t_open <= datetime.time(11, 30) and not sim_trade:
-                    # Enforce that the PREVIOUS candle was not already breaking out
                     prev_c = float(day_df.iloc[idx - 1]["close"]) if idx > 0 else c
                     candle_close_time = (r["dt"].astimezone(IST) + datetime.timedelta(minutes=5)).strftime("%H:%M")
-                    atr_margin = max(15.0, float(r.get("atr14", 18.0)))
                     t_sec = int(r["time"])
 
+                    # Breakout Candle Low - 5.0
                     if c > d_h and prev_c <= d_h and c > vw and c > em:
-                        candle_sl = float(r["low"]) - 5.0
-                        sl_val = round(min(candle_sl, c - atr_margin), 1)
+                        sl_val = round(float(r["low"]) - 5.0, 1)
                         t_list = self.compute_all_confluence_targets(df_h.iloc[:idx+1], c, is_ce=True)
 
                         marker_exists = any(m["time"] == t_sec for m in self.markers)
@@ -425,9 +413,9 @@ class DedicatedTradingWorker:
                         if d_str == unique_days[-1]:
                             todays_first_breakout = sim_trade
 
+                    # Breakdown Candle High + 5.0
                     elif c < d_l and prev_c >= d_l and c < vw and c < em:
-                        candle_sl = float(r["high"]) + 5.0
-                        sl_val = round(max(candle_sl, c + atr_margin), 1)
+                        sl_val = round(float(r["high"]) + 5.0, 1)
                         t_list = self.compute_all_confluence_targets(df_h.iloc[:idx+1], c, is_ce=False)
 
                         marker_exists = any(m["time"] == t_sec for m in self.markers)
@@ -455,7 +443,6 @@ class DedicatedTradingWorker:
                         if d_str == unique_days[-1]:
                             todays_first_breakout = sim_trade
 
-        # Synchronize HUD directly to today's genuine first breakout
         if todays_first_breakout and not self.locked_trade:
             strike, sym, tok, delta, _ = self.find_budget_strike(todays_first_breakout["entry"], is_ce=(todays_first_breakout["type"] == "CE"))
             self.locked_trade = {
@@ -628,17 +615,14 @@ class DedicatedTradingWorker:
         df_curr = pd.DataFrame(self.candles)
         date_readable = last_c["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)")
 
-        # Only allow entry when crossing outside ORB boundaries for the first time
         if datetime.time(9, 30) <= t_open <= datetime.time(11, 30):
-            atr_margin = max(15.0, float(last_c.get("atr14", 18.0)))
             close_time_dt = last_c["dt"].astimezone(IST) + datetime.timedelta(minutes=5)
             close_time_str = close_time_dt.strftime("%H:%M:%S")
 
-            # True CE Cross: Current candle closes > ORB High, and previous closed <= ORB High
+            # CE Breakout: Breakout Candle Low - 5.0
             if close_p > orb_h and prev_c["close"] <= orb_h:
                 strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=True)
-                candle_sl = float(last_c["low"]) - 5.0
-                init_sl = round(min(candle_sl, close_p - atr_margin), 1)
+                init_sl = round(float(last_c["low"]) - 5.0, 1)
 
                 opt_ltp = self.last_polled_opt_ltp if self.last_polled_opt_ltp > 0 else 75.0
                 risk_pts = round(close_p - init_sl, 1)
@@ -687,16 +671,15 @@ class DedicatedTradingWorker:
                     f"• <b>STOP LOSS:</b> {init_sl:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b> (-₹{total_risk_inr})\n"
                     f"{tg_lines}"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🛡 <b>Initial SL:</b> Spot: {init_sl:.1f} | Option: ₹{opt_sl:.2f}\n"
+                    f"🛡 <b>SL Rule:</b> Candle Low - 5.0 pts\n"
                     f"📅 <b>Session Date:</b> {date_readable}\n"
                     f"⏰ <b>Trigger Time (Candle Close):</b> {close_time_str}"
                 )
 
-            # True PE Cross: Current candle closes < ORB Low, and previous closed >= ORB Low
+            # PE Breakdown: Breakout Candle High + 5.0
             elif close_p < orb_l and prev_c["close"] >= orb_l:
                 strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=False)
-                candle_sl = float(last_c["high"]) + 5.0
-                init_sl = round(max(candle_sl, close_p + atr_margin), 1)
+                init_sl = round(float(last_c["high"]) + 5.0, 1)
 
                 opt_ltp = self.last_polled_opt_ltp if self.last_polled_opt_ltp > 0 else 75.0
                 risk_pts = round(init_sl - close_p, 1)
@@ -745,7 +728,7 @@ class DedicatedTradingWorker:
                     f"• <b>STOP LOSS:</b> {init_sl:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b> (-₹{total_risk_inr})\n"
                     f"{tg_lines}"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🛡 <b>Initial SL:</b> Spot: {init_sl:.1f} | Option: ₹{opt_sl:.2f}\n"
+                    f"🛡 <b>SL Rule:</b> Candle High + 5.0 pts\n"
                     f"📅 <b>Session Date:</b> {date_readable}\n"
                     f"⏰ <b>Trigger Time (Candle Close):</b> {close_time_str}"
                 )
