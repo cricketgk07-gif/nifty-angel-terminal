@@ -32,7 +32,7 @@ PORT = int(os.getenv("PORT", 10000))
 
 
 # ==========================================
-# 1. Health Server & Keepalive Pinger
+# 1. Health Server & Keepalive
 # ==========================================
 class HealthHandler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
@@ -158,6 +158,7 @@ class DedicatedTradingWorker:
         self.fib_lines = {}
         self.orb_levels = {}
         self.hud_data = {}
+        self.locked_trade = None
         self.auth_token = None
         self.feed_token = None
         self.last_login_date = None
@@ -165,18 +166,9 @@ class DedicatedTradingWorker:
 
         self.authenticate_angel_one()
 
-        # Preserve historical cards and markers from Redis
         saved_state = read_from_redis("nifty_live_state") or {}
         self.history_cards = saved_state.get("history_cards", {})
         self.markers = saved_state.get("markers", [])
-
-        # Only retain locked trade if it belongs to today and is actively running
-        saved_trade = saved_state.get("locked_trade")
-        today_str = datetime.datetime.now(IST).strftime("%d-%b-%Y")
-        if saved_trade and not saved_trade.get("closed") and today_str in saved_trade.get("date_readable", ""):
-            self.locked_trade = saved_trade
-        else:
-            self.locked_trade = None
 
         self.nfo_df = self.load_scrip_master()
         self.init_historical_candles()
@@ -376,7 +368,9 @@ class DedicatedTradingWorker:
         orb_range_val = max(15.0, round(curr_orb_h - curr_orb_l, 2))
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
-        # Preserves all historical trade markers and hover tags across sessions
+        # Scan for the single valid initial breakout of the session
+        todays_first_breakout = None
+
         for d_str, day_df in df_h.groupby("date_str"):
             day_times = day_df["dt"].apply(lambda d: d.astimezone(IST).time())
             ow = day_df[(day_times >= datetime.time(9, 15)) & (day_times < datetime.time(9, 30))]
@@ -394,13 +388,14 @@ class DedicatedTradingWorker:
                 vw = float(r["vwap"])
                 em = float(r["ema9"])
 
-                # Check all candles between 09:30 and 11:30
                 if datetime.time(9, 30) <= t_open <= datetime.time(11, 30) and not sim_trade:
+                    # Enforce that the PREVIOUS candle was not already breaking out
+                    prev_c = float(day_df.iloc[idx - 1]["close"]) if idx > 0 else c
                     candle_close_time = (r["dt"].astimezone(IST) + datetime.timedelta(minutes=5)).strftime("%H:%M")
                     atr_margin = max(15.0, float(r.get("atr14", 18.0)))
                     t_sec = int(r["time"])
 
-                    if c > d_h and c > vw and c > em:
+                    if c > d_h and prev_c <= d_h and c > vw and c > em:
                         candle_sl = float(r["low"]) - 5.0
                         sl_val = round(min(candle_sl, c - atr_margin), 1)
                         t_list = self.compute_all_confluence_targets(df_h.iloc[:idx+1], c, is_ce=True)
@@ -427,8 +422,10 @@ class DedicatedTradingWorker:
                             "outcome": "ACTIVE",
                         }
                         self.history_cards[str(t_sec)] = sim_trade
+                        if d_str == unique_days[-1]:
+                            todays_first_breakout = sim_trade
 
-                    elif c < d_l and c < vw and c < em:
+                    elif c < d_l and prev_c >= d_l and c < vw and c < em:
                         candle_sl = float(r["high"]) + 5.0
                         sl_val = round(max(candle_sl, c + atr_margin), 1)
                         t_list = self.compute_all_confluence_targets(df_h.iloc[:idx+1], c, is_ce=False)
@@ -455,8 +452,29 @@ class DedicatedTradingWorker:
                             "outcome": "ACTIVE",
                         }
                         self.history_cards[str(t_sec)] = sim_trade
+                        if d_str == unique_days[-1]:
+                            todays_first_breakout = sim_trade
 
-        # Top HUD display logic: only populates when a trade is actively running
+        # Synchronize HUD directly to today's genuine first breakout
+        if todays_first_breakout and not self.locked_trade:
+            strike, sym, tok, delta, _ = self.find_budget_strike(todays_first_breakout["entry"], is_ce=(todays_first_breakout["type"] == "CE"))
+            self.locked_trade = {
+                "type": todays_first_breakout["type"],
+                "entry": todays_first_breakout["entry"],
+                "init_sl": todays_first_breakout["sl"],
+                "current_sl": todays_first_breakout["sl"],
+                "last_alerted_sl": todays_first_breakout["sl"],
+                "targets": todays_first_breakout["targets"],
+                "trail_stage": 0,
+                "peak_extreme": todays_first_breakout["entry"],
+                "closed": False,
+                "symbol": sym,
+                "token": tok,
+                "delta": delta,
+                "opt_entry_ltp": 75.0,
+                "date_readable": todays_first_breakout["date_readable"],
+            }
+
         if self.locked_trade and not self.locked_trade.get("closed"):
             tr = self.locked_trade
             t_type = tr["type"]
@@ -596,10 +614,11 @@ class DedicatedTradingWorker:
         self.sync_state(ltp)
 
     def evaluate_live_breakout(self):
-        if self.locked_trade and self.locked_trade.get("closed"):
+        if self.locked_trade or len(self.candles) < 2:
             return
 
         last_c = self.candles[-1]
+        prev_c = self.candles[-2]
         t_open = last_c["dt"].astimezone(IST).time()
         close_p = last_c["close"]
 
@@ -609,13 +628,14 @@ class DedicatedTradingWorker:
         df_curr = pd.DataFrame(self.candles)
         date_readable = last_c["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)")
 
-        if datetime.time(9, 30) <= t_open <= datetime.time(11, 30) and not self.locked_trade:
+        # Only allow entry when crossing outside ORB boundaries for the first time
+        if datetime.time(9, 30) <= t_open <= datetime.time(11, 30):
             atr_margin = max(15.0, float(last_c.get("atr14", 18.0)))
             close_time_dt = last_c["dt"].astimezone(IST) + datetime.timedelta(minutes=5)
             close_time_str = close_time_dt.strftime("%H:%M:%S")
 
-            # CE Breakout
-            if close_p > orb_h:
+            # True CE Cross: Current candle closes > ORB High, and previous closed <= ORB High
+            if close_p > orb_h and prev_c["close"] <= orb_h:
                 strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=True)
                 candle_sl = float(last_c["low"]) - 5.0
                 init_sl = round(min(candle_sl, close_p - atr_margin), 1)
@@ -672,8 +692,8 @@ class DedicatedTradingWorker:
                     f"⏰ <b>Trigger Time (Candle Close):</b> {close_time_str}"
                 )
 
-            # PE Breakdown
-            elif close_p < orb_l:
+            # True PE Cross: Current candle closes < ORB Low, and previous closed >= ORB Low
+            elif close_p < orb_l and prev_c["close"] >= orb_l:
                 strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=False)
                 candle_sl = float(last_c["high"]) + 5.0
                 init_sl = round(max(candle_sl, close_p + atr_margin), 1)
@@ -890,7 +910,7 @@ class DedicatedTradingWorker:
 
 
 # ==========================================
-# 4. Supervisor Loop & Pre-Market Re-Login
+# 4. Supervisor Loop
 # ==========================================
 def run_worker():
     while True:
@@ -902,9 +922,8 @@ def run_worker():
                 while True:
                     time.sleep(30)
                     now = datetime.datetime.now(IST)
-                    # Pre-market auto-reset at 08:30 AM every morning
                     if engine.last_login_date != now.date() and now.time() >= datetime.time(8, 30):
-                        print("[Supervisor]: Scheduled pre-market trigger reached. Regenerating daily session...")
+                        print("[Supervisor]: Scheduled pre-market re-login trigger reached.")
                         engine.today = now.date()
                         engine.authenticate_angel_one()
                         engine.locked_trade = None
