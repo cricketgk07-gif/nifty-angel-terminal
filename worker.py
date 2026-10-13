@@ -158,7 +158,11 @@ class DedicatedTradingWorker:
         self.fib_lines = {}
         self.orb_levels = {}
         self.hud_data = {}
+        
+        # State: Strictly 1 trade per day
         self.locked_trade = None
+        self.trade_taken_today = False
+        
         self.auth_token = None
         self.feed_token = None
         self.last_login_date = None
@@ -169,10 +173,19 @@ class DedicatedTradingWorker:
         saved_state = read_from_redis("nifty_live_state") or {}
         self.history_cards = saved_state.get("history_cards", {})
         self.markers = saved_state.get("markers", [])
+        
+        today_str = self.today.strftime("%Y-%m-%d")
+        if saved_state.get("trade_date") == today_str:
+            self.trade_taken_today = saved_state.get("trade_taken_today", False)
+            if not saved_state.get("trade_closed", False):
+                self.locked_trade = saved_state.get("locked_trade")
 
         self.nfo_df = self.load_scrip_master()
         self.init_historical_candles()
         self.run_full_strategy_pipeline()
+
+        # AUDIT FROM 09:15: If bot booted late, identify the real 09:30 breakout first
+        self.sync_breakout_from_history()
 
         threading.Thread(target=self.background_option_poller, daemon=True).start()
 
@@ -301,16 +314,9 @@ class DedicatedTradingWorker:
         df_h["vwap"] = (df_h["cum_pv"] / df_h["cum_vol"]).round(2)
         df_h["ema9"] = df_h["close"].ewm(span=9, adjust=False).mean().round(2)
 
-        high_low = df_h["high"] - df_h["low"]
-        high_close = (df_h["high"] - df_h["close"].shift()).abs()
-        low_close = (df_h["low"] - df_h["close"].shift()).abs()
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        df_h["atr14"] = tr.rolling(14, min_periods=1).mean().round(2)
-
         for i in range(len(self.candles)):
             self.candles[i]["vwap"] = float(df_h.iloc[i]["vwap"])
             self.candles[i]["ema9"] = float(df_h.iloc[i]["ema9"])
-            self.candles[i]["atr14"] = float(df_h.iloc[i]["atr14"])
 
         unique_days = list(df_h["date_str"].unique())
         if len(unique_days) >= 2:
@@ -322,24 +328,13 @@ class DedicatedTradingWorker:
                 P = round((pdh + pdl + pdc) / 3.0, 2)
                 rng = round(pdh - pdl, 2)
 
-                r1 = round((2.0 * P) - pdl, 2)
-                s1 = round((2.0 * P) - pdh, 2)
-                r2 = round(P + rng, 2)
-                s2 = round(P - rng, 2)
-                r3 = round(pdh + (2.0 * (P - pdl)), 2)
-                s3 = round(pdl - (2.0 * (pdh - P)), 2)
-                r4 = round(r3 + rng, 2)
-                s4 = round(s3 - rng, 2)
-                r5 = round(r4 + rng, 2)
-                s5 = round(s4 - rng, 2)
-
                 self.pivot_lines = {
                     "P": P,
-                    "R1": r1, "S1": s1,
-                    "R2": r2, "S2": s2,
-                    "R3": r3, "S3": s3,
-                    "R4": r4, "S4": s4,
-                    "R5": r5, "S5": s5,
+                    "R1": round((2.0 * P) - pdl, 2), "S1": round((2.0 * P) - pdh, 2),
+                    "R2": round(P + rng, 2), "S2": round(P - rng, 2),
+                    "R3": round(pdh + (2.0 * (P - pdl)), 2), "S3": round(pdl - (2.0 * (pdh - P)), 2),
+                    "R4": round(round(pdh + (2.0 * (P - pdl)), 2) + rng, 2), "S4": round(round(pdl - (2.0 * (pdh - P)), 2) - rng, 2),
+                    "R5": round(round(round(pdh + (2.0 * (P - pdl)), 2) + rng, 2) + rng, 2), "S5": round(round(round(pdl - (2.0 * (pdh - P)), 2) - rng, 2) - rng, 2),
                     "PDH": pdh,
                     "PDL": pdl,
                 }
@@ -359,8 +354,7 @@ class DedicatedTradingWorker:
         orb_range_val = max(15.0, round(curr_orb_h - curr_orb_l, 2))
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
-        todays_first_breakout = None
-
+        # Scan historical chart days to populate markers & cards
         for d_str, day_df in df_h.groupby("date_str"):
             day_times = day_df["dt"].apply(lambda d: d.astimezone(IST).time())
             ow = day_df[(day_times >= datetime.time(9, 15)) & (day_times < datetime.time(9, 30))]
@@ -369,7 +363,7 @@ class DedicatedTradingWorker:
 
             d_h = float(ow["high"].max())
             d_l = float(ow["low"].min())
-            sim_trade = None
+            day_breakout_done = False
 
             for idx in range(len(day_df)):
                 r = day_df.iloc[idx]
@@ -378,13 +372,13 @@ class DedicatedTradingWorker:
                 vw = float(r["vwap"])
                 em = float(r["ema9"])
 
-                if datetime.time(9, 30) <= t_open <= datetime.time(11, 30) and not sim_trade:
+                if datetime.time(9, 30) <= t_open <= datetime.time(11, 30) and not day_breakout_done:
                     prev_c = float(day_df.iloc[idx - 1]["close"]) if idx > 0 else c
                     candle_close_time = (r["dt"].astimezone(IST) + datetime.timedelta(minutes=5)).strftime("%H:%M")
                     t_sec = int(r["time"])
 
-                    # Breakout Candle Low - 5.0
                     if c > d_h and prev_c <= d_h and c > vw and c > em:
+                        day_breakout_done = True
                         sl_val = round(float(r["low"]) - 5.0, 1)
                         t_list = self.compute_all_confluence_targets(df_h.iloc[:idx+1], c, is_ce=True)
 
@@ -397,7 +391,7 @@ class DedicatedTradingWorker:
                                 "shape": "arrowUp",
                                 "text": f"BUY CE @ {c:.1f}",
                             })
-                        sim_trade = {
+                        self.history_cards[str(t_sec)] = {
                             "title": "BUY CE (ORB BREAKOUT)",
                             "entry": round(c, 1),
                             "sl": sl_val,
@@ -406,15 +400,12 @@ class DedicatedTradingWorker:
                             "time_str": candle_close_time,
                             "date": d_str,
                             "date_readable": r["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)"),
-                            "closed": False,
-                            "outcome": "ACTIVE",
+                            "closed": True if d_str != unique_days[-1] else self.trade_taken_today,
+                            "outcome": "HISTORICAL" if d_str != unique_days[-1] else ("CLOSED" if self.trade_taken_today else "ACTIVE"),
                         }
-                        self.history_cards[str(t_sec)] = sim_trade
-                        if d_str == unique_days[-1]:
-                            todays_first_breakout = sim_trade
 
-                    # Breakdown Candle High + 5.0
                     elif c < d_l and prev_c >= d_l and c < vw and c < em:
+                        day_breakout_done = True
                         sl_val = round(float(r["high"]) + 5.0, 1)
                         t_list = self.compute_all_confluence_targets(df_h.iloc[:idx+1], c, is_ce=False)
 
@@ -427,7 +418,7 @@ class DedicatedTradingWorker:
                                 "shape": "arrowDown",
                                 "text": f"BUY PE @ {c:.1f}",
                             })
-                        sim_trade = {
+                        self.history_cards[str(t_sec)] = {
                             "title": "BUY PE (ORB BREAKDOWN)",
                             "entry": round(c, 1),
                             "sl": sl_val,
@@ -436,32 +427,11 @@ class DedicatedTradingWorker:
                             "time_str": candle_close_time,
                             "date": d_str,
                             "date_readable": r["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)"),
-                            "closed": False,
-                            "outcome": "ACTIVE",
+                            "closed": True if d_str != unique_days[-1] else self.trade_taken_today,
+                            "outcome": "HISTORICAL" if d_str != unique_days[-1] else ("CLOSED" if self.trade_taken_today else "ACTIVE"),
                         }
-                        self.history_cards[str(t_sec)] = sim_trade
-                        if d_str == unique_days[-1]:
-                            todays_first_breakout = sim_trade
 
-        if todays_first_breakout and not self.locked_trade:
-            strike, sym, tok, delta, _ = self.find_budget_strike(todays_first_breakout["entry"], is_ce=(todays_first_breakout["type"] == "CE"))
-            self.locked_trade = {
-                "type": todays_first_breakout["type"],
-                "entry": todays_first_breakout["entry"],
-                "init_sl": todays_first_breakout["sl"],
-                "current_sl": todays_first_breakout["sl"],
-                "last_alerted_sl": todays_first_breakout["sl"],
-                "targets": todays_first_breakout["targets"],
-                "trail_stage": 0,
-                "peak_extreme": todays_first_breakout["entry"],
-                "closed": False,
-                "symbol": sym,
-                "token": tok,
-                "delta": delta,
-                "opt_entry_ltp": 75.0,
-                "date_readable": todays_first_breakout["date_readable"],
-            }
-
+        # Update HUD only if an active trade exists
         if self.locked_trade and not self.locked_trade.get("closed"):
             tr = self.locked_trade
             t_type = tr["type"]
@@ -516,10 +486,119 @@ class DedicatedTradingWorker:
                 "fib_261": round(curr_orb_h + (2.618 * orb_range_val), 1),
             }
 
+    def sync_breakout_from_history(self):
+        """Audits today's candles from 09:15 onwards to lock the real initial breakout."""
+        if self.trade_taken_today or self.locked_trade or not self.candles:
+            return
+
+        today_str = self.today.strftime("%Y-%m-%d")
+        df_curr = pd.DataFrame(self.candles)
+        df_curr["date_str"] = df_curr["dt"].apply(lambda d: d.astimezone(IST).strftime("%Y-%m-%d"))
+        today_df = df_curr[df_curr["date_str"] == today_str]
+
+        if len(today_df) < 4:
+            return  # Has not completed first breakout candle yet
+
+        orb_h = self.orb_levels.get("orb_h", 999999)
+        orb_l = self.orb_levels.get("orb_l", 0)
+
+        for idx in range(len(today_df)):
+            r = today_df.iloc[idx]
+            t_open = r["dt"].astimezone(IST).time()
+            c = float(r["close"])
+            vw = float(r.get("vwap", c))
+            em = float(r.get("ema9", c))
+
+            if datetime.time(9, 30) <= t_open <= datetime.time(11, 30):
+                prev_c = float(today_df.iloc[idx - 1]["close"]) if idx > 0 else c
+
+                # Real CE Breakout occurred in history
+                if c > orb_h and prev_c <= orb_h and c > vw and c > em:
+                    self.trade_taken_today = True
+                    strike, sym, tok, delta, days_exp = self.find_budget_strike(c, is_ce=True)
+                    init_sl = round(float(r["low"]) - 5.0, 1)
+                    targets = self.compute_all_confluence_targets(today_df.iloc[:idx+1], c, is_ce=True)
+
+                    # Check if trade was already stopped out in subsequent candles
+                    stopped_out = False
+                    for subsequent_idx in range(idx + 1, len(today_df)):
+                        sub_low = float(today_df.iloc[subsequent_idx]["low"])
+                        if sub_low <= init_sl:
+                            stopped_out = True
+                            break
+
+                    if stopped_out:
+                        print(f"[History Audit]: Today's breakout @ {c:.1f} was already stopped out. Session marked CLOSED.")
+                        self.locked_trade = None
+                        self.hud_data = {}
+                    else:
+                        print(f"[History Audit]: Locking today's genuine breakout from 09:30 candle @ {c:.1f}")
+                        self.locked_trade = {
+                            "type": "CE",
+                            "strike": strike,
+                            "entry": c,
+                            "init_sl": init_sl,
+                            "current_sl": init_sl,
+                            "last_alerted_sl": init_sl,
+                            "targets": targets,
+                            "trail_stage": 0,
+                            "peak_extreme": c,
+                            "closed": False,
+                            "symbol": sym,
+                            "token": tok,
+                            "delta": delta,
+                            "opt_entry_ltp": 75.0,
+                            "opt_sl": max(0.5, round(75.0 - ((c - init_sl) * delta), 2)),
+                            "time": int(r["time"]),
+                            "date_readable": r["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)"),
+                        }
+                    break
+
+                # Real PE Breakdown occurred in history
+                elif c < orb_l and prev_c >= orb_l and c < vw and c < em:
+                    self.trade_taken_today = True
+                    strike, sym, tok, delta, days_exp = self.find_budget_strike(c, is_ce=False)
+                    init_sl = round(float(r["high"]) + 5.0, 1)
+                    targets = self.compute_all_confluence_targets(today_df.iloc[:idx+1], c, is_ce=False)
+
+                    stopped_out = False
+                    for subsequent_idx in range(idx + 1, len(today_df)):
+                        sub_high = float(today_df.iloc[subsequent_idx]["high"])
+                        if sub_high >= init_sl:
+                            stopped_out = True
+                            break
+
+                    if stopped_out:
+                        print(f"[History Audit]: Today's breakdown @ {c:.1f} was already stopped out. Session marked CLOSED.")
+                        self.locked_trade = None
+                        self.hud_data = {}
+                    else:
+                        print(f"[History Audit]: Locking today's genuine breakdown from 09:30 candle @ {c:.1f}")
+                        self.locked_trade = {
+                            "type": "PE",
+                            "strike": strike,
+                            "entry": c,
+                            "init_sl": init_sl,
+                            "current_sl": init_sl,
+                            "last_alerted_sl": init_sl,
+                            "targets": targets,
+                            "trail_stage": 0,
+                            "peak_extreme": c,
+                            "closed": False,
+                            "symbol": sym,
+                            "token": tok,
+                            "delta": delta,
+                            "opt_entry_ltp": 75.0,
+                            "opt_sl": max(0.5, round(75.0 - ((init_sl - c) * delta), 2)),
+                            "time": int(r["time"]),
+                            "date_readable": r["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)"),
+                        }
+                    break
+
     def background_option_poller(self):
         while True:
-            time.sleep(12)
-            if self.locked_trade and self.locked_trade.get("token") and not self.locked_trade.get("closed"):
+            time.sleep(15)
+            if self.locked_trade and not self.locked_trade.get("closed") and self.locked_trade.get("token"):
                 try:
                     res = self.api.ltpData("NFO", self.locked_trade["symbol"], self.locked_trade["token"])
                     if isinstance(res, dict) and res.get("status") and res.get("data"):
@@ -601,7 +680,8 @@ class DedicatedTradingWorker:
         self.sync_state(ltp)
 
     def evaluate_live_breakout(self):
-        if self.locked_trade or len(self.candles) < 2:
+        # HARD STOP: If already traded today, NEVER enter again
+        if self.trade_taken_today or self.locked_trade or len(self.candles) < 2:
             return
 
         last_c = self.candles[-1]
@@ -619,8 +699,9 @@ class DedicatedTradingWorker:
             close_time_dt = last_c["dt"].astimezone(IST) + datetime.timedelta(minutes=5)
             close_time_str = close_time_dt.strftime("%H:%M:%S")
 
-            # CE Breakout: Breakout Candle Low - 5.0
+            # CE Breakout: First time crossing above ORB High
             if close_p > orb_h and prev_c["close"] <= orb_h:
+                self.trade_taken_today = True
                 strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=True)
                 init_sl = round(float(last_c["low"]) - 5.0, 1)
 
@@ -671,13 +752,14 @@ class DedicatedTradingWorker:
                     f"• <b>STOP LOSS:</b> {init_sl:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b> (-₹{total_risk_inr})\n"
                     f"{tg_lines}"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🛡 <b>SL Rule:</b> Candle Low - 5.0 pts\n"
+                    f"🛡 <b>SL Rule:</b> Breakout Candle Low - 5.0 pts\n"
                     f"📅 <b>Session Date:</b> {date_readable}\n"
                     f"⏰ <b>Trigger Time (Candle Close):</b> {close_time_str}"
                 )
 
-            # PE Breakdown: Breakout Candle High + 5.0
+            # PE Breakdown: First time crossing below ORB Low
             elif close_p < orb_l and prev_c["close"] >= orb_l:
+                self.trade_taken_today = True
                 strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=False)
                 init_sl = round(float(last_c["high"]) + 5.0, 1)
 
@@ -728,12 +810,13 @@ class DedicatedTradingWorker:
                     f"• <b>STOP LOSS:</b> {init_sl:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b> (-₹{total_risk_inr})\n"
                     f"{tg_lines}"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🛡 <b>SL Rule:</b> Candle High + 5.0 pts\n"
+                    f"🛡 <b>SL Rule:</b> Breakout Candle High + 5.0 pts\n"
                     f"📅 <b>Session Date:</b> {date_readable}\n"
                     f"⏰ <b>Trigger Time (Candle Close):</b> {close_time_str}"
                 )
 
     def evaluate_live_trail_and_exit(self, live_spot):
+        # ABSOLUTE SAFETY: If trade is closed or None, NEVER trail or alert
         if not self.locked_trade or self.locked_trade.get("closed"):
             return
 
@@ -744,17 +827,20 @@ class DedicatedTradingWorker:
         opt_entry = tr.get("opt_entry_ltp", 75.0)
         targets = tr.get("targets", [])
         current_stage = tr.get("trail_stage", 0)
-        atr_val = max(12.0, float(self.candles[-1].get("atr14", 15.0)))
         t_now = datetime.datetime.now(IST).strftime("%H:%M:%S")
         date_readable = tr.get("date_readable", datetime.datetime.now(IST).strftime("%d-%b-%Y (%A)"))
 
         stop_hit = (live_spot <= tr["current_sl"]) if is_ce else (live_spot >= tr["current_sl"])
         if stop_hit:
-            tr["closed"] = True
             exit_spot = tr["current_sl"]
             final_pts = round((exit_spot - entry_p) if is_ce else (entry_p - exit_spot), 1)
             final_inr = int(round(final_pts * delta_v * LOT_SIZE_QTY))
             sign = "+" if final_pts >= 0 else ""
+
+            # KILL ACTIVE TRADE PERMANENTLY
+            tr["closed"] = True
+            self.locked_trade = None
+            self.hud_data = {}
 
             send_telegram_alert(
                 f"🏁 <b>TRADE CLOSED (NIFTY {tr['type']} - STOP HIT)</b>\n"
@@ -795,29 +881,15 @@ class DedicatedTradingWorker:
                         sl_updated = True
 
         if peak_gain >= 60.0:
-            cushion = max(10.0, 0.75 * atr_val) if peak_gain >= 90.0 else max(13.0, 1.00 * atr_val)
-
-            prev_candle_extreme = None
-            if len(self.candles) >= 2:
-                if is_ce:
-                    prev_candle_extreme = float(self.candles[-2]["low"]) - 3.0
-                else:
-                    prev_candle_extreme = float(self.candles[-2]["high"]) + 3.0
-
+            cushion = 15.0 if peak_gain >= 90.0 else 20.0
             if is_ce:
                 candidate_trail = round(tr["peak_extreme"] - cushion, 1)
-                if prev_candle_extreme and peak_gain >= 90.0:
-                    candidate_trail = max(candidate_trail, prev_candle_extreme)
-
                 if candidate_trail > tr["current_sl"] + 4.0:
                     tr["current_sl"] = candidate_trail
                     update_reason = f"RATCHETED HIGHER (PEAK: {tr['peak_extreme']:.1f})"
                     sl_updated = True
             else:
                 candidate_trail = round(tr["peak_extreme"] + cushion, 1)
-                if prev_candle_extreme and peak_gain >= 90.0:
-                    candidate_trail = min(candidate_trail, prev_candle_extreme)
-
                 if candidate_trail < tr["current_sl"] - 4.0:
                     tr["current_sl"] = candidate_trail
                     update_reason = f"RATCHETED HIGHER (PEAK: {tr['peak_extreme']:.1f})"
@@ -881,6 +953,9 @@ class DedicatedTradingWorker:
             "opt_ltp": opt_ltp,
             "candles": recent_candles,
             "locked_trade": self.locked_trade if (self.locked_trade and not self.locked_trade.get("closed")) else None,
+            "trade_taken_today": self.trade_taken_today,
+            "trade_closed": self.trade_taken_today and (self.locked_trade is None),
+            "trade_date": self.today.strftime("%Y-%m-%d"),
             "markers": self.markers,
             "history_cards": self.history_cards,
             "pivots": self.pivot_lines,
@@ -905,11 +980,13 @@ def run_worker():
                 while True:
                     time.sleep(30)
                     now = datetime.datetime.now(IST)
+                    # Pre-market auto-reset at 08:30 AM every morning
                     if engine.last_login_date != now.date() and now.time() >= datetime.time(8, 30):
-                        print("[Supervisor]: Scheduled pre-market re-login trigger reached.")
+                        print("[Supervisor]: Pre-market 08:30 AM reached. Resetting daily session completely...")
                         engine.today = now.date()
                         engine.authenticate_angel_one()
                         engine.locked_trade = None
+                        engine.trade_taken_today = False
                         engine.nfo_df = engine.load_scrip_master()
                         engine.init_historical_candles()
                         engine.run_full_strategy_pipeline()
