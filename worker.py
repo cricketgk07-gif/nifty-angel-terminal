@@ -71,7 +71,7 @@ threading.Thread(target=self_ping_keepalive, daemon=True).start()
 
 
 # ==========================================
-# 2. Mathematical & Network Helpers
+# 2. Helper Functions
 # ==========================================
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
@@ -171,6 +171,9 @@ class DedicatedTradingWorker:
         self.init_historical_candles()
         self.run_full_strategy_pipeline()
 
+        # Check for trade continuation if an earlier breakout occurred today
+        self.check_and_restore_today_continuation()
+
         if self.candles:
             self.sync_state(self.candles[-1]["close"])
 
@@ -220,12 +223,13 @@ class DedicatedTradingWorker:
             if resp and resp.get("status") and resp.get("data"):
                 self.candles = []
                 for b in resp["data"]:
-                    dt_parsed = pd.to_datetime(b[0])
-                    if dt_parsed.tzinfo is None:
-                        dt_ist = dt_parsed.tz_localize("Asia/Kolkata")
+                    # Ensure timestamp represents true IST datetime
+                    dt_raw = pd.to_datetime(b[0])
+                    if dt_raw.tzinfo is None:
+                        dt_ist = dt_raw.tz_localize("Asia/Kolkata")
                     else:
-                        dt_ist = dt_parsed.astimezone(IST)
-                    
+                        dt_ist = dt_raw.astimezone(IST)
+
                     t_sec = int(dt_ist.timestamp())
                     self.candles.append({
                         "time": t_sec,
@@ -367,6 +371,7 @@ class DedicatedTradingWorker:
         self.history_cards = {}
         last_found_trade = None
 
+        # Reconstruct historical breakouts for any candle between 09:30 and 11:30
         for d_str, day_df in df_h.groupby("date_str"):
             day_times = day_df["dt"].apply(lambda d: d.astimezone(IST).time())
             ow = day_df[(day_times >= datetime.time(9, 15)) & (day_times < datetime.time(9, 30))]
@@ -396,11 +401,9 @@ class DedicatedTradingWorker:
                         sim_trade["outcome"] = "STOP HIT (LOSS)"
                         sim_trade["exit_price"] = sim_trade["sl"]
 
-                # 5-minute candle opening at 09:30 closes at 09:35
+                # Checks all candle closes between 09:30 and 11:30
                 if datetime.time(9, 30) <= t_open <= datetime.time(11, 30) and not sim_trade:
-                    # Stamping actual candle close time
-                    close_time_dt = r["dt"].astimezone(IST) + datetime.timedelta(minutes=5)
-                    close_time_str = close_time_dt.strftime("%H:%M")
+                    candle_close_time = (r["dt"].astimezone(IST) + datetime.timedelta(minutes=5)).strftime("%H:%M")
                     atr_margin = max(15.0, float(r.get("atr14", 18.0)))
 
                     if c > d_h and c > vw and c > em:
@@ -422,7 +425,7 @@ class DedicatedTradingWorker:
                             "sl": sl_val,
                             "targets": t_list,
                             "type": "CE",
-                            "time_str": close_time_str,
+                            "time_str": candle_close_time,
                             "date": d_str,
                             "date_readable": r["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)"),
                             "closed": False,
@@ -451,7 +454,7 @@ class DedicatedTradingWorker:
                             "sl": sl_val,
                             "targets": t_list,
                             "type": "PE",
-                            "time_str": close_time_str,
+                            "time_str": candle_close_time,
                             "date": d_str,
                             "date_readable": r["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)"),
                             "closed": False,
@@ -543,6 +546,122 @@ class DedicatedTradingWorker:
             "date_readable": active_t.get("date_readable", str(self.today)) if active_t else str(self.today),
             "trade_closed": active_t.get("closed", False) if active_t else False,
         }
+
+    def check_and_restore_today_continuation(self):
+        """
+        If the bot booted mid-day and price is actively trading beyond the ORB
+        boundaries, restores the setup and broadcasts the current continuation status.
+        """
+        if self.locked_trade or not self.candles:
+            return
+
+        last_c = self.candles[-1]
+        now_time = datetime.datetime.now(IST).time()
+        close_p = float(last_c["close"])
+        orb_h = self.orb_levels.get("orb_h", 999999)
+        orb_l = self.orb_levels.get("orb_l", 0)
+
+        # Active breakout holding above ORB High
+        if close_p > orb_h and now_time <= datetime.time(15, 15):
+            print("[Continuation Detection]: Active price is above ORB High. Locking CE runner...")
+            strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=True)
+            atr_margin = max(15.0, float(last_c.get("atr14", 18.0)))
+            init_sl = round(close_p - atr_margin, 1)
+            opt_ltp = self.fetch_option_ltp(sym, tok) if tok else 75.0
+            risk_pts = round(close_p - init_sl, 1)
+            opt_sl = max(0.5, round(opt_ltp - (risk_pts * delta), 2))
+
+            df_curr = pd.DataFrame(self.candles)
+            targets = self.compute_all_confluence_targets(df_curr, close_p, is_ce=True)
+
+            self.locked_trade = {
+                "type": "CE",
+                "strike": strike,
+                "entry": close_p,
+                "init_sl": init_sl,
+                "current_sl": init_sl,
+                "last_alerted_sl": init_sl,
+                "targets": targets,
+                "trail_stage": 0,
+                "peak_extreme": close_p,
+                "closed": False,
+                "symbol": sym,
+                "token": tok,
+                "delta": delta,
+                "opt_entry_ltp": opt_ltp,
+                "opt_sl": opt_sl,
+                "time": last_c["time"],
+                "date_readable": last_c["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)"),
+            }
+
+            budget_val = int(round(get_dynamic_budget()))
+            tg_lines = "".join([f"• <b>TARGET {i}:</b> {tg:.1f}\n" for i, tg in enumerate(targets[:4], start=1)])
+
+            send_telegram_alert(
+                f"⚡ <b>ACTIVE ORB TRADE CONTINUATION: NIFTY CE</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<b>CONTRACT:</b> {sym} (Δ: {delta:.2f})\n"
+                f"<b>MODE:</b> Budget (&lt; ₹{budget_val}) | <b>QTY:</b> {LOT_SIZE_QTY}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"• <b>CURRENT INDEX (SPOT):</b> {close_p:.1f}\n"
+                f"• <b>ESTIMATED OPTION LTP:</b> ₹{opt_ltp:.2f}\n"
+                f"• <b>ACTIVE STOP LOSS:</b> {init_sl:.1f} (₹{opt_sl:.2f})\n"
+                f"{tg_lines}"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📍 <b>Status:</b> SYNCHRONIZED RUNNER\n"
+                f"⏰ <b>Restored Time:</b> {datetime.datetime.now(IST).strftime('%H:%M:%S')}"
+            )
+
+        # Active breakdown holding below ORB Low
+        elif close_p < orb_l and now_time <= datetime.time(15, 15):
+            print("[Continuation Detection]: Active price is below ORB Low. Locking PE runner...")
+            strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=False)
+            atr_margin = max(15.0, float(last_c.get("atr14", 18.0)))
+            init_sl = round(close_p + atr_margin, 1)
+            opt_ltp = self.fetch_option_ltp(sym, tok) if tok else 75.0
+            risk_pts = round(init_sl - close_p, 1)
+            opt_sl = max(0.5, round(opt_ltp - (risk_pts * delta), 2))
+
+            df_curr = pd.DataFrame(self.candles)
+            targets = self.compute_all_confluence_targets(df_curr, close_p, is_ce=False)
+
+            self.locked_trade = {
+                "type": "PE",
+                "strike": strike,
+                "entry": close_p,
+                "init_sl": init_sl,
+                "current_sl": init_sl,
+                "last_alerted_sl": init_sl,
+                "targets": targets,
+                "trail_stage": 0,
+                "peak_extreme": close_p,
+                "closed": False,
+                "symbol": sym,
+                "token": tok,
+                "delta": delta,
+                "opt_entry_ltp": opt_ltp,
+                "opt_sl": opt_sl,
+                "time": last_c["time"],
+                "date_readable": last_c["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)"),
+            }
+
+            budget_val = int(round(get_dynamic_budget()))
+            tg_lines = "".join([f"• <b>TARGET {i}:</b> {tg:.1f}\n" for i, tg in enumerate(targets[:4], start=1)])
+
+            send_telegram_alert(
+                f"⚡ <b>ACTIVE ORB TRADE CONTINUATION: NIFTY PE</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<b>CONTRACT:</b> {sym} (Δ: {delta:.2f})\n"
+                f"<b>MODE:</b> Budget (&lt; ₹{budget_val}) | <b>QTY:</b> {LOT_SIZE_QTY}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"• <b>CURRENT INDEX (SPOT):</b> {close_p:.1f}\n"
+                f"• <b>ESTIMATED OPTION LTP:</b> ₹{opt_ltp:.2f}\n"
+                f"• <b>ACTIVE STOP LOSS:</b> {init_sl:.1f} (₹{opt_sl:.2f})\n"
+                f"{tg_lines}"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📍 <b>Status:</b> SYNCHRONIZED RUNNER\n"
+                f"⏰ <b>Restored Time:</b> {datetime.datetime.now(IST).strftime('%H:%M:%S')}"
+            )
 
     def fetch_option_ltp(self, sym, tok):
         try:
@@ -641,7 +760,7 @@ class DedicatedTradingWorker:
         df_curr = pd.DataFrame(self.candles)
         date_readable = last_c["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)")
 
-        # 5-minute candle opening at 09:30 closes at 09:35:00
+        # Checks all 5-minute candles opening between 09:30 and 11:30
         if datetime.time(9, 30) <= t_open <= datetime.time(11, 30) and not self.locked_trade:
             atr_margin = max(15.0, float(last_c.get("atr14", 18.0)))
             close_time_dt = last_c["dt"].astimezone(IST) + datetime.timedelta(minutes=5)
