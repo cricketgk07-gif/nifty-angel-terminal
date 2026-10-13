@@ -158,7 +158,6 @@ if hud and hud.get("entry_spot"):
         unsafe_allow_html=True,
     )
 else:
-    # Standby Dashboard Card when no trade is active
     orb_h_display = orb_levels.get("orb_h", "—")
     orb_l_display = orb_levels.get("orb_l", "—")
     pivot_p_display = pivots.get("P", "—")
@@ -261,7 +260,6 @@ html_code = f"""
     const orbLevels = {orb_json} || {{}};
     const fibLines = {fib_json} || {{}};
 
-    // Indian Standard Time (IST) offset: +5h 30m (+19800s)
     const IST_OFFSET = 19800;
 
     const formattedCandles = rawCandles.map(c => ({{
@@ -451,7 +449,7 @@ html_code = f"""
               }}
             }}
           }}
-        } catch (err) {{}}
+        }} catch (err) {{}}
       }}, 2000);
     }}
 
