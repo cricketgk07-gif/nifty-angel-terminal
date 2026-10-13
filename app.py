@@ -1,7 +1,5 @@
-import html
 import json
 import os
-import time
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
@@ -10,21 +8,6 @@ st.set_page_config(
     page_title="NIFTY 50 ORB Terminal",
     layout="wide",
     initial_sidebar_state="collapsed",
-)
-
-# Force browser to ping Streamlit rerun every 3 seconds for real-time tick flow
-components.html(
-    """
-    <script>
-      window.parent.setTimeout(() => {
-        const refreshBtn = window.parent.document.querySelector('button[kind="secondary"]');
-        // Trigger soft rerun without reloading full page
-        window.parent.postMessage({type: 'streamlit:render'}, '*');
-      }, 3000);
-    </script>
-    """,
-    height=0,
-    width=0,
 )
 
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
@@ -59,9 +42,6 @@ def write_redis_key(key: str, value):
         pass
 
 
-# -------------------------------------------------------------
-# Read Live Trading State from Redis
-# -------------------------------------------------------------
 state_data = read_redis_key("nifty_live_state") or {}
 
 ltp = float(state_data.get("ltp", 0.0))
@@ -73,21 +53,17 @@ pivots = state_data.get("pivots", {})
 orb_levels = state_data.get("orb_levels", {})
 fib_lines = state_data.get("fib_lines", {})
 hud = state_data.get("hud", {})
-updated_at = state_data.get("updated_at", 0)
 
 saved_budget = read_redis_key("user_selected_budget")
 current_budget = float(saved_budget) if saved_budget is not None else BUDGET_CEILING_DEFAULT
 
-# -------------------------------------------------------------
-# Header Bar & Live Point Monitor
-# -------------------------------------------------------------
 col_title, col_budget, col_refresh = st.columns([3, 2, 1])
 
 with col_title:
     st.markdown(
         f"<h3 style='margin:0; padding:0; color:#e0e0e0; font-family:sans-serif;'>"
         f"NIFTY 50 Opening Range Terminal "
-        f"<span style='color:#00e676; font-size:22px; font-weight:bold; margin-left:10px;'>₹{ltp:.2f}</span>"
+        f"<span id='live_ltp_display' style='color:#00e676; font-size:22px; font-weight:bold; margin-left:10px;'>₹{ltp:.2f}</span>"
         f"</h3>",
         unsafe_allow_html=True,
     )
@@ -99,7 +75,6 @@ with col_budget:
         max_value=150.0,
         value=current_budget,
         step=5.0,
-        help="Strike selector picks contracts trading closest to and below this ceiling.",
     )
     if new_budget != current_budget:
         write_redis_key("user_selected_budget", new_budget)
@@ -109,9 +84,6 @@ with col_refresh:
     if st.button("🔄 Force Refresh"):
         st.rerun()
 
-# -------------------------------------------------------------
-# Active Trade HUD Card
-# -------------------------------------------------------------
 if hud:
     trade_type = hud.get("type", "CE")
     badge_bg = "#00c853" if trade_type == "CE" else "#d50000"
@@ -175,15 +147,14 @@ if hud:
         unsafe_allow_html=True,
     )
 
-# -------------------------------------------------------------
-# Lightweight Charts Component (Pivots up to R5/S5)
-# -------------------------------------------------------------
 candles_json = json.dumps(candles)
 markers_json = json.dumps(markers)
 history_cards_json = json.dumps(history_cards)
 pivots_json = json.dumps(pivots)
 orb_json = json.dumps(orb_levels)
 fib_json = json.dumps(fib_lines)
+redis_url_str = UPSTASH_REDIS_REST_URL
+redis_token_str = UPSTASH_REDIS_REST_TOKEN
 
 html_code = f"""
 <!DOCTYPE html>
@@ -197,7 +168,7 @@ html_code = f"""
       padding: 0;
       background-color: #131722;
       color: #d1d4dc;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
       overflow: hidden;
     }}
     #chart_container {{
@@ -254,6 +225,7 @@ html_code = f"""
       }},
       rightPriceScale: {{
         borderColor: '#2a2e39',
+        autoScale: true,
       }},
       timeScale: {{
         borderColor: '#2a2e39',
@@ -269,7 +241,6 @@ html_code = f"""
       wickUpColor: '#089981',
       wickDownColor: '#f23645',
     }});
-
     candleSeries.setData(candlesData);
 
     const vwapSeries = chart.addLineSeries({{
@@ -292,37 +263,31 @@ html_code = f"""
       candleSeries.setMarkers(markersData);
     }}
 
-    // Pivots P, R1-R5, S1-S5, PDH, PDL
-    const pivotConfig = {{
+    // Limit active horizontal price lines to relevant trading levels
+    // to prevent squishing the candlestick view
+    const visiblePivots = {{
       'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
       'R1':  {{ color: '#ef5350', title: 'R1' }},
       'R2':  {{ color: '#e53935', title: 'R2' }},
-      'R3':  {{ color: '#d32f2f', title: 'R3' }},
-      'R4':  {{ color: '#c62828', title: 'R4' }},
-      'R5':  {{ color: '#b71c1c', title: 'R5' }},
       'S1':  {{ color: '#26a69a', title: 'S1' }},
       'S2':  {{ color: '#00897b', title: 'S2' }},
-      'S3':  {{ color: '#00796b', title: 'S3' }},
-      'S4':  {{ color: '#00695c', title: 'S4' }},
-      'S5':  {{ color: '#004d40', title: 'S5' }},
       'PDH': {{ color: '#42a5f5', title: 'PDH' }},
       'PDL': {{ color: '#ab47bc', title: 'PDL' }},
     }};
 
     Object.entries(pivots || {{}}).forEach(([k, val]) => {{
-      if (val && pivotConfig[k]) {{
+      if (val && visiblePivots[k]) {{
         candleSeries.createPriceLine({{
           price: parseFloat(val),
-          color: pivotConfig[k].color,
+          color: visiblePivots[k].color,
           lineWidth: 1,
           lineStyle: LightweightCharts.LineStyle.Dashed,
           axisLabelVisible: true,
-          title: pivotConfig[k].title,
+          title: visiblePivots[k].title,
         }});
       }}
     }});
 
-    // ORB Lines
     if (orbLevels && orbLevels.orb_h) {{
       candleSeries.createPriceLine({{
         price: parseFloat(orbLevels.orb_h),
@@ -344,21 +309,7 @@ html_code = f"""
       }});
     }}
 
-    // Fib Projections
-    if (fibLines) {{
-      Object.entries(fibLines).forEach(([fKey, fVal]) => {{
-        if (fVal) {{
-          candleSeries.createPriceLine({{
-            price: parseFloat(fVal),
-            color: '#b388ff',
-            lineWidth: 1,
-            lineStyle: LightweightCharts.LineStyle.Dotted,
-            axisLabelVisible: true,
-            title: fKey.toUpperCase().replace('_', ' '),
-          }});
-        }}
-      }});
-    }}
+    chart.timeScale().fitContent();
 
     // Hover Card Logic
     chart.subscribeCrosshairMove(param => {{
@@ -390,6 +341,42 @@ html_code = f"""
         hoverCard.style.display = 'none';
       }}
     }});
+
+    // Real-Time 2-Second Direct Redis Poller
+    const redisUrl = "{redis_url_str}";
+    const redisToken = "{redis_token_str}";
+
+    if (redisUrl && redisToken) {{
+      setInterval(async () => {{
+        try {{
+          const res = await fetch(redisUrl + '/get/nifty_live_state', {{
+            headers: {{ 'Authorization': 'Bearer ' + redisToken }}
+          }});
+          if (res.ok) {{
+            const dataObj = await res.json();
+            if (dataObj && dataObj.result) {{
+              const liveState = JSON.parse(dataObj.result);
+              if (liveState && liveState.candles && liveState.candles.length > 0) {{
+                const latestCandle = liveState.candles[liveState.candles.length - 1];
+                candleSeries.update(latestCandle);
+                if (latestCandle.vwap) {{
+                  vwapSeries.update({{ time: latestCandle.time, value: latestCandle.vwap }});
+                }}
+                if (latestCandle.ema9) {{
+                  emaSeries.update({{ time: latestCandle.time, value: latestCandle.ema9 }});
+                }}
+              }}
+              if (liveState && liveState.ltp) {{
+                const el = window.parent.document.getElementById('live_ltp_display');
+                if (el) {{
+                  el.innerText = '₹' + Number(liveState.ltp).toFixed(2);
+                }}
+              }}
+            }}
+          }}
+        }} catch (err) {{}}
+      }}, 2000);
+    }}
 
     window.addEventListener('resize', () => {{
       chart.applyOptions({{ width: container.clientWidth }});
