@@ -93,9 +93,9 @@ with col_refresh:
         st.rerun()
 
 # -------------------------------------------------------------
-# Active Trade HUD Card
+# Always-Visible HUD Card
 # -------------------------------------------------------------
-if hud:
+if hud and hud.get("entry_spot"):
     trade_type = hud.get("type", "CE")
     badge_bg = "#00c853" if trade_type == "CE" else "#d50000"
     symbol = hud.get("symbol", f"NIFTY {trade_type}")
@@ -157,9 +157,50 @@ if hud:
         """,
         unsafe_allow_html=True,
     )
+else:
+    # Standby Dashboard Card when no trade is active
+    orb_h_display = orb_levels.get("orb_h", "—")
+    orb_l_display = orb_levels.get("orb_l", "—")
+    pivot_p_display = pivots.get("P", "—")
+    pdh_display = pivots.get("PDH", "—")
+    pdl_display = pivots.get("PDL", "—")
+
+    st.markdown(
+        f"""
+        <div style="background:#131722; border:1px solid #2a2e39; border-radius:8px; padding:12px 16px; margin-bottom:12px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                <span style="color:#90a4ae; font-size:13px; font-weight:bold;">STANDBY MONITOR • SESSION KEY LEVELS</span>
+                <span style="color:#787b86; font-size:12px;">Awaiting Breakout Confirmation</span>
+            </div>
+            <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
+                    <div style="font-size:11px; color:#90a4ae;">ORB HIGH</div>
+                    <div style="font-size:14px; font-weight:bold; color:#00e676;">{orb_h_display}</div>
+                </div>
+                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
+                    <div style="font-size:11px; color:#90a4ae;">ORB LOW</div>
+                    <div style="font-size:14px; font-weight:bold; color:#ff5252;">{orb_l_display}</div>
+                </div>
+                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
+                    <div style="font-size:11px; color:#90a4ae;">PIVOT P</div>
+                    <div style="font-size:14px; font-weight:bold; color:#ffeb3b;">{pivot_p_display}</div>
+                </div>
+                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
+                    <div style="font-size:11px; color:#90a4ae;">PREV DAY HIGH</div>
+                    <div style="font-size:14px; font-weight:bold; color:#42a5f5;">{pdh_display}</div>
+                </div>
+                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
+                    <div style="font-size:11px; color:#90a4ae;">PREV DAY LOW</div>
+                    <div style="font-size:14px; font-weight:bold; color:#ab47bc;">{pdl_display}</div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # -------------------------------------------------------------
-# Lightweight Charts Component (with IST Offset & Real-time Poller)
+# Lightweight Charts Component
 # -------------------------------------------------------------
 candles_json = json.dumps(candles)
 markers_json = json.dumps(markers)
@@ -410,7 +451,7 @@ html_code = f"""
               }}
             }}
           }}
-        }} catch (err) {{}}
+        } catch (err) {{}}
       }}, 2000);
     }}
 
