@@ -220,7 +220,7 @@ html_code = f"""
     const orbLevels = {orb_json} || {{}};
     const fibLines = {fib_json} || {{}};
 
-    // Constant offset: Indian Standard Time (IST) is UTC + 5h 30m (+19800 seconds)
+    // Indian Standard Time (IST) offset: +5h 30m (+19800s)
     const IST_OFFSET = 19800;
 
     const formattedCandles = rawCandles.map(c => ({{
@@ -295,7 +295,6 @@ html_code = f"""
       candleSeries.setMarkers(formattedMarkers);
     }}
 
-    // Selected key price lines to maintain readable vertical chart proportions
     const visiblePivots = {{
       'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
       'R1':  {{ color: '#ef5350', title: 'R1' }},
@@ -350,7 +349,6 @@ html_code = f"""
         hoverCard.style.display = 'none';
         return;
       }}
-      // Crosshair uses shifted time; map back to raw time key
       const rawSecKey = String(param.time - IST_OFFSET);
       const cardData = historyCards[rawSecKey] || historyCards[String(param.time)];
       if (cardData) {{
