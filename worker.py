@@ -11,12 +11,13 @@ import numpy as np
 import pandas as pd
 import pyotp
 import requests
+import zoneinfo
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 INDEX_TOKEN = "99926000"
 LOT_SIZE_QTY = 65
-IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 
 API_KEY = os.getenv("API_KEY", "")
 CLIENT_CODE = os.getenv("CLIENT_CODE", "")
@@ -221,6 +222,10 @@ class DedicatedTradingWorker:
                 self.candles = []
                 for b in resp["data"]:
                     dt = pd.to_datetime(b[0])
+                    if dt.tzinfo is None:
+                        dt = dt.tz_localize("Asia/Kolkata")
+                    else:
+                        dt = dt.astimezone(IST)
                     t_sec = int(dt.timestamp())
                     self.candles.append({
                         "time": t_sec,
@@ -287,7 +292,7 @@ class DedicatedTradingWorker:
             return
 
         df_h = pd.DataFrame(self.candles)
-        df_h["date_str"] = df_h["dt"].dt.strftime("%Y-%m-%d")
+        df_h["date_str"] = df_h["dt"].apply(lambda d: d.astimezone(IST).strftime("%Y-%m-%d"))
 
         candle_spread = (df_h["high"] - df_h["low"]) + (df_h["close"] - df_h["open"]).abs()
         df_h["calc_vol"] = candle_spread * 1250.0 + 500.0
@@ -343,7 +348,8 @@ class DedicatedTradingWorker:
                 }
 
         today_bars = df_h[df_h["date_str"] == unique_days[-1]]
-        orb_window = today_bars[(today_bars["dt"].dt.time >= datetime.time(9, 15)) & (today_bars["dt"].dt.time < datetime.time(9, 30))]
+        today_bars_ist_time = today_bars["dt"].apply(lambda d: d.astimezone(IST).time())
+        orb_window = today_bars[(today_bars_ist_time >= datetime.time(9, 15)) & (today_bars_ist_time < datetime.time(9, 30))]
 
         if len(orb_window) >= 3:
             curr_orb_h = round(float(orb_window["high"].max()), 2)
@@ -361,7 +367,8 @@ class DedicatedTradingWorker:
         last_found_trade = None
 
         for d_str, day_df in df_h.groupby("date_str"):
-            ow = day_df[(day_df["dt"].dt.time >= datetime.time(9, 15)) & (day_df["dt"].dt.time < datetime.time(9, 30))]
+            day_times = day_df["dt"].apply(lambda d: d.astimezone(IST).time())
+            ow = day_df[(day_times >= datetime.time(9, 15)) & (day_times < datetime.time(9, 30))]
             if len(ow) < 3:
                 continue
 
@@ -371,7 +378,7 @@ class DedicatedTradingWorker:
 
             for idx in range(len(day_df)):
                 r = day_df.iloc[idx]
-                t = r["dt"].time()
+                t = r["dt"].astimezone(IST).time()
                 c = float(r["close"])
                 h_bar = float(r["high"])
                 l_bar = float(r["low"])
@@ -407,9 +414,9 @@ class DedicatedTradingWorker:
                             "sl": sl_val,
                             "targets": t_list,
                             "type": "CE",
-                            "time_str": r["dt"].strftime("%H:%M"),
+                            "time_str": r["dt"].astimezone(IST).strftime("%H:%M"),
                             "date": d_str,
-                            "date_readable": r["dt"].strftime("%d-%b-%Y (%A)"),
+                            "date_readable": r["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)"),
                             "closed": False,
                             "outcome": "ACTIVE",
                         }
@@ -435,9 +442,9 @@ class DedicatedTradingWorker:
                             "sl": sl_val,
                             "targets": t_list,
                             "type": "PE",
-                            "time_str": r["dt"].strftime("%H:%M"),
+                            "time_str": r["dt"].astimezone(IST).strftime("%H:%M"),
                             "date": d_str,
-                            "date_readable": r["dt"].strftime("%d-%b-%Y (%A)"),
+                            "date_readable": r["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)"),
                             "closed": False,
                             "outcome": "ACTIVE",
                         }
@@ -483,6 +490,7 @@ class DedicatedTradingWorker:
             delta_v = 0.50
             sym = f"NIFTY {int(round(last_close / 50.0) * 50)} {t_type}"
 
+        # Populate Fib lines properly
         if t_type == "CE":
             self.fib_lines = {
                 "fib_100": round(curr_orb_h + (1.000 * orb_range_val), 1),
@@ -615,14 +623,14 @@ class DedicatedTradingWorker:
             return
 
         last_c = self.candles[-1]
-        t = last_c["dt"].time()
+        t = last_c["dt"].astimezone(IST).time()
         close_p = last_c["close"]
 
         orb_h = self.orb_levels.get("orb_h", 999999)
         orb_l = self.orb_levels.get("orb_l", 0)
 
         df_curr = pd.DataFrame(self.candles)
-        date_readable = last_c["dt"].strftime("%d-%b-%Y (%A)")
+        date_readable = last_c["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)")
 
         if datetime.time(9, 30) <= t <= datetime.time(11, 30) and not self.locked_trade:
             # CE Breakout
@@ -678,7 +686,7 @@ class DedicatedTradingWorker:
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"🛡 <b>Initial SL:</b> Spot: {init_sl:.1f} | Option: ₹{opt_sl:.2f}\n"
                     f"📅 <b>Session Date:</b> {date_readable}\n"
-                    f"⏰ <b>Trigger Time:</b> {last_c['dt'].strftime('%H:%M:%S')}"
+                    f"⏰ <b>Trigger Time:</b> {last_c['dt'].astimezone(IST).strftime('%H:%M:%S')}"
                 )
 
             # PE Breakdown
@@ -734,7 +742,7 @@ class DedicatedTradingWorker:
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"🛡 <b>Initial SL:</b> Spot: {init_sl:.1f} | Option: ₹{opt_sl:.2f}\n"
                     f"📅 <b>Session Date:</b> {date_readable}\n"
-                    f"⏰ <b>Trigger Time:</b> {last_c['dt'].strftime('%H:%M:%S')}"
+                    f"⏰ <b>Trigger Time:</b> {last_c['dt'].astimezone(IST).strftime('%H:%M:%S')}"
                 )
 
     def evaluate_live_trail_and_exit(self, live_spot):
@@ -752,7 +760,6 @@ class DedicatedTradingWorker:
         t_now = datetime.datetime.now(IST).strftime("%H:%M:%S")
         date_readable = tr.get("date_readable", datetime.datetime.now(IST).strftime("%d-%b-%Y (%A)"))
 
-        # Priority 1: Stop Loss Hit Verification
         stop_hit = (live_spot <= tr["current_sl"]) if is_ce else (live_spot >= tr["current_sl"])
         if stop_hit:
             tr["closed"] = True
@@ -771,7 +778,6 @@ class DedicatedTradingWorker:
             )
             return
 
-        # Priority 2: Target Trailing Progression
         if is_ce:
             tr["peak_extreme"] = max(tr.get("peak_extreme", entry_p), live_spot)
             peak_gain = tr["peak_extreme"] - entry_p
@@ -900,7 +906,7 @@ class DedicatedTradingWorker:
 
 
 # ==========================================
-# 4. Supervisor Loop & Active Stream Recovery
+# 4. Supervisor Loop & Stream Reconnect
 # ==========================================
 def run_worker():
     while True:
