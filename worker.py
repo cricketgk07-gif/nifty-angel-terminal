@@ -10,12 +10,13 @@ import time
 import pandas as pd
 import pyotp
 import requests
+import zoneinfo
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 INDEX_TOKEN = "99926000"
 LOT_SIZE_QTY = 65
-IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 
 API_KEY = os.getenv("API_KEY", "")
 CLIENT_CODE = os.getenv("CLIENT_CODE", "")
@@ -219,10 +220,9 @@ class DedicatedTradingWorker:
             if resp and resp.get("status") and resp.get("data"):
                 self.candles = []
                 for b in resp["data"]:
-                    # Angel One timestamps come as "2026-10-13T09:15:00+05:30" or "YYYY-MM-DD HH:MM"
                     dt_parsed = pd.to_datetime(b[0])
                     if dt_parsed.tzinfo is None:
-                        dt_ist = dt_parsed.tz_localize(IST)
+                        dt_ist = dt_parsed.tz_localize("Asia/Kolkata")
                     else:
                         dt_ist = dt_parsed.astimezone(IST)
                     
@@ -379,7 +379,7 @@ class DedicatedTradingWorker:
 
             for idx in range(len(day_df)):
                 r = day_df.iloc[idx]
-                t = r["dt"].astimezone(IST).time()
+                t_open = r["dt"].astimezone(IST).time()
                 c = float(r["close"])
                 h_bar = float(r["high"])
                 l_bar = float(r["low"])
@@ -396,9 +396,16 @@ class DedicatedTradingWorker:
                         sim_trade["outcome"] = "STOP HIT (LOSS)"
                         sim_trade["exit_price"] = sim_trade["sl"]
 
-                if datetime.time(9, 30) <= t <= datetime.time(11, 30) and not sim_trade:
+                # 5-minute candle opening at 09:30 closes at 09:35
+                if datetime.time(9, 30) <= t_open <= datetime.time(11, 30) and not sim_trade:
+                    # Stamping actual candle close time
+                    close_time_dt = r["dt"].astimezone(IST) + datetime.timedelta(minutes=5)
+                    close_time_str = close_time_dt.strftime("%H:%M")
+                    atr_margin = max(15.0, float(r.get("atr14", 18.0)))
+
                     if c > d_h and c > vw and c > em:
-                        sl_val = round(float(r["low"]) - 5.0, 1)
+                        candle_sl = float(r["low"]) - 5.0
+                        sl_val = round(min(candle_sl, c - atr_margin), 1)
                         t_list = self.compute_all_confluence_targets(df_h.iloc[:idx+1], c, is_ce=True)
                         t_sec = int(r["time"])
 
@@ -415,7 +422,7 @@ class DedicatedTradingWorker:
                             "sl": sl_val,
                             "targets": t_list,
                             "type": "CE",
-                            "time_str": r["dt"].astimezone(IST).strftime("%H:%M"),
+                            "time_str": close_time_str,
                             "date": d_str,
                             "date_readable": r["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)"),
                             "closed": False,
@@ -426,7 +433,8 @@ class DedicatedTradingWorker:
                         last_found_trade = sim_trade
 
                     elif c < d_l and c < vw and c < em:
-                        sl_val = round(float(r["high"]) + 5.0, 1)
+                        candle_sl = float(r["high"]) + 5.0
+                        sl_val = round(max(candle_sl, c + atr_margin), 1)
                         t_list = self.compute_all_confluence_targets(df_h.iloc[:idx+1], c, is_ce=False)
                         t_sec = int(r["time"])
 
@@ -443,7 +451,7 @@ class DedicatedTradingWorker:
                             "sl": sl_val,
                             "targets": t_list,
                             "type": "PE",
-                            "time_str": r["dt"].astimezone(IST).strftime("%H:%M"),
+                            "time_str": close_time_str,
                             "date": d_str,
                             "date_readable": r["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)"),
                             "closed": False,
@@ -484,14 +492,14 @@ class DedicatedTradingWorker:
             t_type = "CE" if last_close >= float(df_h.iloc[-1]["vwap"]) else "PE"
             entry_p = curr_orb_h if t_type == "CE" else curr_orb_l
             last_bar = self.candles[-1]
-            sl_p = round(last_bar["low"] - 5.0 if t_type == "CE" else last_bar["high"] + 5.0, 1)
+            atr_margin = max(15.0, float(last_bar.get("atr14", 18.0)))
+            sl_p = round(entry_p - atr_margin if t_type == "CE" else entry_p + atr_margin, 1)
             trail_p = sl_p
             target_list = self.compute_all_confluence_targets(df_h, entry_p, is_ce=(t_type == "CE"))
             opt_entry = 75.0
             delta_v = 0.50
             sym = f"NIFTY {int(round(last_close / 50.0) * 50)} {t_type}"
 
-        # Setup Fib Lines
         if t_type == "CE":
             self.fib_lines = {
                 "fib_100": round(curr_orb_h + (1.000 * orb_range_val), 1),
@@ -624,7 +632,7 @@ class DedicatedTradingWorker:
             return
 
         last_c = self.candles[-1]
-        t = last_c["dt"].astimezone(IST).time()
+        t_open = last_c["dt"].astimezone(IST).time()
         close_p = last_c["close"]
 
         orb_h = self.orb_levels.get("orb_h", 999999)
@@ -633,11 +641,18 @@ class DedicatedTradingWorker:
         df_curr = pd.DataFrame(self.candles)
         date_readable = last_c["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)")
 
-        if datetime.time(9, 30) <= t <= datetime.time(11, 30) and not self.locked_trade:
+        # 5-minute candle opening at 09:30 closes at 09:35:00
+        if datetime.time(9, 30) <= t_open <= datetime.time(11, 30) and not self.locked_trade:
+            atr_margin = max(15.0, float(last_c.get("atr14", 18.0)))
+            close_time_dt = last_c["dt"].astimezone(IST) + datetime.timedelta(minutes=5)
+            close_time_str = close_time_dt.strftime("%H:%M:%S")
+
             # CE Breakout
             if close_p > orb_h:
                 strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=True)
-                init_sl = round(last_c["low"] - 5.0, 1)
+                candle_sl = float(last_c["low"]) - 5.0
+                init_sl = round(min(candle_sl, close_p - atr_margin), 1)
+
                 opt_ltp = self.fetch_option_ltp(sym, tok) if tok else 75.0
                 risk_pts = round(close_p - init_sl, 1)
                 opt_sl = max(0.5, round(opt_ltp - (risk_pts * delta), 2))
@@ -687,13 +702,15 @@ class DedicatedTradingWorker:
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"🛡 <b>Initial SL:</b> Spot: {init_sl:.1f} | Option: ₹{opt_sl:.2f}\n"
                     f"📅 <b>Session Date:</b> {date_readable}\n"
-                    f"⏰ <b>Trigger Time:</b> {last_c['dt'].astimezone(IST).strftime('%H:%M:%S')}"
+                    f"⏰ <b>Trigger Time (Candle Close):</b> {close_time_str}"
                 )
 
             # PE Breakdown
             elif close_p < orb_l:
                 strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=False)
-                init_sl = round(last_c["high"] + 5.0, 1)
+                candle_sl = float(last_c["high"]) + 5.0
+                init_sl = round(max(candle_sl, close_p + atr_margin), 1)
+
                 opt_ltp = self.fetch_option_ltp(sym, tok) if tok else 75.0
                 risk_pts = round(init_sl - close_p, 1)
                 opt_sl = max(0.5, round(opt_ltp - (risk_pts * delta), 2))
@@ -743,7 +760,7 @@ class DedicatedTradingWorker:
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"🛡 <b>Initial SL:</b> Spot: {init_sl:.1f} | Option: ₹{opt_sl:.2f}\n"
                     f"📅 <b>Session Date:</b> {date_readable}\n"
-                    f"⏰ <b>Trigger Time:</b> {last_c['dt'].astimezone(IST).strftime('%H:%M:%S')}"
+                    f"⏰ <b>Trigger Time (Candle Close):</b> {close_time_str}"
                 )
 
     def evaluate_live_trail_and_exit(self, live_spot):
