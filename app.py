@@ -1,3 +1,4 @@
+import html
 import json
 import os
 import requests
@@ -42,6 +43,9 @@ def write_redis_key(key: str, value):
         pass
 
 
+# -------------------------------------------------------------
+# Read Live Trading State from Redis
+# -------------------------------------------------------------
 state_data = read_redis_key("nifty_live_state") or {}
 
 ltp = float(state_data.get("ltp", 0.0))
@@ -57,6 +61,9 @@ hud = state_data.get("hud", {})
 saved_budget = read_redis_key("user_selected_budget")
 current_budget = float(saved_budget) if saved_budget is not None else BUDGET_CEILING_DEFAULT
 
+# -------------------------------------------------------------
+# Header Bar & Live Point Monitor
+# -------------------------------------------------------------
 col_title, col_budget, col_refresh = st.columns([3, 2, 1])
 
 with col_title:
@@ -75,6 +82,7 @@ with col_budget:
         max_value=150.0,
         value=current_budget,
         step=5.0,
+        help="Strike selector picks contracts trading closest to and below this ceiling.",
     )
     if new_budget != current_budget:
         write_redis_key("user_selected_budget", new_budget)
@@ -84,6 +92,9 @@ with col_refresh:
     if st.button("🔄 Force Refresh"):
         st.rerun()
 
+# -------------------------------------------------------------
+# Active Trade HUD Card
+# -------------------------------------------------------------
 if hud:
     trade_type = hud.get("type", "CE")
     badge_bg = "#00c853" if trade_type == "CE" else "#d50000"
@@ -147,6 +158,9 @@ if hud:
         unsafe_allow_html=True,
     )
 
+# -------------------------------------------------------------
+# Lightweight Charts Component (with IST Offset & Real-time Poller)
+# -------------------------------------------------------------
 candles_json = json.dumps(candles)
 markers_json = json.dumps(markers)
 history_cards_json = json.dumps(history_cards)
@@ -199,12 +213,30 @@ html_code = f"""
   </div>
 
   <script>
-    const candlesData = {candles_json};
-    const markersData = {markers_json};
-    const historyCards = {history_cards_json};
-    const pivots = {pivots_json};
-    const orbLevels = {orb_json};
-    const fibLines = {fib_json};
+    const rawCandles = {candles_json} || [];
+    const rawMarkers = {markers_json} || [];
+    const historyCards = {history_cards_json} || {{}};
+    const pivots = {pivots_json} || {{}};
+    const orbLevels = {orb_json} || {{}};
+    const fibLines = {fib_json} || {{}};
+
+    // Constant offset: Indian Standard Time (IST) is UTC + 5h 30m (+19800 seconds)
+    const IST_OFFSET = 19800;
+
+    const formattedCandles = rawCandles.map(c => ({{
+      time: c.time + IST_OFFSET,
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+      vwap: c.vwap,
+      ema9: c.ema9
+    }}));
+
+    const formattedMarkers = rawMarkers.map(m => ({{
+      ...m,
+      time: m.time + IST_OFFSET
+    }}));
 
     const container = document.getElementById('chart_container');
     const hoverCard = document.getElementById('hover_card');
@@ -241,7 +273,7 @@ html_code = f"""
       wickUpColor: '#089981',
       wickDownColor: '#f23645',
     }});
-    candleSeries.setData(candlesData);
+    candleSeries.setData(formattedCandles);
 
     const vwapSeries = chart.addLineSeries({{
       color: '#ff9800',
@@ -249,7 +281,7 @@ html_code = f"""
       priceLineVisible: false,
       title: 'VWAP',
     }});
-    vwapSeries.setData(candlesData.filter(d => d.vwap).map(d => ({{ time: d.time, value: d.vwap }})));
+    vwapSeries.setData(formattedCandles.filter(d => d.vwap).map(d => ({{ time: d.time, value: d.vwap }})));
 
     const emaSeries = chart.addLineSeries({{
       color: '#2962ff',
@@ -257,14 +289,13 @@ html_code = f"""
       priceLineVisible: false,
       title: 'EMA 9',
     }});
-    emaSeries.setData(candlesData.filter(d => d.ema9).map(d => ({{ time: d.time, value: d.ema9 }})));
+    emaSeries.setData(formattedCandles.filter(d => d.ema9).map(d => ({{ time: d.time, value: d.ema9 }})));
 
-    if (markersData && markersData.length > 0) {{
-      candleSeries.setMarkers(markersData);
+    if (formattedMarkers.length > 0) {{
+      candleSeries.setMarkers(formattedMarkers);
     }}
 
-    // Limit active horizontal price lines to relevant trading levels
-    // to prevent squishing the candlestick view
+    // Selected key price lines to maintain readable vertical chart proportions
     const visiblePivots = {{
       'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
       'R1':  {{ color: '#ef5350', title: 'R1' }},
@@ -275,7 +306,7 @@ html_code = f"""
       'PDL': {{ color: '#ab47bc', title: 'PDL' }},
     }};
 
-    Object.entries(pivots || {{}}).forEach(([k, val]) => {{
+    Object.entries(pivots).forEach(([k, val]) => {{
       if (val && visiblePivots[k]) {{
         candleSeries.createPriceLine({{
           price: parseFloat(val),
@@ -309,7 +340,9 @@ html_code = f"""
       }});
     }}
 
-    chart.timeScale().fitContent();
+    if (formattedCandles.length > 0) {{
+      chart.timeScale().fitContent();
+    }}
 
     // Hover Card Logic
     chart.subscribeCrosshairMove(param => {{
@@ -317,8 +350,9 @@ html_code = f"""
         hoverCard.style.display = 'none';
         return;
       }}
-      const tKey = String(param.time);
-      const cardData = historyCards[tKey];
+      // Crosshair uses shifted time; map back to raw time key
+      const rawSecKey = String(param.time - IST_OFFSET);
+      const cardData = historyCards[rawSecKey] || historyCards[String(param.time)];
       if (cardData) {{
         const isCe = cardData.type === 'CE';
         const color = isCe ? '#00e676' : '#ff5252';
@@ -358,12 +392,16 @@ html_code = f"""
               const liveState = JSON.parse(dataObj.result);
               if (liveState && liveState.candles && liveState.candles.length > 0) {{
                 const latestCandle = liveState.candles[liveState.candles.length - 1];
-                candleSeries.update(latestCandle);
+                const shiftedCandle = {{
+                  ...latestCandle,
+                  time: latestCandle.time + IST_OFFSET
+                }};
+                candleSeries.update(shiftedCandle);
                 if (latestCandle.vwap) {{
-                  vwapSeries.update({{ time: latestCandle.time, value: latestCandle.vwap }});
+                  vwapSeries.update({{ time: shiftedCandle.time, value: latestCandle.vwap }});
                 }}
                 if (latestCandle.ema9) {{
-                  emaSeries.update({{ time: latestCandle.time, value: latestCandle.ema9 }});
+                  emaSeries.update({{ time: shiftedCandle.time, value: latestCandle.ema9 }});
                 }}
               }}
               if (liveState && liveState.ltp) {{
