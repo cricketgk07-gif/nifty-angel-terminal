@@ -199,7 +199,7 @@ else:
     )
 
 # -------------------------------------------------------------
-# Lightweight Charts Component (with Bidirectional Fib Levels)
+# Lightweight Charts Component (All Pivots P, R1-R5, S1-S5)
 # -------------------------------------------------------------
 candles_json = json.dumps(candles)
 markers_json = json.dumps(markers)
@@ -334,12 +334,19 @@ html_code = f"""
       candleSeries.setMarkers(formattedMarkers);
     }}
 
+    // Complete Pivot Definitions: P, R1 through R5, S1 through S5, PDH, PDL
     const visiblePivots = {{
       'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
       'R1':  {{ color: '#ef5350', title: 'R1' }},
       'R2':  {{ color: '#e53935', title: 'R2' }},
+      'R3':  {{ color: '#d32f2f', title: 'R3' }},
+      'R4':  {{ color: '#c62828', title: 'R4' }},
+      'R5':  {{ color: '#b71c1c', title: 'R5' }},
       'S1':  {{ color: '#26a69a', title: 'S1' }},
       'S2':  {{ color: '#00897b', title: 'S2' }},
+      'S3':  {{ color: '#00796b', title: 'S3' }},
+      'S4':  {{ color: '#00695c', title: 'S4' }},
+      'S5':  {{ color: '#004d40', title: 'S5' }},
       'PDH': {{ color: '#42a5f5', title: 'PDH' }},
       'PDL': {{ color: '#ab47bc', title: 'PDL' }},
     }};
