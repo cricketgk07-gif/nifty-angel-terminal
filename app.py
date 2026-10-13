@@ -93,7 +93,7 @@ with col_refresh:
         st.rerun()
 
 # -------------------------------------------------------------
-# Always-Visible HUD Card
+# Standby Monitor or Active Trade Execution HUD Card
 # -------------------------------------------------------------
 if hud and hud.get("entry_spot"):
     trade_type = hud.get("type", "CE")
@@ -199,7 +199,7 @@ else:
     )
 
 # -------------------------------------------------------------
-# Lightweight Charts Component
+# Lightweight Charts Component (with Bidirectional Fib Levels)
 # -------------------------------------------------------------
 candles_json = json.dumps(candles)
 markers_json = json.dumps(markers)
@@ -375,6 +375,27 @@ html_code = f"""
         lineStyle: LightweightCharts.LineStyle.Solid,
         axisLabelVisible: true,
         title: 'ORB LOW',
+      }});
+    }}
+
+    // Draw Fibonacci Projections (FIB 100, FIB 161, FIB 261)
+    if (fibLines) {{
+      const fibTitles = {{
+        'fib_100': 'FIB 100',
+        'fib_161': 'FIB 161',
+        'fib_261': 'FIB 261'
+      }};
+      Object.entries(fibLines).forEach(([fKey, fVal]) => {{
+        if (fVal && fibTitles[fKey]) {{
+          candleSeries.createPriceLine({{
+            price: parseFloat(fVal),
+            color: '#b388ff',
+            lineWidth: 1,
+            lineStyle: LightweightCharts.LineStyle.Dotted,
+            axisLabelVisible: true,
+            title: fibTitles[fKey],
+          }});
+        }}
       }});
     }}
 
