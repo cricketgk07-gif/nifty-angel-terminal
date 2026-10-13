@@ -32,7 +32,7 @@ PORT = int(os.getenv("PORT", 10000))
 
 
 # ==========================================
-# 1. Self-Sustaining Health Server & Auto-Pinger
+# 1. Health Server & Self-Pinger
 # ==========================================
 class HealthHandler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
@@ -59,7 +59,6 @@ threading.Thread(target=run_ping_server, daemon=True).start()
 
 
 def self_ping_keepalive():
-    """Pings localhost every 8 minutes to prevent Render from idling out."""
     while True:
         time.sleep(480)
         try:
@@ -183,22 +182,9 @@ class DedicatedTradingWorker:
             self.auth_token = self.session["data"]["jwtToken"]
             self.feed_token = self.api.getfeedToken()
             self.last_login_date = datetime.datetime.now(IST).date()
-            print(f"[Auth Success]: SmartAPI tokens refreshed for {self.last_login_date}")
+            print(f"[Auth Success]: SmartAPI tokens generated for {self.last_login_date}")
         except Exception as e:
-            print(f"[Auth Error]: Failed to generate Angel One session: {e}")
-
-    def check_daily_relogin(self):
-        now = datetime.datetime.now(IST)
-        if self.last_login_date != now.date() and now.time() >= datetime.time(8, 30):
-            print("[Daily Refresh]: Resetting credentials and ORB session for the new trading day...")
-            self.today = now.date()
-            self.authenticate_angel_one()
-            self.locked_trade = None
-            self.nfo_df = self.load_scrip_master()
-            self.init_historical_candles()
-            self.run_full_strategy_pipeline()
-            return True
-        return False
+            print(f"[Auth Error]: Session generation failed: {e}")
 
     def load_scrip_master(self):
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -235,7 +221,7 @@ class DedicatedTradingWorker:
                 self.candles = []
                 for b in resp["data"]:
                     dt = pd.to_datetime(b[0])
-                    t_sec = int((dt.tz_localize(None) - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1))
+                    t_sec = int(dt.timestamp())
                     self.candles.append({
                         "time": t_sec,
                         "open": float(b[1]),
@@ -245,7 +231,7 @@ class DedicatedTradingWorker:
                         "dt": dt,
                     })
         except Exception as e:
-            print(f"Candle fetch notice: {e}")
+            print(f"Candle history warning: {e}")
 
     def compute_all_confluence_targets(self, df_h, entry_p, is_ce):
         high_low = df_h["high"] - df_h["low"]
@@ -598,13 +584,10 @@ class DedicatedTradingWorker:
         return chosen_strike, chosen_sym, chosen_tok, delta, days_to_exp
 
     def on_tick(self, ltp):
-        if self.check_daily_relogin():
-            return
-
         now = datetime.datetime.now(IST)
         bucket_min = (now.minute // 5) * 5
         bar_dt = now.replace(minute=bucket_min, second=0, microsecond=0)
-        t_sec = int((bar_dt.tz_localize(None) - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1))
+        t_sec = int(bar_dt.timestamp())
 
         if self.active_bar is None or self.active_bar["time"] != t_sec:
             if self.active_bar:
@@ -769,7 +752,7 @@ class DedicatedTradingWorker:
         t_now = datetime.datetime.now(IST).strftime("%H:%M:%S")
         date_readable = tr.get("date_readable", datetime.datetime.now(IST).strftime("%d-%b-%Y (%A)"))
 
-        # Step 1: Check Stop Loss Hit FIRST
+        # Priority 1: Stop Loss Hit Verification
         stop_hit = (live_spot <= tr["current_sl"]) if is_ce else (live_spot >= tr["current_sl"])
         if stop_hit:
             tr["closed"] = True
@@ -788,7 +771,7 @@ class DedicatedTradingWorker:
             )
             return
 
-        # Step 2: Evaluate Targets & Progressive Trails
+        # Priority 2: Target Trailing Progression
         if is_ce:
             tr["peak_extreme"] = max(tr.get("peak_extreme", entry_p), live_spot)
             peak_gain = tr["peak_extreme"] - entry_p
@@ -917,13 +900,34 @@ class DedicatedTradingWorker:
 
 
 # ==========================================
-# 4. Resilient Worker Loop
+# 4. Supervisor Loop & Active Stream Recovery
 # ==========================================
 def run_worker():
     while True:
         try:
-            print("Starting Trading Worker with Auto-Relogin and Keepalive...")
+            print("[Supervisor]: Initializing SmartAPI Session...")
             engine = DedicatedTradingWorker()
+
+            def schedule_checker():
+                while True:
+                    time.sleep(30)
+                    now = datetime.datetime.now(IST)
+                    if engine.last_login_date != now.date() and now.time() >= datetime.time(8, 30):
+                        print("[Supervisor]: Scheduled pre-market re-authentication trigger reached.")
+                        engine.today = now.date()
+                        engine.authenticate_angel_one()
+                        engine.locked_trade = None
+                        engine.nfo_df = engine.load_scrip_master()
+                        engine.init_historical_candles()
+                        engine.run_full_strategy_pipeline()
+                        try:
+                            sws.close_connection()
+                        except Exception:
+                            pass
+                        break
+
+            threading.Thread(target=schedule_checker, daemon=True).start()
+
             sws = SmartWebSocketV2(engine.auth_token, API_KEY, CLIENT_CODE, engine.feed_token)
 
             def on_data(wsapp, msg):
@@ -932,26 +936,26 @@ def run_worker():
                     engine.on_tick(ltp)
 
             def on_open(wsapp):
-                print("WebSocket Connected Successfully to Angel One")
+                print("[WebSocket]: Connected and Subscribed to Nifty Index Token 99926000")
                 sws.subscribe("correl_id_1", 1, [{"exchangeType": 1, "tokens": [INDEX_TOKEN]}])
 
-            def on_error(*args, **kwargs):
-                print("WebSocket Notice/Error:", args)
+            def on_error(wsapp, error):
+                print(f"[WebSocket Notice/Error]: {error}")
 
-            def on_close(*args, **kwargs):
-                print("WebSocket Connection Closed:", args)
+            def on_close(wsapp):
+                print("[WebSocket Closed]: Stream connection dropped. Supervisor reconnecting...")
 
             sws.on_open = on_open
             sws.on_data = on_data
             sws.on_error = on_error
             sws.on_close = on_close
-
             sws._on_error = on_error
             sws._on_close = on_close
 
             sws.connect()
+
         except Exception as e:
-            print(f"Connection paused or reconnecting: {e}")
+            print(f"[Supervisor Error]: Exception encountered: {e}. Reinitializing in 10s...")
             time.sleep(10)
 
 
