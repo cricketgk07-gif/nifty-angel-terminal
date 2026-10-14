@@ -189,17 +189,19 @@ class DedicatedTradingWorker:
         today_str = self.today.strftime("%Y-%m-%d")
         saved_state = read_from_redis("nifty_live_state") or {}
 
-        # Only retain live positions if within current active market day
+        # Only retain active live trade if currently in market hours today
         if is_market_hours() and saved_state.get("trade_date") == today_str:
             self.trades_taken_today = saved_state.get("trades_taken_today", 0)
             self.trade_history_today = saved_state.get("trade_history_today", [])
             if not saved_state.get("trade_closed", False):
                 self.locked_trade = saved_state.get("locked_trade")
 
+        # Explicitly reset markers cache in memory to wipe ghost historical markers
+        self.markers = []
+        self.history_cards = {}
+
         self.nfo_df = self.load_scrip_master()
         self.init_historical_candles()
-        
-        # Fresh recalculation of all markers (clears previous bad simulations)
         self.run_full_strategy_pipeline()
 
         threading.Thread(target=self.background_option_poller, daemon=True).start()
@@ -429,7 +431,7 @@ class DedicatedTradingWorker:
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
         # -------------------------------------------------------------
-        # SYNCHRONIZED HISTORICAL SIMULATOR (COMPLETELY RESETS MARKERS)
+        # SYNCHRONIZED HISTORICAL SIMULATOR (ZERO DUPLICATE SIGNALS)
         # -------------------------------------------------------------
         self.markers = []
         self.history_cards = {}
@@ -439,7 +441,7 @@ class DedicatedTradingWorker:
             if len(day_bars) < 4:
                 continue
 
-            # ORB formed by strictly the first 3 candles (09:15, 09:20, 09:25)
+            # First 3 candles define the Day's ORB Range
             ow = day_bars.iloc[0:3]
             d_h = round(float(ow["high"].max()), 2)
             d_l = round(float(ow["low"].min()), 2)
@@ -483,9 +485,9 @@ class DedicatedTradingWorker:
                     is_ce_sim = (sim_active_trade["type"] == "CE")
 
                     if is_ce_sim and l <= sim_active_trade["sl"]:
-                        sim_active_trade = None  # Hit SL / Exited
+                        sim_active_trade = None  # Trade exited
                     elif (not is_ce_sim) and h >= sim_active_trade["sl"]:
-                        sim_active_trade = None  # Hit SL / Exited
+                        sim_active_trade = None  # Trade exited
 
                     if sim_active_trade is not None:
                         targets = sim_active_trade["targets"]
@@ -531,8 +533,7 @@ class DedicatedTradingWorker:
                     min_headroom_req = 25.0
                     # The very first breakout candle (09:30 AM close at index 3) triggers immediately
                     orb_ce = (c > d_h and prev_c <= d_h and c > vw)
-                    # Absorption of resistance level
-                    sec_ce = (c > d_h and prev_c > d_h and c > vw and c > em and (c - d_h) >= 4.0)
+                    sec_ce = (c > d_h and prev_c > d_h and c > vw and c > em and (c - d_h) >= 4.0 and idx <= 5)
 
                     if orb_ce or sec_ce:
                         hd, near_name, lvl_val = self.check_headroom_to_nearest_level(c, is_ce=True, custom_pivots=day_pivots)
@@ -541,7 +542,7 @@ class DedicatedTradingWorker:
                             sl_val = round(l - 5.0, 1)
 
                     orb_pe = (c < d_l and prev_c >= d_l and c < vw)
-                    sec_pe = (c < d_l and prev_c < d_l and c < vw and c < em and (d_l - c) >= 4.0)
+                    sec_pe = (c < d_l and prev_c < d_l and c < vw and c < em and (d_l - c) >= 4.0 and idx <= 5)
 
                     if orb_pe or sec_pe:
                         hd, near_name, lvl_val = self.check_headroom_to_nearest_level(c, is_ce=False, custom_pivots=day_pivots)
