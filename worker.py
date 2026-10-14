@@ -93,7 +93,6 @@ def is_market_hours():
 
 def send_telegram_alert(message: str):
     if not is_market_hours():
-        print(f"[Alert Suppressed]: Market closed, blocked: {message[:40]}...")
         return False
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -118,7 +117,7 @@ def push_to_redis(key, data_obj):
     url = f"{UPSTASH_REDIS_REST_URL}/set/{key}"
     headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
     try:
-        requests.post(url, headers=headers, data=json.dumps(data_obj), timeout=3)
+        requests.post(url, headers=headers, data=json.dumps(data_obj), timeout=2)
     except Exception:
         pass
 
@@ -177,6 +176,7 @@ class DedicatedTradingWorker:
         self.feed_token = None
         self.last_login_date = None
         self.last_polled_opt_ltp = 0.0
+        self.last_push_time = 0.0
 
         self.authenticate_angel_one()
 
@@ -203,7 +203,7 @@ class DedicatedTradingWorker:
         threading.Thread(target=self.background_option_poller, daemon=True).start()
 
         if self.candles:
-            self.sync_state(self.candles[-1]["close"])
+            self.sync_state(self.candles[-1]["close"], force=True)
 
     def authenticate_angel_one(self):
         try:
@@ -367,7 +367,6 @@ class DedicatedTradingWorker:
         orb_range_val = max(15.0, round(curr_orb_h - curr_orb_l, 2))
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
-        # Fibonacci Projections: Upside for CE or Default Standby, Downside for PE
         is_active_pe = self.locked_trade and self.locked_trade.get("type") == "PE"
         if is_active_pe:
             self.fib_lines = {
@@ -564,15 +563,20 @@ class DedicatedTradingWorker:
             return
 
         now = datetime.datetime.now(IST)
+        # Bucket strictly to 5-minute boundaries
         bucket_min = (now.minute // 5) * 5
         bar_dt = now.replace(minute=bucket_min, second=0, microsecond=0)
         t_sec = int(bar_dt.timestamp())
 
+        # If a new 5-minute candle has opened
         if self.active_bar is None or self.active_bar["time"] != t_sec:
             if self.active_bar:
                 self.candles.append(self.active_bar.copy())
                 self.run_full_strategy_pipeline()
                 self.evaluate_live_breakout()
+                self.sync_state(ltp, force=True)
+
+            # First tick of the 5-minute bucket establishes Open, High, Low, Close
             self.active_bar = {
                 "time": t_sec,
                 "open": ltp,
@@ -610,7 +614,6 @@ class DedicatedTradingWorker:
             close_time_dt = last_c["dt"].astimezone(IST) + datetime.timedelta(minutes=5)
             close_time_str = close_time_dt.strftime("%H:%M:%S")
 
-            # CE Breakout: Breakout Candle Low - 5.0
             if close_p > orb_h and prev_c["close"] <= orb_h:
                 self.trade_taken_today = True
                 strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=True)
@@ -668,7 +671,6 @@ class DedicatedTradingWorker:
                     f"⏰ <b>Trigger Time (Candle Close):</b> {close_time_str}"
                 )
 
-            # PE Breakdown: Breakout Candle High + 5.0
             elif close_p < orb_l and prev_c["close"] >= orb_l:
                 self.trade_taken_today = True
                 strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=False)
@@ -830,7 +832,13 @@ class DedicatedTradingWorker:
                 f"📅 <b>Date:</b> {date_readable} | ⏰ <b>Time:</b> {t_now}"
             )
 
-    def sync_state(self, live_ltp):
+    def sync_state(self, live_ltp, force=False):
+        now_ts = time.time()
+        # Rate-limit Redis updates to 1 second unless forced on candle closure
+        if not force and (now_ts - self.last_push_time < 1.0):
+            return
+        self.last_push_time = now_ts
+
         opt_ltp = 0.0
         if is_market_hours() and self.locked_trade and not self.locked_trade.get("closed"):
             pts_gain = (live_ltp - self.locked_trade["entry"]) if self.locked_trade["type"] == "CE" else (self.locked_trade["entry"] - live_ltp)
@@ -846,7 +854,7 @@ class DedicatedTradingWorker:
                 "vwap": c.get("vwap", c["close"]),
                 "ema9": c.get("ema9", c["close"]),
             }
-            for c in self.candles[-500:]
+            for c in self.candles[-300:]
         ]
         if self.active_bar:
             recent_candles.append({
