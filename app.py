@@ -1,28 +1,21 @@
-import html
+import streamlit as st
 import json
 import os
 import requests
-import streamlit as st
 import streamlit.components.v1 as components
 
-st.set_page_config(
-    page_title="NIFTY 50 ORB Terminal",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+st.set_page_config(layout="wide", page_title="NIFTY Live Strategy HUD", initial_sidebar_state="collapsed")
 
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
-BUDGET_CEILING_DEFAULT = float(os.getenv("BUDGET_CEILING", "80.0"))
 
-
-def read_redis_key(key: str):
+def read_from_redis():
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
         return None
-    url = f"{UPSTASH_REDIS_REST_URL}/get/{key}"
+    url = f"{UPSTASH_REDIS_REST_URL}/get/nifty_live_state"
     headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
     try:
-        r = requests.get(url, headers=headers, timeout=3)
+        r = requests.get(url, headers=headers, timeout=2)
         if r.status_code == 200:
             val = r.json().get("result")
             if val:
@@ -31,470 +24,186 @@ def read_redis_key(key: str):
         pass
     return None
 
+data = read_from_redis() or {}
+candles = data.get("candles", [])
+markers = data.get("markers", [])
+history_cards = data.get("history_cards", {})
+pivots = data.get("pivots", {})
+orb_levels = data.get("orb_levels", {})
 
-def write_redis_key(key: str, value):
-    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
-        return
-    url = f"{UPSTASH_REDIS_REST_URL}/set/{key}"
-    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
-    try:
-        requests.post(url, headers=headers, data=json.dumps(value), timeout=3)
-    except Exception:
-        pass
+# Extract Key Levels for display badges
+orb_h = orb_levels.get("orb_h", 0.0)
+orb_l = orb_levels.get("orb_l", 0.0)
+pivot_p = pivots.get("P", 0.0)
+pdh = pivots.get("PDH", 0.0)
+pdl = pivots.get("PDL", 0.0)
 
+# Header metric badges
+col1, col2, col3, col4, col5 = st.columns(5)
+with col1:
+    st.metric("ORB HIGH", f"{orb_h:.1f}")
+with col2:
+    st.metric("ORB LOW", f"{orb_l:.1f}")
+with col3:
+    st.metric("PIVOT P", f"{pivot_p:.2f}")
+with col4:
+    st.metric("PREV DAY HIGH", f"{pdh:.2f}")
+with col5:
+    st.metric("PREV DAY LOW", f"{pdl:.2f}")
 
-# -------------------------------------------------------------
-# Read Live Trading State from Redis
-# -------------------------------------------------------------
-state_data = read_redis_key("nifty_live_state") or {}
-
-ltp = float(state_data.get("ltp", 0.0))
-opt_ltp = float(state_data.get("opt_ltp", 0.0))
-candles = state_data.get("candles", [])
-markers = state_data.get("markers", [])
-history_cards = state_data.get("history_cards", {})
-pivots = state_data.get("pivots", {})
-orb_levels = state_data.get("orb_levels", {})
-fib_lines = state_data.get("fib_lines", {})
-hud = state_data.get("hud", {})
-
-trades_taken = state_data.get("trades_taken_today", 0)
-trade_history = state_data.get("trade_history_today", [])
-
-saved_budget = read_redis_key("user_selected_budget")
-current_budget = float(saved_budget) if saved_budget is not None else BUDGET_CEILING_DEFAULT
-
-# -------------------------------------------------------------
-# Header Bar & Live Point Monitor
-# -------------------------------------------------------------
-col_title, col_budget, col_refresh = st.columns([3, 2, 1])
-
-with col_title:
-    st.markdown(
-        f"<h3 style='margin:0; padding:0; color:#e0e0e0; font-family:sans-serif;'>"
-        f"NIFTY 50 Opening Range Terminal "
-        f"<span id='live_ltp_display' style='color:#00e676; font-size:22px; font-weight:bold; margin-left:10px;'>₹{ltp:.2f}</span>"
-        f"</h3>",
-        unsafe_allow_html=True,
-    )
-
-with col_budget:
-    new_budget = st.slider(
-        "Max Premium (₹)",
-        min_value=30.0,
-        max_value=150.0,
-        value=current_budget,
-        step=5.0,
-        help="Strike selector picks contracts trading closest to and below this ceiling.",
-    )
-    if new_budget != current_budget:
-        write_redis_key("user_selected_budget", new_budget)
-        st.rerun()
-
-with col_refresh:
-    if st.button("🔄 Force Refresh"):
-        st.rerun()
-
-# -------------------------------------------------------------
-# Standby Monitor or Active Trade Execution HUD Card
-# -------------------------------------------------------------
-if hud and hud.get("entry_spot"):
-    trade_type = hud.get("type", "CE")
-    badge_bg = "#00c853" if trade_type == "CE" else "#d50000"
-    symbol = hud.get("symbol", f"NIFTY {trade_type}")
-    entry_spot = float(hud.get("entry_spot", 0.0))
-    entry_opt = float(hud.get("entry_opt", 0.0))
-    trail_spot = float(hud.get("trail_spot", 0.0))
-    trail_opt = float(hud.get("trail_opt", 0.0))
-    secured_pts = float(hud.get("secured_pts", 0.0))
-    sl_spot = float(hud.get("sl_spot", 0.0))
-    sl_opt = float(hud.get("sl_opt", 0.0))
-    risk_pts = float(hud.get("risk_pts", 0.0))
-    is_closed = hud.get("trade_closed", False)
-    status_label = "CLOSED (STOP HIT)" if is_closed else f"ACTIVE RUNNER [TRADE #{trades_taken}/2]"
-
-    tg_html = ""
-    for tg in hud.get("targets", []):
-        tg_html += (
-            f"<div style='background:#1f2430; padding:6px 10px; border-radius:4px; text-align:center; min-width:110px;'>"
-            f"<div style='font-size:11px; color:#90a4ae;'>{tg.get('label')}</div>"
-            f"<div style='font-size:13px; font-weight:bold; color:#ffb74d;'>{tg.get('spot', 0.0):.1f}</div>"
-            f"<div style='font-size:11px; color:#81c784;'>₹{tg.get('opt', 0.0):.2f} (+{tg.get('pts', 0.0):.1f}p)</div>"
-            f"</div>"
-        )
-
-    st.markdown(
-        f"""
-        <div style="background:#131722; border:1px solid #2a2e39; border-radius:8px; padding:12px 16px; margin-bottom:12px;">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; flex-wrap:wrap; gap:8px;">
-                <div style="display:flex; align-items:center; gap:8px;">
-                    <span style="background:{badge_bg}; color:#fff; font-size:12px; font-weight:bold; padding:3px 8px; border-radius:4px;">{trade_type}</span>
-                    <span style="color:#ffffff; font-size:15px; font-weight:bold;">{symbol}</span>
-                    <span style="color:#787b86; font-size:12px;">(Delta: {hud.get('delta', 0.5):.2f})</span>
-                </div>
-                <div style="font-size:12px; color:{'#ff5252' if is_closed else '#00e676'}; font-weight:bold;">
-                    ● {status_label}
-                </div>
-            </div>
-            <div style="display:flex; gap:12px; align-items:stretch; flex-wrap:wrap;">
-                <div style="background:#1f2430; padding:6px 12px; border-radius:4px; min-width:130px;">
-                    <div style="font-size:11px; color:#90a4ae;">ENTRY</div>
-                    <div style="font-size:14px; font-weight:bold; color:#fff;">{entry_spot:.1f}</div>
-                    <div style="font-size:11px; color:#4fc3f7;">LTP: ₹{entry_opt:.2f}</div>
-                </div>
-                <div style="background:#1f2430; padding:6px 12px; border-radius:4px; min-width:130px;">
-                    <div style="font-size:11px; color:#90a4ae;">INITIAL SL</div>
-                    <div style="font-size:14px; font-weight:bold; color:#ef5350;">{sl_spot:.1f}</div>
-                    <div style="font-size:11px; color:#ef5350;">- {risk_pts:.1f} pts (₹{sl_opt:.2f})</div>
-                </div>
-                <div style="background:#1f2430; padding:6px 12px; border-radius:4px; min-width:130px;">
-                    <div style="font-size:11px; color:#90a4ae;">CURRENT TRAIL SL</div>
-                    <div style="font-size:14px; font-weight:bold; color:#00e676;">{trail_spot:.1f}</div>
-                    <div style="font-size:11px; color:#00e676;">{'Locked: +' if secured_pts >= 0 else 'Risk: '}{secured_pts:.1f} pts (₹{trail_opt:.2f})</div>
-                </div>
-                <div style="display:flex; gap:8px; overflow-x:auto;">
-                    {tg_html}
-                </div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-else:
-    orb_h_display = orb_levels.get("orb_h", "—")
-    orb_l_display = orb_levels.get("orb_l", "—")
-    pivot_p_display = pivots.get("P", "—")
-    pdh_display = pivots.get("PDH", "—")
-    pdl_display = pivots.get("PDL", "—")
-
-    session_status = "Awaiting Breakout Confirmation"
-    if trades_taken >= 2:
-        session_status = "Daily Limit Reached (2/2 Trades Complete)"
-    elif trades_taken == 1 and len(trade_history) > 0 and trade_history[0].get("outcome") == "PROFIT":
-        session_status = "Daily Target Secured (Trade 1 Finished in Profit)"
-
-    st.markdown(
-        f"""
-        <div style="background:#131722; border:1px solid #2a2e39; border-radius:8px; padding:12px 16px; margin-bottom:12px;">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                <span style="color:#90a4ae; font-size:13px; font-weight:bold;">STANDBY MONITOR • SESSION KEY LEVELS</span>
-                <span style="color:#787b86; font-size:12px;">{session_status}</span>
-            </div>
-            <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
-                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">ORB HIGH</div>
-                    <div style="font-size:14px; font-weight:bold; color:#00e676;">{orb_h_display}</div>
-                </div>
-                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">ORB LOW</div>
-                    <div style="font-size:14px; font-weight:bold; color:#ff5252;">{orb_l_display}</div>
-                </div>
-                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">PIVOT P</div>
-                    <div style="font-size:14px; font-weight:bold; color:#ffeb3b;">{pivot_p_display}</div>
-                </div>
-                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">PREV DAY HIGH</div>
-                    <div style="font-size:14px; font-weight:bold; color:#42a5f5;">{pdh_display}</div>
-                </div>
-                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">PREV DAY LOW</div>
-                    <div style="font-size:14px; font-weight:bold; color:#ab47bc;">{pdl_display}</div>
-                </div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-# -------------------------------------------------------------
-# Lightweight Charts Component (All Pivots P, R1-R5, S1-S5)
-# -------------------------------------------------------------
 candles_json = json.dumps(candles)
 markers_json = json.dumps(markers)
 history_cards_json = json.dumps(history_cards)
 pivots_json = json.dumps(pivots)
 orb_json = json.dumps(orb_levels)
-fib_json = json.dumps(fib_lines)
-redis_url_str = UPSTASH_REDIS_REST_URL
-redis_token_str = UPSTASH_REDIS_REST_TOKEN
 
 html_code = f"""
 <!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8" />
-  <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
-  <style>
-    body {{
-      margin: 0;
-      padding: 0;
-      background-color: #131722;
-      color: #d1d4dc;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      overflow: hidden;
-    }}
-    #chart_container {{
-      width: 100vw;
-      height: 620px;
-      position: relative;
-    }}
-    #hover_card {{
-      position: absolute;
-      display: none;
-      background: #1e222d;
-      border: 1px solid #363a45;
-      border-radius: 6px;
-      padding: 10px 14px;
-      font-size: 12px;
-      line-height: 1.5;
-      color: #d1d4dc;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
-      z-index: 1000;
-      pointer-events: none;
-      min-width: 200px;
-    }}
-  </style>
+    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        body {{
+            margin: 0;
+            padding: 0;
+            background-color: #131722;
+            color: #d1d4dc;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            overflow: hidden;
+        }}
+        #tv_chart {{
+            width: 100vw;
+            height: 85vh;
+        }}
+    </style>
 </head>
 <body>
-  <div id="chart_container">
-    <div id="hover_card"></div>
-  </div>
-
-  <script>
-    const rawCandles = {candles_json} || [];
-    const rawMarkers = {markers_json} || [];
-    const historyCards = {history_cards_json} || {{}};
-    const pivots = {pivots_json} || {{}};
-    const orbLevels = {orb_json} || {{}};
-    const fibLines = {fib_json} || {{}};
-
-    const IST_OFFSET = 19800;
-
-    const formattedCandles = rawCandles.map(c => ({{
-      time: c.time + IST_OFFSET,
-      open: c.open,
-      high: c.high,
-      low: c.low,
-      close: c.close,
-      vwap: c.vwap,
-      ema9: c.ema9
-    }}));
-
-    const formattedMarkers = rawMarkers.map(m => ({{
-      ...m,
-      time: m.time + IST_OFFSET
-    }}));
-
-    const container = document.getElementById('chart_container');
-    const hoverCard = document.getElementById('hover_card');
-
-    const chart = LightweightCharts.createChart(container, {{
-      width: container.clientWidth,
-      height: 620,
-      layout: {{
-        background: {{ color: '#131722' }},
-        textColor: '#d1d4dc',
-      }},
-      grid: {{
-        vertLines: {{ color: '#1f2430' }},
-        horzLines: {{ color: '#1f2430' }},
-      }},
-      crosshair: {{
-        mode: LightweightCharts.CrosshairMode.Normal,
-      }},
-      rightPriceScale: {{
-        borderColor: '#2a2e39',
-        autoScale: true,
-      }},
-      timeScale: {{
-        borderColor: '#2a2e39',
-        timeVisible: true,
-        secondsVisible: false,
-      }},
-    }});
-
-    const candleSeries = chart.addCandlestickSeries({{
-      upColor: '#089981',
-      downColor: '#f23645',
-      borderVisible: false,
-      wickUpColor: '#089981',
-      wickDownColor: '#f23645',
-    }});
-    candleSeries.setData(formattedCandles);
-
-    const vwapSeries = chart.addLineSeries({{
-      color: '#ff9800',
-      lineWidth: 2,
-      priceLineVisible: false,
-      title: 'VWAP',
-    }});
-    vwapSeries.setData(formattedCandles.filter(d => d.vwap).map(d => ({{ time: d.time, value: d.vwap }})));
-
-    const emaSeries = chart.addLineSeries({{
-      color: '#2962ff',
-      lineWidth: 1,
-      priceLineVisible: false,
-      title: 'EMA 9',
-    }});
-    emaSeries.setData(formattedCandles.filter(d => d.ema9).map(d => ({{ time: d.time, value: d.ema9 }})));
-
-    if (formattedMarkers.length > 0) {{
-      candleSeries.setMarkers(formattedMarkers);
-    }}
-
-    const visiblePivots = {{
-      'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
-      'R1':  {{ color: '#ef5350', title: 'R1' }},
-      'R2':  {{ color: '#e53935', title: 'R2' }},
-      'R3':  {{ color: '#d32f2f', title: 'R3' }},
-      'R4':  {{ color: '#c62828', title: 'R4' }},
-      'R5':  {{ color: '#b71c1c', title: 'R5' }},
-      'S1':  {{ color: '#26a69a', title: 'S1' }},
-      'S2':  {{ color: '#00897b', title: 'S2' }},
-      'S3':  {{ color: '#00796b', title: 'S3' }},
-      'S4':  {{ color: '#00695c', title: 'S4' }},
-      'S5':  {{ color: '#004d40', title: 'S5' }},
-      'PDH': {{ color: '#42a5f5', title: 'PDH' }},
-      'PDL': {{ color: '#ab47bc', title: 'PDL' }},
-    }};
-
-    Object.entries(pivots).forEach(([k, val]) => {{
-      if (val && visiblePivots[k]) {{
-        candleSeries.createPriceLine({{
-          price: parseFloat(val),
-          color: visiblePivots[k].color,
-          lineWidth: 1,
-          lineStyle: LightweightCharts.LineStyle.Dashed,
-          axisLabelVisible: true,
-          title: visiblePivots[k].title,
-        }});
-      }}
-    }});
-
-    if (orbLevels && orbLevels.orb_h) {{
-      candleSeries.createPriceLine({{
-        price: parseFloat(orbLevels.orb_h),
-        color: '#00e676',
-        lineWidth: 2,
-        lineStyle: LightweightCharts.LineStyle.Solid,
-        axisLabelVisible: true,
-        title: 'ORB HIGH',
-      }});
-    }}
-    if (orbLevels && orbLevels.orb_l) {{
-      candleSeries.createPriceLine({{
-        price: parseFloat(orbLevels.orb_l),
-        color: '#ff5252',
-        lineWidth: 2,
-        lineStyle: LightweightCharts.LineStyle.Solid,
-        axisLabelVisible: true,
-        title: 'ORB LOW',
-      }});
-    }}
-
-    if (fibLines) {{
-      const fibTitles = {{
-        'fib_100': 'FIB 100',
-        'fib_161': 'FIB 161',
-        'fib_261': 'FIB 261'
-      }};
-      Object.entries(fibLines).forEach(([fKey, fVal]) => {{
-        if (fVal && fibTitles[fKey]) {{
-          candleSeries.createPriceLine({{
-            price: parseFloat(fVal),
-            color: '#b388ff',
-            lineWidth: 1,
-            lineStyle: LightweightCharts.LineStyle.Dotted,
-            axisLabelVisible: true,
-            title: fibTitles[fKey],
-          }});
-        }}
-      }});
-    }}
-
-    if (formattedCandles.length > 0) {{
-      chart.timeScale().fitContent();
-    }}
-
-    chart.subscribeCrosshairMove(param => {{
-      if (!param || !param.time || !param.point) {{
-        hoverCard.style.display = 'none';
-        return;
-      }}
-      const rawSecKey = String(param.time - IST_OFFSET);
-      const cardData = historyCards[rawSecKey] || historyCards[String(param.time)];
-      if (cardData) {{
-        const isCe = cardData.type === 'CE';
-        const color = isCe ? '#00e676' : '#ff5252';
-        let targetsHtml = '';
-        if (cardData.targets && cardData.targets.length > 0) {{
-          targetsHtml = '<div style="margin-top:4px; font-size:11px; color:#90a4ae;"><b>Targets:</b> ' +
-            cardData.targets.slice(0, 4).join(', ') + '</div>';
-        }}
-        hoverCard.innerHTML = `
-          <div style="font-weight:bold; color:${{color}}; margin-bottom:4px;">${{cardData.title}}</div>
-          <div><b>Time:</b> ${{cardData.time_str}} | ${{cardData.date_readable || ''}}</div>
-          <div><b>Entry:</b> ${{cardData.entry}} | <b>SL:</b> ${{cardData.sl}}</div>
-          <div><b>Status:</b> ${{cardData.outcome || 'ACTIVE'}}</div>
-          ${{targetsHtml}}
-        `;
-        hoverCard.style.display = 'block';
-        hoverCard.style.left = Math.min(param.point.x + 15, container.clientWidth - 220) + 'px';
-        hoverCard.style.top = Math.max(param.point.y - 70, 10) + 'px';
-      }} else {{
-        hoverCard.style.display = 'none';
-      }}
-    }});
-
-    const redisUrl = "{redis_url_str}";
-    const redisToken = "{redis_token_str}";
-
-    if (redisUrl && redisToken) {{
-      setInterval(async () => {{
-        try {{
-          const res = await fetch(redisUrl + '/get/nifty_live_state', {{
-            headers: {{ 'Authorization': 'Bearer ' + redisToken }}
-          }});
-          if (res.ok) {{
-            const dataObj = await res.json();
-            if (dataObj && dataObj.result) {{
-              const liveState = JSON.parse(dataObj.result);
-              if (liveState && liveState.candles && liveState.candles.length > 0) {{
-                const latestCandle = liveState.candles[liveState.candles.length - 1];
-                const shiftedCandle = {{
-                  time: latestCandle.time + IST_OFFSET,
-                  open: latestCandle.open,
-                  high: latestCandle.high,
-                  low: latestCandle.low,
-                  close: latestCandle.close
-                }};
-                candleSeries.update(shiftedCandle);
-                if (latestCandle.vwap) {{
-                  vwapSeries.update({{ time: shiftedCandle.time, value: latestCandle.vwap }});
-                }}
-                if (latestCandle.ema9) {{
-                  emaSeries.update({{ time: shiftedCandle.time, value: latestCandle.ema9 }});
-                }}
-              }}
-              if (liveState && liveState.ltp) {{
-                const el = window.parent.document.getElementById('live_ltp_display');
-                if (el) {{
-                  el.innerText = '₹' + Number(liveState.ltp).toFixed(2);
-                }}
-              }}
+    <div id="tv_chart"></div>
+    <script>
+        const chartContainer = document.getElementById('tv_chart');
+        const chart = LightweightCharts.createChart(chartContainer, {{
+            layout: {{
+                backgroundColor: '#131722',
+                textColor: '#d1d4dc',
+            }},
+            grid: {{
+                vertLines: {{ color: '#1f2434' }},
+                horzLines: {{ color: '#1f2434' }},
+            }},
+            timeScale: {{
+                timeVisible: true,
+                secondsVisible: false,
+            }},
+            rightPriceScale: {{
+                borderColor: '#2b2f3e',
             }}
-          }}
-        }} catch (err) {{}}
-      }}, 1000);
-    }}
+        }});
 
-    window.addEventListener('resize', () => {{
-      chart.applyOptions({{ width: container.clientWidth }});
-    }});
-  </script>
+        const candleSeries = chart.addCandlestickSeries({{
+            upColor: '#089981',
+            downColor: '#f23645',
+            borderVisible: false,
+            wickUpColor: '#089981',
+            wickDownColor: '#f23645',
+        }});
+
+        const vwapSeries = chart.addLineSeries({{
+            color: '#ff9800',
+            lineWidth: 2,
+            title: 'VWAP',
+        }});
+
+        const emaSeries = chart.addLineSeries({{
+            color: '#2962ff',
+            lineWidth: 2,
+            title: 'EMA 9',
+        }});
+
+        const rawCandles = {candles_json};
+        const rawMarkers = {markers_json};
+        const pivots = {pivots_json};
+        const orb = {orb_json};
+
+        if (rawCandles && rawCandles.length > 0) {{
+            const cData = [];
+            const vData = [];
+            const eData = [];
+
+            rawCandles.forEach(c => {{
+                cData.push({{ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close }});
+                if (c.vwap) vData.push({{ time: c.time, value: c.vwap }});
+                if (c.ema9) eData.push({{ time: c.time, value: c.ema9 }});
+            }});
+
+            candleSeries.setData(cData);
+            vwapSeries.setData(vData);
+            emaSeries.setData(eData);
+
+            if (rawMarkers && rawMarkers.length > 0) {{
+                candleSeries.setMarkers(rawMarkers);
+            }}
+
+            // Draw ORB Lines
+            if (orb.orb_h) {{
+                candleSeries.createPriceLine({{
+                    price: orb.orb_h,
+                    color: '#089981',
+                    lineWidth: 2,
+                    lineStyle: LightweightCharts.LineStyle.Solid,
+                    axisLabelVisible: true,
+                    title: 'ORB HIGH',
+                }});
+            }}
+            if (orb.orb_l) {{
+                candleSeries.createPriceLine({{
+                    price: orb.orb_l,
+                    color: '#f23645',
+                    lineWidth: 2,
+                    lineStyle: LightweightCharts.LineStyle.Solid,
+                    axisLabelVisible: true,
+                    title: 'ORB LOW',
+                }});
+            }}
+
+            // Draw Pivot Lines
+            if (pivots.P) {{
+                candleSeries.createPriceLine({{
+                    price: pivots.P,
+                    color: '#fbc02d',
+                    lineWidth: 1,
+                    lineStyle: LightweightCharts.LineStyle.Dashed,
+                    axisLabelVisible: true,
+                    title: 'Pivot P',
+                }});
+            }}
+            if (pivots.PDH) {{
+                candleSeries.createPriceLine({{
+                    price: pivots.PDH,
+                    color: '#29b6f6',
+                    lineWidth: 1,
+                    lineStyle: LightweightCharts.LineStyle.Dotted,
+                    axisLabelVisible: true,
+                    title: 'PDH',
+                }});
+            }}
+            if (pivots.PDL) {{
+                candleSeries.createPriceLine({{
+                    price: pivots.PDL,
+                    color: '#ab47bc',
+                    lineWidth: 1,
+                    lineStyle: LightweightCharts.LineStyle.Dotted,
+                    axisLabelVisible: true,
+                    title: 'PDL',
+                }});
+            }}
+        }}
+
+        window.addEventListener('resize', () => {{
+            chart.applyOptions({{ width: window.innerWidth, height: window.innerHeight * 0.85 }});
+        }});
+    </script>
 </body>
 </html>
 """
 
-components.html(html_code, height=640)
+components.html(html_code, height=720)
