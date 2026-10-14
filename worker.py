@@ -186,26 +186,20 @@ class DedicatedTradingWorker:
 
         self.authenticate_angel_one()
 
-        saved_state = read_from_redis("nifty_live_state") or {}
-        self.history_cards = saved_state.get("history_cards", {})
-        self.markers = saved_state.get("markers", [])
-
         today_str = self.today.strftime("%Y-%m-%d")
-        now_time = datetime.datetime.now(IST).time()
+        saved_state = read_from_redis("nifty_live_state") or {}
 
-        if now_time > datetime.time(15, 30) or now_time < datetime.time(9, 15):
-            self.locked_trade = None
-            self.trades_taken_today = saved_state.get("trades_taken_today", 0) if saved_state.get("trade_date") == today_str else 0
-            self.trade_history_today = saved_state.get("trade_history_today", []) if saved_state.get("trade_date") == today_str else []
-        else:
-            if saved_state.get("trade_date") == today_str:
-                self.trades_taken_today = saved_state.get("trades_taken_today", 0)
-                self.trade_history_today = saved_state.get("trade_history_today", [])
-                if not saved_state.get("trade_closed", False):
-                    self.locked_trade = saved_state.get("locked_trade")
+        # Only retain live positions if within current active market day
+        if is_market_hours() and saved_state.get("trade_date") == today_str:
+            self.trades_taken_today = saved_state.get("trades_taken_today", 0)
+            self.trade_history_today = saved_state.get("trade_history_today", [])
+            if not saved_state.get("trade_closed", False):
+                self.locked_trade = saved_state.get("locked_trade")
 
         self.nfo_df = self.load_scrip_master()
         self.init_historical_candles()
+        
+        # Fresh recalculation of all markers (clears previous bad simulations)
         self.run_full_strategy_pipeline()
 
         threading.Thread(target=self.background_option_poller, daemon=True).start()
@@ -435,7 +429,7 @@ class DedicatedTradingWorker:
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
         # -------------------------------------------------------------
-        # SYNCHRONIZED HISTORICAL SIMULATOR (ZERO DUPLICATE SIGNALS)
+        # SYNCHRONIZED HISTORICAL SIMULATOR (COMPLETELY RESETS MARKERS)
         # -------------------------------------------------------------
         self.markers = []
         self.history_cards = {}
@@ -445,6 +439,7 @@ class DedicatedTradingWorker:
             if len(day_bars) < 4:
                 continue
 
+            # ORB formed by strictly the first 3 candles (09:15, 09:20, 09:25)
             ow = day_bars.iloc[0:3]
             d_h = round(float(ow["high"].max()), 2)
             d_l = round(float(ow["low"].min()), 2)
@@ -483,17 +478,15 @@ class DedicatedTradingWorker:
                 t_sec = int(r["time"])
                 candle_close_time = (r["dt"].astimezone(IST) + datetime.timedelta(minutes=5)).strftime("%H:%M")
 
-                # 1. TRADE LIFECYCLE MANAGEMENT (Strict single-active-trade lock)
+                # 1. TRADE LIFECYCLE MANAGEMENT (Active trade locks out fresh entries)
                 if sim_active_trade is not None:
                     is_ce_sim = (sim_active_trade["type"] == "CE")
 
-                    # Hard Stop Loss / Trailing Stop verification
                     if is_ce_sim and l <= sim_active_trade["sl"]:
-                        sim_active_trade = None  # Trade officially closed
+                        sim_active_trade = None  # Hit SL / Exited
                     elif (not is_ce_sim) and h >= sim_active_trade["sl"]:
-                        sim_active_trade = None  # Trade officially closed
+                        sim_active_trade = None  # Hit SL / Exited
 
-                    # Trailing update if position survived
                     if sim_active_trade is not None:
                         targets = sim_active_trade["targets"]
                         for i_tg, tg_val in enumerate(targets, start=1):
@@ -504,14 +497,14 @@ class DedicatedTradingWorker:
                                         sim_active_trade["sl"] = sim_active_trade["entry"] + (2.0 if is_ce_sim else -2.0)
                                     else:
                                         sim_active_trade["sl"] = targets[i_tg - 2]
-                        # Position is still active. Skip to next candle.
+                        # Position is still active. Skip to next candle completely!
                         continue
 
                 # 2. FRESH ENTRY CHECKS
                 if day_trade_count >= 2:
                     continue
 
-                # Hard Execution Windows: No entries allowed during 11:15 to 12:45 Midday Dead Zone
+                # Strict windows (NO trades during Midday Dead Zone 11:15 to 12:45)
                 in_w1 = datetime.time(9, 30) <= t_open <= datetime.time(11, 15)
                 in_w2 = datetime.time(12, 45) <= t_open <= datetime.time(13, 45)
 
@@ -536,9 +529,9 @@ class DedicatedTradingWorker:
 
                 if in_w1:
                     min_headroom_req = 25.0
-                    # Initial breakout triggers at 09:30 AM close immediately
+                    # The very first breakout candle (09:30 AM close at index 3) triggers immediately
                     orb_ce = (c > d_h and prev_c <= d_h and c > vw)
-                    # Absorption Breakout (if previous candle was already above and pushing past resistance)
+                    # Absorption of resistance level
                     sec_ce = (c > d_h and prev_c > d_h and c > vw and c > em and (c - d_h) >= 4.0)
 
                     if orb_ce or sec_ce:
@@ -562,7 +555,7 @@ class DedicatedTradingWorker:
                     if abs(c - day_open_val) > 280.0 or (day_pdc > 0 and abs(c - day_pdc) > 280.0):
                         continue
 
-                    # Window 2: Requires breakout of the entire day's HOD / LOD
+                    # Window 2 requires taking out the entire day's extreme HOD/LOD
                     orb_break_ce = (c > d_h and prev_c <= d_h)
                     hod_break_ce = (c > m_hod and prev_c <= m_hod and c > d_h)
                     if (orb_break_ce or hod_break_ce) and c > vw + 4.0 and c > em:
