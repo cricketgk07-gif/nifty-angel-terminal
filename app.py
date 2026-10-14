@@ -58,6 +58,9 @@ orb_levels = state_data.get("orb_levels", {})
 fib_lines = state_data.get("fib_lines", {})
 hud = state_data.get("hud", {})
 
+trades_taken = state_data.get("trades_taken_today", 0)
+trade_history = state_data.get("trade_history_today", [])
+
 saved_budget = read_redis_key("user_selected_budget")
 current_budget = float(saved_budget) if saved_budget is not None else BUDGET_CEILING_DEFAULT
 
@@ -108,7 +111,7 @@ if hud and hud.get("entry_spot"):
     sl_opt = float(hud.get("sl_opt", 0.0))
     risk_pts = float(hud.get("risk_pts", 0.0))
     is_closed = hud.get("trade_closed", False)
-    status_label = "CLOSED (STOP HIT)" if is_closed else "ACTIVE RUNNER"
+    status_label = "CLOSED (STOP HIT)" if is_closed else f"ACTIVE RUNNER [TRADE #{trades_taken}/2]"
 
     tg_html = ""
     for tg in hud.get("targets", []):
@@ -164,12 +167,18 @@ else:
     pdh_display = pivots.get("PDH", "—")
     pdl_display = pivots.get("PDL", "—")
 
+    session_status = "Awaiting Breakout Confirmation"
+    if trades_taken >= 2:
+        session_status = "Daily Limit Reached (2/2 Trades Complete)"
+    elif trades_taken == 1 and len(trade_history) > 0 and trade_history[0].get("outcome") == "PROFIT":
+        session_status = "Daily Target Secured (Trade 1 Finished in Profit)"
+
     st.markdown(
         f"""
         <div style="background:#131722; border:1px solid #2a2e39; border-radius:8px; padding:12px 16px; margin-bottom:12px;">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
                 <span style="color:#90a4ae; font-size:13px; font-weight:bold;">STANDBY MONITOR • SESSION KEY LEVELS</span>
-                <span style="color:#787b86; font-size:12px;">Awaiting Breakout Confirmation</span>
+                <span style="color:#787b86; font-size:12px;">{session_status}</span>
             </div>
             <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
                 <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
@@ -438,7 +447,6 @@ html_code = f"""
       }}
     }});
 
-    // 1-Second Direct Redis Poller for Live Sync
     const redisUrl = "{redis_url_str}";
     const redisToken = "{redis_token_str}";
 
