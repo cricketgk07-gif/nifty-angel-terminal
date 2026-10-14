@@ -437,7 +437,7 @@ class DedicatedTradingWorker:
         # -------------------------------------------------------------
         # SYNCHRONIZED HISTORICAL TRADE SIMULATOR
         # 1. Day-specific ORB extracted strictly from its first 3 bars
-        # 2. First trade must physically be stopped out before Trade 2 can enter
+        # 2. Strict active-trade lock: Trade 1 must physically exit before Trade 2 can enter
         # -------------------------------------------------------------
         self.markers = []
         self.history_cards = {}
@@ -485,17 +485,17 @@ class DedicatedTradingWorker:
                 t_sec = int(r["time"])
                 candle_close_time = (r["dt"].astimezone(IST) + datetime.timedelta(minutes=5)).strftime("%H:%M")
 
-                # Track active trade exit or trailing
+                # 1. ACTIVE TRADE LIFECYCLE MANAGEMENT
                 if sim_active_trade is not None:
                     is_ce_sim = (sim_active_trade["type"] == "CE")
 
-                    # Hard check: Did candle low/high hit stop loss?
+                    # Check Stop Loss hit
                     if is_ce_sim and l <= sim_active_trade["sl"]:
-                        sim_active_trade = None
+                        sim_active_trade = None  # Trade officially closed
                     elif (not is_ce_sim) and h >= sim_active_trade["sl"]:
-                        sim_active_trade = None
+                        sim_active_trade = None  # Trade officially closed
 
-                    # If still open, trail stop on target reach
+                    # If still open, manage trailing stop progression
                     if sim_active_trade is not None:
                         targets = sim_active_trade["targets"]
                         for i_tg, tg_val in enumerate(targets, start=1):
@@ -506,10 +506,10 @@ class DedicatedTradingWorker:
                                         sim_active_trade["sl"] = sim_active_trade["entry"] + (2.0 if is_ce_sim else -2.0)
                                     else:
                                         sim_active_trade["sl"] = targets[i_tg - 2]
-                        # Position still open: Block any fresh entry
+                        # Position is STILL OPEN. Skip directly to the next bar!
                         continue
 
-                # Fresh Trade Evaluation (Only when NO trade is active and under daily limit)
+                # 2. FRESH ENTRY CHECKS (Only runs if NO trade is active)
                 if day_trade_count >= 2:
                     continue
 
@@ -523,7 +523,7 @@ class DedicatedTradingWorker:
                 c_range = max(1.0, h - l)
                 b_ratio = abs(c - o) / c_range
 
-                if b_ratio < 0.55:
+                if b_ratio < 0.50:
                     continue
 
                 prior_bars = day_bars.iloc[:idx]
@@ -537,8 +537,10 @@ class DedicatedTradingWorker:
 
                 if in_w1:
                     min_headroom_req = 25.0
-                    orb_ce = (c > d_h and prev_c <= d_h and c > vw and c > em)
-                    sec_ce = (c > d_h and c > vw and c > em and (c - d_h) >= 4.0 and prev_c <= d_h)
+                    # Initial ORB Breakout triggers immediately on crossing ORB High + VWAP
+                    orb_ce = (c > d_h and prev_c <= d_h and c > vw)
+                    # Absorption Breakout (if previous was already above and pushing)
+                    sec_ce = (c > d_h and prev_c > d_h and c > vw and c > em and (c - d_h) >= 4.0)
 
                     if orb_ce or sec_ce:
                         hd, near_name, lvl_val = self.check_headroom_to_nearest_level(c, is_ce=True, custom_pivots=day_pivots, custom_orb=day_orb)
@@ -546,8 +548,8 @@ class DedicatedTradingWorker:
                             ce_cand = True
                             sl_val = round(l - 5.0, 1)
 
-                    orb_pe = (c < d_l and prev_c >= d_l and c < vw and c < em)
-                    sec_pe = (c < d_l and c < vw and c < em and (d_l - c) >= 4.0 and prev_c >= d_l)
+                    orb_pe = (c < d_l and prev_c >= d_l and c < vw)
+                    sec_pe = (c < d_l and prev_c < d_l and c < vw and c < em and (d_l - c) >= 4.0)
 
                     if orb_pe or sec_pe:
                         hd, near_name, lvl_val = self.check_headroom_to_nearest_level(c, is_ce=False, custom_pivots=day_pivots, custom_orb=day_orb)
@@ -799,7 +801,7 @@ class DedicatedTradingWorker:
         session_lod = float(df_curr["low"].min())
         session_range = session_hod - session_lod
 
-        if body_ratio < 0.55:
+        if body_ratio < 0.50:
             return
         if session_range > (0.85 * self.daily_atr):
             return
@@ -814,8 +816,8 @@ class DedicatedTradingWorker:
 
         if in_w1:
             min_headroom_req = 25.0
-            orb_ce = (close_p > orb_h and prev_c["close"] <= orb_h and close_p > vwap_val and close_p > ema9_val)
-            sec_ce = (close_p > orb_h and close_p > vwap_val and close_p > ema9_val and (close_p - orb_h) >= 4.0 and prev_c["close"] <= orb_h)
+            orb_ce = (close_p > orb_h and prev_c["close"] <= orb_h and close_p > vwap_val)
+            sec_ce = (close_p > orb_h and prev_c["close"] > orb_h and close_p > vwap_val and close_p > ema9_val and (close_p - orb_h) >= 4.0)
 
             if orb_ce or sec_ce:
                 hd, near_res, lvl_val = self.check_headroom_to_nearest_level(close_p, is_ce=True)
@@ -824,8 +826,8 @@ class DedicatedTradingWorker:
                     setup_title = "ORB HIGH BREAKOUT"
                     init_sl = round(float(last_c["low"]) - 5.0, 1)
 
-            orb_pe = (close_p < orb_l and prev_c["close"] >= orb_l and close_p < vwap_val and close_p < ema9_val)
-            sec_pe = (close_p < orb_l and close_p < vwap_val and close_p < ema9_val and (orb_l - close_p) >= 4.0 and prev_c["close"] >= orb_l)
+            orb_pe = (close_p < orb_l and prev_c["close"] >= orb_l and close_p < vwap_val)
+            sec_pe = (close_p < orb_l and prev_c["close"] < orb_l and close_p < vwap_val and close_p < ema9_val and (orb_l - close_p) >= 4.0)
 
             if orb_pe or sec_pe:
                 hd, near_sup, lvl_val = self.check_headroom_to_nearest_level(close_p, is_ce=False)
@@ -919,7 +921,7 @@ class DedicatedTradingWorker:
                 f"• <b>STOP LOSS:</b> {init_sl:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b> (-₹{total_risk_inr})\n"
                 f"{tg_lines}"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🛡 <b>SL Anchor:</b> Structure Validated ± 5.0 pts\n"
+                f"🛡 <b>SL Anchor:</b> Breakout Low - 5.0 pts\n"
                 f"📅 <b>Session Date:</b> {date_readable}\n"
                 f"⏰ <b>Trigger Time (Candle Close):</b> {close_time_str}"
             )
@@ -984,7 +986,7 @@ class DedicatedTradingWorker:
                 f"• <b>STOP LOSS:</b> {init_sl:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b> (-₹{total_risk_inr})\n"
                 f"{tg_lines}"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🛡 <b>SL Anchor:</b> Structure Validated ± 5.0 pts\n"
+                f"🛡 <b>SL Anchor:</b> Breakout High + 5.0 pts\n"
                 f"📅 <b>Session Date:</b> {date_readable}\n"
                 f"⏰ <b>Trigger Time (Candle Close):</b> {close_time_str}"
             )
