@@ -326,6 +326,7 @@ class DedicatedTradingWorker:
         orb_l = orb.get("orb_l", entry_p)
         orb_rng = orb.get("range", 25.0)
 
+        # Real structural levels (excluding synthetic intra-range lines)
         all_levels = {}
         for k, v in p.items():
             if v is not None:
@@ -358,35 +359,29 @@ class DedicatedTradingWorker:
 
         day_open = float(df_slice.iloc[0]["open"])
         c_open_dist = abs(live_close - day_open)
-        if c_open_dist > 220.0:
+        if c_open_dist > 280.0:
             return False, f"Exhaustion Trap: Moved {c_open_dist:.1f} pts from Open"
 
         if self.prev_day_close > 0:
             pdc_dist = abs(live_close - self.prev_day_close)
-            if pdc_dist > 250.0:
+            if pdc_dist > 280.0:
                 return False, f"Exhaustion Trap: Moved {pdc_dist:.1f} pts from PDC"
 
         ema_3ago = float(df_slice.iloc[-3]["ema9"])
         if is_ce:
             ema_slope = ema9_val - ema_3ago
-            if ema_slope < 3.5:
+            if ema_slope < 3.0:
                 return False, f"Flat EMA9 slope ({ema_slope:.1f} pts)"
             vwap_gap = live_close - vwap_val
-            if vwap_gap < 8.0:
+            if vwap_gap < 5.0:
                 return False, f"Tight VWAP gap ({vwap_gap:.1f} pts)"
-            c_5ago = float(df_slice.iloc[-5]["close"])
-            if (live_close - c_5ago) < 20.0:
-                return False, "Recent 25-min velocity < 20 pts"
         else:
             ema_slope = ema_3ago - ema9_val
-            if ema_slope < 3.5:
+            if ema_slope < 3.0:
                 return False, f"Flat EMA9 downward slope ({ema_slope:.1f} pts)"
             vwap_gap = vwap_val - live_close
-            if vwap_gap < 8.0:
+            if vwap_gap < 5.0:
                 return False, f"Tight VWAP gap ({vwap_gap:.1f} pts)"
-            c_5ago = float(df_slice.iloc[-5]["close"])
-            if (c_5ago - live_close) < 20.0:
-                return False, "Recent 25-min velocity < 20 pts"
 
         return True, "Momentum Validated"
 
@@ -441,21 +436,13 @@ class DedicatedTradingWorker:
                     "PDL": pdl,
                 }
 
-        today_bars = df_h[df_h["date_str"] == unique_days[-1]]
+        today_bars = df_h[df_h["date_str"] == unique_days[-1]].sort_values("time").reset_index(drop=True)
         if len(today_bars) > 0:
             self.session_open_price = float(today_bars.iloc[0]["open"])
 
-        today_bars_ist_time = today_bars["dt"].apply(lambda d: d.astimezone(IST).time())
-        orb_window = today_bars[(today_bars_ist_time >= datetime.time(9, 15)) & (today_bars_ist_time < datetime.time(9, 30))]
-
-        if len(orb_window) >= 3:
-            curr_orb_h = round(float(orb_window["high"].max()), 2)
-            curr_orb_l = round(float(orb_window["low"].min()), 2)
-        else:
-            first_three = today_bars.iloc[0:3] if len(today_bars) >= 3 else today_bars
-            curr_orb_h = round(float(first_three["high"].max()), 2)
-            curr_orb_l = round(float(first_three["low"].min()), 2)
-
+        orb_bars = today_bars.iloc[0:3] if len(today_bars) >= 3 else today_bars
+        curr_orb_h = round(float(orb_bars["high"].max()), 2)
+        curr_orb_l = round(float(orb_bars["low"].min()), 2)
         orb_range_val = max(15.0, round(curr_orb_h - curr_orb_l, 2))
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
@@ -481,13 +468,14 @@ class DedicatedTradingWorker:
         self.history_cards = {}
 
         for d_str, day_df in df_h.groupby("date_str"):
-            day_times = day_df["dt"].apply(lambda d: d.astimezone(IST).time())
-            ow = day_df[(day_times >= datetime.time(9, 15)) & (day_times < datetime.time(9, 30))]
-            if len(ow) < 3:
+            day_bars = day_df.sort_values("time").reset_index(drop=True)
+            if len(day_bars) < 4:
                 continue
 
-            d_h = float(ow["high"].max())
-            d_l = float(ow["low"].min())
+            # Lock ORB to the first 3 candles (09:15, 09:20, 09:25)
+            ow = day_bars.iloc[0:3]
+            d_h = round(float(ow["high"].max()), 2)
+            d_l = round(float(ow["low"].min()), 2)
             d_rng = max(15.0, round(d_h - d_l, 2))
             day_orb = {"orb_h": d_h, "orb_l": d_l, "range": d_rng}
 
@@ -511,8 +499,9 @@ class DedicatedTradingWorker:
             day_trade_count = 0
             sim_active_trade = None
 
-            for idx in range(len(day_df)):
-                r = day_df.iloc[idx]
+            # Scan starting from the 09:30 AM candle (index 3)
+            for idx in range(3, len(day_bars)):
+                r = day_bars.iloc[idx]
                 t_open = r["dt"].astimezone(IST).time()
                 c = float(r["close"])
                 o = float(r["open"])
@@ -552,16 +541,16 @@ class DedicatedTradingWorker:
                 if not (in_w1 or in_w2):
                     continue
 
-                prev_c = float(day_df.iloc[idx - 1]["close"]) if idx > 0 else c
+                prev_c = float(day_bars.iloc[idx - 1]["close"])
                 c_range = max(1.0, h - l)
                 b_ratio = abs(c - o) / c_range
 
-                if b_ratio < 0.60:
+                if b_ratio < 0.55:
                     continue
 
-                prior_bars = day_df.iloc[:idx]
-                m_hod = float(prior_bars["high"].max()) if len(prior_bars) > 0 else d_h
-                m_lod = float(prior_bars["low"].min()) if len(prior_bars) > 0 else d_l
+                prior_bars = day_bars.iloc[:idx]
+                m_hod = float(prior_bars["high"].max())
+                m_lod = float(prior_bars["low"].min())
 
                 ce_cand = False
                 pe_cand = False
@@ -570,59 +559,53 @@ class DedicatedTradingWorker:
 
                 if in_w1:
                     min_headroom_req = 25.0
-                    orb_ce = (c > d_h and prev_c <= d_h and c > vw + 3.0 and c > em)
-                    hd_temp, near_k, near_lvl_p = self.check_headroom_to_nearest_level(c, is_ce=True, custom_pivots=day_pivots, custom_orb=day_orb)
-                    sec_ce = (c > d_h and prev_c > d_h and near_lvl_p > 0 and c > near_lvl_p and prev_c <= near_lvl_p and c > vw + 3.0 and c > em)
+                    orb_ce = (c > d_h and prev_c <= d_h and c > vw and c > em)
+                    sec_ce = (c > d_h and c > vw and c > em and (c - d_h) >= 4.0)
 
                     if orb_ce or sec_ce:
                         hd, near_name, lvl_val = self.check_headroom_to_nearest_level(c, is_ce=True, custom_pivots=day_pivots, custom_orb=day_orb)
                         if hd >= min_headroom_req:
                             ce_cand = True
-                            if sec_ce and lvl_val > 0:
+                            if sec_ce and lvl_val > 0 and abs(c - lvl_val) <= 25.0:
                                 sl_val = max(round(lvl_val - 5.0, 1), round(l - 5.0, 1))
 
-                    orb_pe = (c < d_l and prev_c >= d_l and c < vw - 3.0 and c < em)
-                    hd_temp_pe, near_k_pe, near_lvl_pe = self.check_headroom_to_nearest_level(c, is_ce=False, custom_pivots=day_pivots, custom_orb=day_orb)
-                    sec_pe = (c < d_l and prev_c < d_l and near_lvl_pe > 0 and c < near_lvl_pe and prev_c >= near_lvl_pe and c < vw - 3.0 and c < em)
+                    orb_pe = (c < d_l and prev_c >= d_l and c < vw and c < em)
+                    sec_pe = (c < d_l and c < vw and c < em and (d_l - c) >= 4.0)
 
                     if orb_pe or sec_pe:
                         hd, near_name, lvl_val = self.check_headroom_to_nearest_level(c, is_ce=False, custom_pivots=day_pivots, custom_orb=day_orb)
                         if hd >= min_headroom_req:
                             pe_cand = True
-                            if sec_pe and lvl_val > 0:
+                            if sec_pe and lvl_val > 0 and abs(c - lvl_val) <= 25.0:
                                 sl_val = min(round(lvl_val + 5.0, 1), round(h + 5.0, 1))
                             else:
                                 sl_val = round(h + 5.0, 1)
 
                 elif in_w2:
                     min_headroom_req = 50.0
-                    day_open_val = float(day_df.iloc[0]["open"])
-                    if abs(c - day_open_val) > 220.0 or (day_pdc > 0 and abs(c - day_pdc) > 250.0):
+                    day_open_val = float(day_bars.iloc[0]["open"])
+                    if abs(c - day_open_val) > 280.0 or (day_pdc > 0 and abs(c - day_pdc) > 280.0):
                         continue
 
-                    if idx >= 5:
-                        c_5ago = float(day_df.iloc[idx - 5]["close"])
-                        ema_3ago = float(day_df.iloc[idx - 3]["ema9"])
+                    orb_break_ce = (c > d_h and prev_c <= d_h)
+                    hod_break_ce = (c > m_hod and prev_c <= m_hod and c > d_h)
+                    if (orb_break_ce or hod_break_ce) and c > vw + 4.0 and c > em:
+                        hd, _, _ = self.check_headroom_to_nearest_level(c, is_ce=True, custom_pivots=day_pivots, custom_orb=day_orb)
+                        if hd >= min_headroom_req:
+                            ce_cand = True
+                            sl_val = round(l - 5.0, 1)
 
-                        orb_break_ce = (c > d_h and prev_c <= d_h)
-                        hod_break_ce = (c > m_hod and prev_c <= m_hod and c > d_h)
-                        if (orb_break_ce or hod_break_ce) and c > vw + 8.0 and (c - c_5ago) >= 20.0 and (em - ema_3ago) >= 3.5:
-                            hd, _, _ = self.check_headroom_to_nearest_level(c, is_ce=True, custom_pivots=day_pivots, custom_orb=day_orb)
-                            if hd >= min_headroom_req:
-                                ce_cand = True
-                                sl_val = round(l - 5.0, 1)
-
-                        orb_break_pe = (c < d_l and prev_c >= d_l)
-                        lod_break_pe = (c < m_lod and prev_c >= m_lod and c < d_l)
-                        if (orb_break_pe or lod_break_pe) and c < vw - 8.0 and (c_5ago - c) >= 20.0 and (ema_3ago - em) >= 3.5:
-                            hd, _, _ = self.check_headroom_to_nearest_level(c, is_ce=False, custom_pivots=day_pivots, custom_orb=day_orb)
-                            if hd >= min_headroom_req:
-                                pe_cand = True
-                                sl_val = round(h + 5.0, 1)
+                    orb_break_pe = (c < d_l and prev_c >= d_l)
+                    lod_break_pe = (c < m_lod and prev_c >= m_lod and c < d_l)
+                    if (orb_break_pe or lod_break_pe) and c < vw - 4.0 and c < em:
+                        hd, _, _ = self.check_headroom_to_nearest_level(c, is_ce=False, custom_pivots=day_pivots, custom_orb=day_orb)
+                        if hd >= min_headroom_req:
+                            pe_cand = True
+                            sl_val = round(h + 5.0, 1)
 
                 if ce_cand:
                     day_trade_count += 1
-                    t_list = self.compute_all_confluence_targets(day_df.iloc[:idx+1], c, is_ce=True, custom_pivots=day_pivots, custom_orb=day_orb)
+                    t_list = self.compute_all_confluence_targets(day_bars.iloc[:idx+1], c, is_ce=True, custom_pivots=day_pivots, custom_orb=day_orb)
 
                     self.markers.append({
                         "time": t_sec,
@@ -647,7 +630,7 @@ class DedicatedTradingWorker:
 
                 elif pe_cand:
                     day_trade_count += 1
-                    t_list = self.compute_all_confluence_targets(day_df.iloc[:idx+1], c, is_ce=False, custom_pivots=day_pivots, custom_orb=day_orb)
+                    t_list = self.compute_all_confluence_targets(day_bars.iloc[:idx+1], c, is_ce=False, custom_pivots=day_pivots, custom_orb=day_orb)
 
                     self.markers.append({
                         "time": t_sec,
@@ -808,7 +791,7 @@ class DedicatedTradingWorker:
         if not is_market_hours():
             return
 
-        if self.locked_trade or self.trades_taken_today >= 2 or len(self.candles) < 5:
+        if self.locked_trade or self.trades_taken_today >= 2 or len(self.candles) < 4:
             return
 
         last_c = self.candles[-1]
@@ -842,7 +825,7 @@ class DedicatedTradingWorker:
         session_lod = float(df_curr["low"].min())
         session_range = session_hod - session_lod
 
-        if body_ratio < 0.60:
+        if body_ratio < 0.55:
             return
         if session_range > (0.85 * self.daily_atr):
             return
@@ -857,30 +840,26 @@ class DedicatedTradingWorker:
 
         if in_w1:
             min_headroom_req = 25.0
-            # 1. Direct ORB Breakout
-            orb_ce = (close_p > orb_h and prev_c["close"] <= orb_h and close_p > vwap_val + 3.0 and close_p > ema9_val)
-            # 2. Level Absorption Breakout
-            hd_p, near_k, near_lvl_p = self.check_headroom_to_nearest_level(close_p, is_ce=True)
-            sec_ce = (close_p > orb_h and prev_c["close"] > orb_h and near_lvl_p > 0 and close_p > near_lvl_p and prev_c["close"] <= near_lvl_p and close_p > vwap_val + 3.0 and close_p > ema9_val)
+            orb_ce = (close_p > orb_h and prev_c["close"] <= orb_h and close_p > vwap_val and close_p > ema9_val)
+            sec_ce = (close_p > orb_h and close_p > vwap_val and close_p > ema9_val and (close_p - orb_h) >= 4.0)
 
             if orb_ce or sec_ce:
                 hd, near_res, lvl_val = self.check_headroom_to_nearest_level(close_p, is_ce=True)
                 if hd >= min_headroom_req:
                     ce_candidate = True
                     setup_title = "RESISTANCE ABSORPTION BREAKOUT" if sec_ce else "ORB HIGH BREAKOUT"
-                    if sec_ce and lvl_val > 0:
+                    if sec_ce and lvl_val > 0 and abs(close_p - lvl_val) <= 25.0:
                         init_sl = max(round(lvl_val - 5.0, 1), round(float(last_c["low"]) - 5.0, 1))
 
-            orb_pe = (close_p < orb_l and prev_c["close"] >= orb_l and close_p < vwap_val - 3.0 and close_p < ema9_val)
-            hd_pe, near_k_pe, near_lvl_pe = self.check_headroom_to_nearest_level(close_p, is_ce=False)
-            sec_pe = (close_p < orb_l and prev_c["close"] < orb_l and near_lvl_pe > 0 and close_p < near_lvl_pe and prev_c["close"] >= near_lvl_pe and close_p < vwap_val - 3.0 and close_p < ema9_val)
+            orb_pe = (close_p < orb_l and prev_c["close"] >= orb_l and close_p < vwap_val and close_p < ema9_val)
+            sec_pe = (close_p < orb_l and close_p < vwap_val and close_p < ema9_val and (orb_l - close_p) >= 4.0)
 
             if orb_pe or sec_pe:
                 hd, near_sup, lvl_val = self.check_headroom_to_nearest_level(close_p, is_ce=False)
                 if hd >= min_headroom_req:
                     pe_candidate = True
                     setup_title = "SUPPORT ABSORPTION BREAKDOWN" if sec_pe else "ORB LOW BREAKDOWN"
-                    if sec_pe and lvl_val > 0:
+                    if sec_pe and lvl_val > 0 and abs(close_p - lvl_val) <= 25.0:
                         init_sl = min(round(lvl_val + 5.0, 1), round(float(last_c["high"]) + 5.0, 1))
                     else:
                         init_sl = round(float(last_c["high"]) + 5.0, 1)
@@ -892,7 +871,7 @@ class DedicatedTradingWorker:
 
             if is_orb_ce or is_hod_ce:
                 passed, reason = self.verify_window2_momentum_possibility(df_curr, True, close_p, vwap_val, ema9_val)
-                if passed and close_p > vwap_val + 8.0 and close_p > ema9_val:
+                if passed and close_p > vwap_val + 4.0 and close_p > ema9_val:
                     hd, near_res, _ = self.check_headroom_to_nearest_level(close_p, is_ce=True)
                     if hd >= min_headroom_req:
                         ce_candidate = True
@@ -904,7 +883,7 @@ class DedicatedTradingWorker:
 
             if is_orb_pe or is_lod_pe:
                 passed, reason = self.verify_window2_momentum_possibility(df_curr, False, close_p, vwap_val, ema9_val)
-                if passed and close_p < vwap_val - 8.0 and close_p < ema9_val:
+                if passed and close_p < vwap_val - 4.0 and close_p < ema9_val:
                     hd, near_sup, _ = self.check_headroom_to_nearest_level(close_p, is_ce=False)
                     if hd >= min_headroom_req:
                         pe_candidate = True
