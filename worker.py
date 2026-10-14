@@ -319,7 +319,7 @@ class DedicatedTradingWorker:
 
         return valid
 
-    def check_headroom_to_nearest_level(self, entry_p, is_ce, custom_pivots=None, custom_orb=None):
+    def check_headroom_to_nearest_level(self, entry_p, is_ce, custom_pivots=None):
         p = custom_pivots or self.pivot_lines
         all_levels = {}
         for k, v in p.items():
@@ -435,9 +435,7 @@ class DedicatedTradingWorker:
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
         # -------------------------------------------------------------
-        # SYNCHRONIZED HISTORICAL TRADE SIMULATOR
-        # 1. Day-specific ORB extracted strictly from its first 3 bars
-        # 2. Strict active-trade lock: Trade 1 must physically exit before Trade 2 can enter
+        # SYNCHRONIZED HISTORICAL SIMULATOR (ZERO DUPLICATE SIGNALS)
         # -------------------------------------------------------------
         self.markers = []
         self.history_cards = {}
@@ -485,17 +483,17 @@ class DedicatedTradingWorker:
                 t_sec = int(r["time"])
                 candle_close_time = (r["dt"].astimezone(IST) + datetime.timedelta(minutes=5)).strftime("%H:%M")
 
-                # 1. ACTIVE TRADE LIFECYCLE MANAGEMENT
+                # 1. TRADE LIFECYCLE MANAGEMENT (Strict single-active-trade lock)
                 if sim_active_trade is not None:
                     is_ce_sim = (sim_active_trade["type"] == "CE")
 
-                    # Check Stop Loss hit
+                    # Hard Stop Loss / Trailing Stop verification
                     if is_ce_sim and l <= sim_active_trade["sl"]:
                         sim_active_trade = None  # Trade officially closed
                     elif (not is_ce_sim) and h >= sim_active_trade["sl"]:
                         sim_active_trade = None  # Trade officially closed
 
-                    # If still open, manage trailing stop progression
+                    # Trailing update if position survived
                     if sim_active_trade is not None:
                         targets = sim_active_trade["targets"]
                         for i_tg, tg_val in enumerate(targets, start=1):
@@ -506,13 +504,14 @@ class DedicatedTradingWorker:
                                         sim_active_trade["sl"] = sim_active_trade["entry"] + (2.0 if is_ce_sim else -2.0)
                                     else:
                                         sim_active_trade["sl"] = targets[i_tg - 2]
-                        # Position is STILL OPEN. Skip directly to the next bar!
+                        # Position is still active. Skip to next candle.
                         continue
 
-                # 2. FRESH ENTRY CHECKS (Only runs if NO trade is active)
+                # 2. FRESH ENTRY CHECKS
                 if day_trade_count >= 2:
                     continue
 
+                # Hard Execution Windows: No entries allowed during 11:15 to 12:45 Midday Dead Zone
                 in_w1 = datetime.time(9, 30) <= t_open <= datetime.time(11, 15)
                 in_w2 = datetime.time(12, 45) <= t_open <= datetime.time(13, 45)
 
@@ -537,13 +536,13 @@ class DedicatedTradingWorker:
 
                 if in_w1:
                     min_headroom_req = 25.0
-                    # Initial ORB Breakout triggers immediately on crossing ORB High + VWAP
+                    # Initial breakout triggers at 09:30 AM close immediately
                     orb_ce = (c > d_h and prev_c <= d_h and c > vw)
-                    # Absorption Breakout (if previous was already above and pushing)
+                    # Absorption Breakout (if previous candle was already above and pushing past resistance)
                     sec_ce = (c > d_h and prev_c > d_h and c > vw and c > em and (c - d_h) >= 4.0)
 
                     if orb_ce or sec_ce:
-                        hd, near_name, lvl_val = self.check_headroom_to_nearest_level(c, is_ce=True, custom_pivots=day_pivots, custom_orb=day_orb)
+                        hd, near_name, lvl_val = self.check_headroom_to_nearest_level(c, is_ce=True, custom_pivots=day_pivots)
                         if hd >= min_headroom_req:
                             ce_cand = True
                             sl_val = round(l - 5.0, 1)
@@ -552,7 +551,7 @@ class DedicatedTradingWorker:
                     sec_pe = (c < d_l and prev_c < d_l and c < vw and c < em and (d_l - c) >= 4.0)
 
                     if orb_pe or sec_pe:
-                        hd, near_name, lvl_val = self.check_headroom_to_nearest_level(c, is_ce=False, custom_pivots=day_pivots, custom_orb=day_orb)
+                        hd, near_name, lvl_val = self.check_headroom_to_nearest_level(c, is_ce=False, custom_pivots=day_pivots)
                         if hd >= min_headroom_req:
                             pe_cand = True
                             sl_val = round(h + 5.0, 1)
@@ -563,10 +562,11 @@ class DedicatedTradingWorker:
                     if abs(c - day_open_val) > 280.0 or (day_pdc > 0 and abs(c - day_pdc) > 280.0):
                         continue
 
+                    # Window 2: Requires breakout of the entire day's HOD / LOD
                     orb_break_ce = (c > d_h and prev_c <= d_h)
                     hod_break_ce = (c > m_hod and prev_c <= m_hod and c > d_h)
                     if (orb_break_ce or hod_break_ce) and c > vw + 4.0 and c > em:
-                        hd, _, _ = self.check_headroom_to_nearest_level(c, is_ce=True, custom_pivots=day_pivots, custom_orb=day_orb)
+                        hd, _, _ = self.check_headroom_to_nearest_level(c, is_ce=True, custom_pivots=day_pivots)
                         if hd >= min_headroom_req:
                             ce_cand = True
                             sl_val = round(l - 5.0, 1)
@@ -574,7 +574,7 @@ class DedicatedTradingWorker:
                     orb_break_pe = (c < d_l and prev_c >= d_l)
                     lod_break_pe = (c < m_lod and prev_c >= m_lod and c < d_l)
                     if (orb_break_pe or lod_break_pe) and c < vw - 4.0 and c < em:
-                        hd, _, _ = self.check_headroom_to_nearest_level(c, is_ce=False, custom_pivots=day_pivots, custom_orb=day_orb)
+                        hd, _, _ = self.check_headroom_to_nearest_level(c, is_ce=False, custom_pivots=day_pivots)
                         if hd >= min_headroom_req:
                             pe_cand = True
                             sl_val = round(h + 5.0, 1)
