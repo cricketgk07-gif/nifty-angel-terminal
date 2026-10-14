@@ -189,7 +189,7 @@ class DedicatedTradingWorker:
         today_str = self.today.strftime("%Y-%m-%d")
         saved_state = read_from_redis("nifty_live_state") or {}
 
-        # Reset in-memory marker dictionaries to eliminate stale cached arrows
+        # In-memory clean wipe of cached markers
         self.markers = []
         self.history_cards = {}
 
@@ -336,38 +336,6 @@ class DedicatedTradingWorker:
             dist = round(entry_p - underneath[nearest_k], 1)
             return dist, nearest_k, underneath[nearest_k]
 
-    def verify_window2_momentum_possibility(self, df_slice, is_ce, live_close, vwap_val, ema9_val):
-        if len(df_slice) < 5:
-            return False, "Insufficient history"
-
-        day_open = float(df_slice.iloc[0]["open"])
-        c_open_dist = abs(live_close - day_open)
-        if c_open_dist > 280.0:
-            return False, f"Exhaustion Trap: Moved {c_open_dist:.1f} pts from Open"
-
-        if self.prev_day_close > 0:
-            pdc_dist = abs(live_close - self.prev_day_close)
-            if pdc_dist > 280.0:
-                return False, f"Exhaustion Trap: Moved {pdc_dist:.1f} pts from PDC"
-
-        ema_3ago = float(df_slice.iloc[-3]["ema9"])
-        if is_ce:
-            ema_slope = ema9_val - ema_3ago
-            if ema_slope < 3.0:
-                return False, f"Flat EMA9 slope ({ema_slope:.1f} pts)"
-            vwap_gap = live_close - vwap_val
-            if vwap_gap < 5.0:
-                return False, f"Tight VWAP gap ({vwap_gap:.1f} pts)"
-        else:
-            ema_slope = ema_3ago - ema9_val
-            if ema_slope < 3.0:
-                return False, f"Flat EMA9 downward slope ({ema_slope:.1f} pts)"
-            vwap_gap = vwap_val - live_close
-            if vwap_gap < 5.0:
-                return False, f"Tight VWAP gap ({vwap_gap:.1f} pts)"
-
-        return True, "Momentum Validated"
-
     def run_full_strategy_pipeline(self):
         if not self.candles:
             return
@@ -429,7 +397,7 @@ class DedicatedTradingWorker:
         orb_range_val = max(15.0, round(curr_orb_h - curr_orb_l, 2))
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
-        # Reset markers and recompute historical bars
+        # Reset markers and recompute historical bars cleanly
         self.markers = []
         self.history_cards = {}
 
@@ -527,20 +495,27 @@ class DedicatedTradingWorker:
 
                 if in_w1:
                     min_headroom_req = 25.0
-                    # The very first breakout candle (09:30 AM close at index 3) triggers immediately
-                    orb_ce = (c > d_h and prev_c <= d_h and c > vw)
-                    sec_ce = (c > d_h and prev_c > d_h and c > vw and c > em and (c - d_h) >= 4.0 and idx <= 5)
 
-                    if orb_ce or sec_ce:
+                    # 1. Primary ORB Breakout (e.g. Oct 9 Yellow Tick @ 09:30 AM close)
+                    orb_ce = (c > d_h and prev_c <= d_h and c > vw)
+                    orb_pe = (c < d_l and prev_c >= d_l and c < vw)
+
+                    # 2. Structural Level Breakdown / LOD Continuation (e.g. Oct 12 Green Tick @ 22459.8)
+                    lod_break_pe = (c < m_lod and prev_c >= m_lod and c < d_l and c < vw and c < em)
+
+                    # EXHAUSTION FILTER (Blocks Oct 14 Red Cross @ 22561.8):
+                    # Do not enter if current 3-candle sequence has already collapsed > 110 pts vertically
+                    bars_3_high = float(day_bars.iloc[max(0, idx - 2):idx + 1]["high"].max())
+                    bars_3_low = float(day_bars.iloc[max(0, idx - 2):idx + 1]["low"].min())
+                    is_climax_spike = (bars_3_high - bars_3_low) > 110.0
+
+                    if orb_ce and not is_climax_spike:
                         hd, near_name, lvl_val = self.check_headroom_to_nearest_level(c, is_ce=True, custom_pivots=day_pivots)
                         if hd >= min_headroom_req:
                             ce_cand = True
                             sl_val = round(l - 5.0, 1)
 
-                    orb_pe = (c < d_l and prev_c >= d_l and c < vw)
-                    sec_pe = (c < d_l and prev_c < d_l and c < vw and c < em and (d_l - c) >= 4.0 and idx <= 5)
-
-                    if orb_pe or sec_pe:
+                    if (orb_pe or lod_break_pe) and not is_climax_spike:
                         hd, near_name, lvl_val = self.check_headroom_to_nearest_level(c, is_ce=False, custom_pivots=day_pivots)
                         if hd >= min_headroom_req:
                             pe_cand = True
@@ -553,17 +528,16 @@ class DedicatedTradingWorker:
                         continue
 
                     # Window 2 requires taking out the entire day's extreme HOD/LOD
-                    orb_break_ce = (c > d_h and prev_c <= d_h)
-                    hod_break_ce = (c > m_hod and prev_c <= m_hod and c > d_h)
-                    if (orb_break_ce or hod_break_ce) and c > vw + 4.0 and c > em:
+                    hod_break_ce = (c > m_hod and prev_c <= m_hod and c > d_h and c > vw + 4.0 and c > em)
+                    lod_break_pe = (c < m_lod and prev_c >= m_lod and c < d_l and c < vw - 4.0 and c < em)
+
+                    if hod_break_ce:
                         hd, _, _ = self.check_headroom_to_nearest_level(c, is_ce=True, custom_pivots=day_pivots)
                         if hd >= min_headroom_req:
                             ce_cand = True
                             sl_val = round(l - 5.0, 1)
 
-                    orb_break_pe = (c < d_l and prev_c >= d_l)
-                    lod_break_pe = (c < m_lod and prev_c >= m_lod and c < d_l)
-                    if (orb_break_pe or lod_break_pe) and c < vw - 4.0 and c < em:
+                    if lod_break_pe:
                         hd, _, _ = self.check_headroom_to_nearest_level(c, is_ce=False, custom_pivots=day_pivots)
                         if hd >= min_headroom_req:
                             pe_cand = True
@@ -807,50 +781,49 @@ class DedicatedTradingWorker:
         if in_w1:
             min_headroom_req = 25.0
             orb_ce = (close_p > orb_h and prev_c["close"] <= orb_h and close_p > vwap_val)
-            sec_ce = (close_p > orb_h and prev_c["close"] > orb_h and close_p > vwap_val and close_p > ema9_val and (close_p - orb_h) >= 4.0)
+            orb_pe = (close_p < orb_l and prev_c["close"] >= orb_l and close_p < vwap_val)
+            lod_break_pe = (close_p < session_lod_prior and prev_c["close"] >= session_lod_prior and close_p < orb_l and close_p < vwap_val and close_p < ema9_val)
 
-            if orb_ce or sec_ce:
+            bars_3_high = float(df_curr.iloc[-3:]["high"].max()) if len(df_curr) >= 3 else high_p
+            bars_3_low = float(df_curr.iloc[-3:]["low"].min()) if len(df_curr) >= 3 else low_p
+            is_climax_spike = (bars_3_high - bars_3_low) > 110.0
+
+            if orb_ce and not is_climax_spike:
                 hd, near_res, lvl_val = self.check_headroom_to_nearest_level(close_p, is_ce=True)
                 if hd >= min_headroom_req:
                     ce_candidate = True
                     setup_title = "ORB HIGH BREAKOUT"
                     init_sl = round(float(last_c["low"]) - 5.0, 1)
 
-            orb_pe = (close_p < orb_l and prev_c["close"] >= orb_l and close_p < vwap_val)
-            sec_pe = (close_p < orb_l and prev_c["close"] < orb_l and close_p < vwap_val and close_p < ema9_val and (orb_l - close_p) >= 4.0)
-
-            if orb_pe or sec_pe:
+            if (orb_pe or lod_break_pe) and not is_climax_spike:
                 hd, near_sup, lvl_val = self.check_headroom_to_nearest_level(close_p, is_ce=False)
                 if hd >= min_headroom_req:
                     pe_candidate = True
-                    setup_title = "ORB LOW BREAKDOWN"
+                    setup_title = "SUPPORT LEVEL BREAKDOWN" if lod_break_pe else "ORB LOW BREAKDOWN"
                     init_sl = round(float(last_c["high"]) + 5.0, 1)
 
         elif in_w2:
             min_headroom_req = 50.0
-            is_orb_ce = (close_p > orb_h and prev_c["close"] <= orb_h)
-            is_hod_ce = (close_p > session_hod_prior and prev_c["close"] <= session_hod_prior and close_p > orb_h)
+            day_open_val = float(df_curr.iloc[0]["open"])
+            if abs(close_p - day_open_val) > 280.0 or (self.prev_day_close > 0 and abs(close_p - self.prev_day_close) > 280.0):
+                return
 
-            if is_orb_ce or is_hod_ce:
-                passed, reason = self.verify_window2_momentum_possibility(df_curr, True, close_p, vwap_val, ema9_val)
-                if passed and close_p > vwap_val + 4.0 and close_p > ema9_val:
-                    hd, near_res, _ = self.check_headroom_to_nearest_level(close_p, is_ce=True)
-                    if hd >= min_headroom_req:
-                        ce_candidate = True
-                        setup_title = "HOD RESISTANCE CONTINUATION" if is_hod_ce else "ORB HIGH BREAKOUT"
-                        init_sl = round(float(last_c["low"]) - 5.0, 1)
+            hod_break_ce = (close_p > session_hod_prior and prev_c["close"] <= session_hod_prior and close_p > orb_h and close_p > vwap_val + 4.0 and close_p > ema9_val)
+            lod_break_pe = (close_p < session_lod_prior and prev_c["close"] >= session_lod_prior and close_p < orb_l and close_p < vwap_val - 4.0 and close_p < ema9_val)
 
-            is_orb_pe = (close_p < orb_l and prev_c["close"] >= orb_l)
-            is_lod_pe = (close_p < session_lod_prior and prev_c["close"] >= session_lod_prior and close_p < orb_l)
+            if hod_break_ce:
+                hd, near_res, _ = self.check_headroom_to_nearest_level(close_p, is_ce=True)
+                if hd >= min_headroom_req:
+                    ce_candidate = True
+                    setup_title = "HOD BREAKOUT"
+                    init_sl = round(float(last_c["low"]) - 5.0, 1)
 
-            if is_orb_pe or is_lod_pe:
-                passed, reason = self.verify_window2_momentum_possibility(df_curr, False, close_p, vwap_val, ema9_val)
-                if passed and close_p < vwap_val - 4.0 and close_p < ema9_val:
-                    hd, near_sup, _ = self.check_headroom_to_nearest_level(close_p, is_ce=False)
-                    if hd >= min_headroom_req:
-                        pe_candidate = True
-                        setup_title = "LOD SUPPORT CONTINUATION" if is_lod_pe else "ORB LOW BREAKDOWN"
-                        init_sl = round(float(last_c["high"]) + 5.0, 1)
+            if lod_break_pe:
+                hd, near_sup, _ = self.check_headroom_to_nearest_level(close_p, is_ce=False)
+                if hd >= min_headroom_req:
+                    pe_candidate = True
+                    setup_title = "LOD BREAKDOWN"
+                    init_sl = round(float(last_c["high"]) + 5.0, 1)
 
         if ce_candidate:
             self.trades_taken_today += 1
