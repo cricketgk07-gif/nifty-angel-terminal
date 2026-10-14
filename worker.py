@@ -276,6 +276,9 @@ class DedicatedTradingWorker:
         except Exception as e:
             print(f"[Candles Error]: {e}")
 
+    # =============================================================
+    # Confluence Targets & Dynamic Runway Engine
+    # =============================================================
     def compute_all_confluence_targets(self, df_h, entry_p, is_ce):
         recent_swing_h = float(df_h["high"].iloc[-20:].max())
         recent_swing_l = float(df_h["low"].iloc[-20:].min())
@@ -285,7 +288,7 @@ class DedicatedTradingWorker:
         orb_rng = self.orb_levels.get("range", 25.0)
 
         p = self.pivot_lines
-        min_filter = 25.0
+        min_runway = 25.0
 
         if is_ce:
             candidates = [
@@ -297,7 +300,7 @@ class DedicatedTradingWorker:
                 p.get("PDH"),
                 recent_swing_h,
             ]
-            valid = sorted(list(set([round(x, 1) for x in candidates if x is not None and x >= entry_p + min_filter])))
+            valid = sorted(list(set([round(x, 1) for x in candidates if x is not None and x >= entry_p + min_runway])))
             if not valid:
                 valid = [round(entry_p + 40.0, 1), round(entry_p + 75.0, 1), round(entry_p + 120.0, 1)]
         else:
@@ -310,11 +313,45 @@ class DedicatedTradingWorker:
                 p.get("PDL"),
                 recent_swing_l,
             ]
-            valid = sorted(list(set([round(x, 1) for x in candidates if x is not None and x <= entry_p - min_filter])), reverse=True)
+            valid = sorted(list(set([round(x, 1) for x in candidates if x is not None and x <= entry_p - min_runway])), reverse=True)
             if not valid:
                 valid = [round(entry_p - 40.0, 1), round(entry_p - 75.0, 1), round(entry_p - 120.0, 1)]
 
         return valid
+
+    def check_headroom_to_nearest_level(self, entry_p, is_ce):
+        """
+        Calculates distance from entry to the immediately preceding resistance/support.
+        Suppresses entry if distance < 25.0 index points.
+        """
+        p = self.pivot_lines
+        orb_h = self.orb_levels.get("orb_h", entry_p)
+        orb_l = self.orb_levels.get("orb_l", entry_p)
+        orb_rng = self.orb_levels.get("range", 25.0)
+
+        all_levels = {}
+        for k, v in p.items():
+            if v is not None:
+                all_levels[k] = float(v)
+
+        all_levels["FIB_100"] = orb_h + (1.000 * orb_rng) if is_ce else orb_l - (1.000 * orb_rng)
+        all_levels["FIB_161"] = orb_h + (1.618 * orb_rng) if is_ce else orb_l - (1.618 * orb_rng)
+        all_levels["FIB_261"] = orb_h + (2.618 * orb_rng) if is_ce else orb_l - (2.618 * orb_rng)
+
+        if is_ce:
+            overhead = {k: v for k, v in all_levels.items() if v > entry_p}
+            if not overhead:
+                return 999.0, "CLEAR SKY"
+            nearest_k = min(overhead, key=overhead.get)
+            dist = round(overhead[nearest_k] - entry_p, 1)
+            return dist, nearest_k
+        else:
+            underneath = {k: v for k, v in all_levels.items() if v < entry_p}
+            if not underneath:
+                return 999.0, "OPEN FLOOR"
+            nearest_k = max(underneath, key=underneath.get)
+            dist = round(entry_p - underneath[nearest_k], 1)
+            return dist, nearest_k
 
     def run_full_strategy_pipeline(self):
         if not self.candles:
@@ -333,7 +370,6 @@ class DedicatedTradingWorker:
         df_h["vwap"] = (df_h["cum_pv"] / df_h["cum_vol"]).round(2)
         df_h["ema9"] = df_h["close"].ewm(span=9, adjust=False).mean().round(2)
 
-        # 5-Minute ATR Calculation
         tr1 = df_h["high"] - df_h["low"]
         tr2 = (df_h["high"] - df_h["close"].shift(1)).abs()
         tr3 = (df_h["low"] - df_h["close"].shift(1)).abs()
@@ -382,7 +418,6 @@ class DedicatedTradingWorker:
         orb_range_val = max(15.0, round(curr_orb_h - curr_orb_l, 2))
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
-        # Dynamic Fibonacci Projections (Upside vs Downside)
         latest_c = float(self.candles[-1]["close"]) if self.candles else curr_orb_h
         midpoint = (curr_orb_h + curr_orb_l) / 2.0
         is_pe_context = (self.locked_trade and self.locked_trade.get("type") == "PE") or (not self.locked_trade and latest_c < midpoint)
@@ -400,7 +435,7 @@ class DedicatedTradingWorker:
                 "fib_261": round(curr_orb_h + (2.618 * orb_range_val), 1),
             }
 
-        # Historical backtest scan for chart marker cards
+        # Backtest marker scan
         for d_str, day_df in df_h.groupby("date_str"):
             day_times = day_df["dt"].apply(lambda d: d.astimezone(IST).time())
             ow = day_df[(day_times >= datetime.time(9, 15)) & (day_times < datetime.time(9, 30))]
@@ -480,7 +515,6 @@ class DedicatedTradingWorker:
                             "outcome": "HISTORICAL",
                         }
 
-        # Active Trade HUD Card
         if is_market_hours() and self.locked_trade and not self.locked_trade.get("closed"):
             tr = self.locked_trade
             t_type = tr["type"]
@@ -647,52 +681,70 @@ class DedicatedTradingWorker:
         orb_h = self.orb_levels.get("orb_h", 999999)
         orb_l = self.orb_levels.get("orb_l", 0)
 
-        # 4. CHOP & MEGAPHONE GUARDS FOR TRADE #2
-        is_trade_2 = (self.trades_taken_today == 1)
+        pdh_val = self.pivot_lines.get("PDH", 999999)
+        pdl_val = self.pivot_lines.get("PDL", 0)
+
+        # Prior High / Low of Day (before current candle)
+        df_curr = pd.DataFrame(self.candles)
+        df_prior = df_curr.iloc[:-1]
+        session_hod_prior = float(df_prior["high"].max()) if len(df_prior) > 0 else orb_h
+        session_lod_prior = float(df_prior["low"].min()) if len(df_prior) > 0 else orb_l
+
         candle_range = max(1.0, high_p - low_p)
         body_ratio = abs(close_p - open_p) / candle_range
 
-        df_curr = pd.DataFrame(self.candles)
         session_hod = float(df_curr["high"].max())
         session_lod = float(df_curr["low"].min())
         session_range = session_hod - session_lod
 
-        if is_trade_2:
-            # Candle Body Ratio >= 60% filter (no large wick traps)
-            if body_ratio < 0.60:
-                return
-
-            # ATR Exhaustion Filter: Avoid second trade if day range is already blown out
-            if session_range > (0.85 * self.daily_atr):
-                return
-
-        date_readable = last_c["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)")
-        close_time_dt = last_c["dt"].astimezone(IST) + datetime.timedelta(minutes=5)
-        close_time_str = close_time_dt.strftime("%H:%M:%S")
+        # Signal Health Checks: Body Ratio >= 60% and Daily ATR Guard
+        if body_ratio < 0.60:
+            return
+        if session_range > (0.85 * self.daily_atr):
+            return
 
         trade_num = self.trades_taken_today + 1
-        window_label = "WINDOW 1 (MORNING DRIVE)" if in_w1 else "WINDOW 2 (AFTERNOON EXPANSION)"
+        is_trade_2 = (self.trades_taken_today == 1)
 
         # -------------------------------------------------------------
-        # CE Breakout Check (Scenario A, B, or D)
+        # CE Breakout / Continuation Evaluation (ORB High, PDH, or HOD)
         # -------------------------------------------------------------
-        ce_breakout = (close_p > orb_h and prev_c["close"] <= orb_h and close_p > vwap_val and close_p > ema9_val)
-        if is_trade_2:
-            ce_breakout = ce_breakout and (close_p >= vwap_val + 3.0)
+        is_orb_ce = (close_p > orb_h and prev_c["close"] <= orb_h)
+        is_pdh_ce = (close_p > pdh_val and prev_c["close"] <= pdh_val)
+        is_hod_ce = (close_p > session_hod_prior and prev_c["close"] <= session_hod_prior and close_p > orb_h)
 
-        if ce_breakout:
+        ce_candidate = (is_orb_ce or is_pdh_ce or is_hod_ce) and (close_p > vwap_val + 3.0) and (close_p > ema9_val)
+
+        if ce_candidate:
+            # Headroom / Runway Check: Must have >= 25 pts before next overhead resistance
+            headroom, nearest_res = self.check_headroom_to_nearest_level(close_p, is_ce=True)
+            if headroom < 25.0:
+                print(f"[Engine Filter]: CE Suppressed. Insufficient headroom ({headroom:.1f} pts) to {nearest_res}.")
+                return
+
             self.trades_taken_today += 1
             strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=True)
 
-            # Initial SL = Breakout Candle Low - 5.0 pts
             init_sl = round(float(last_c["low"]) - 5.0, 1)
-
             opt_ltp = self.last_polled_opt_ltp if self.last_polled_opt_ltp > 0 else 75.0
             risk_pts = round(close_p - init_sl, 1)
             opt_sl = max(0.5, round(opt_ltp - (risk_pts * delta), 2))
 
             targets = self.compute_all_confluence_targets(df_curr, close_p, is_ce=True)
-            scenario_tag = "ORB BREAKOUT" if trade_num == 1 else "RE-BREAKOUT / CONTINUATION"
+
+            if is_pdh_ce:
+                setup_title = "PREVIOUS DAY HIGH (PDH) BREAKOUT"
+            elif is_hod_ce and not is_orb_ce:
+                setup_title = "HOD RESISTANCE BREAKOUT"
+            elif trade_num == 1:
+                setup_title = "ORB BREAKOUT"
+            else:
+                setup_title = "RE-BREAKOUT / CONTINUATION"
+
+            date_readable = last_c["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)")
+            close_time_dt = last_c["dt"].astimezone(IST) + datetime.timedelta(minutes=5)
+            close_time_str = close_time_dt.strftime("%H:%M:%S")
+            window_label = "WINDOW 1 (MORNING DRIVE)" if in_w1 else "WINDOW 2 (AFTERNOON EXPANSION)"
 
             self.locked_trade = {
                 "type": "CE",
@@ -726,9 +778,10 @@ class DedicatedTradingWorker:
                 tg_lines += f"• <b>TARGET {i_tg}:</b> {tg_val:.1f} (+{pts_d:.1f} pts) | <b>₹{opt_d:.2f}</b> (+₹{inr_d})\n"
 
             send_telegram_alert(
-                f"🚀 <b>{scenario_tag}: BUY CE [TRADE #{trade_num}/2]</b>\n"
+                f"🚀 <b>{setup_title}: BUY CE [TRADE #{trade_num}/2]</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"<b>SESSION:</b> {window_label}\n"
+                f"<b>HEADROOM:</b> +{headroom:.1f} pts to {nearest_res} (CLEAR)\n"
                 f"<b>CONTRACT:</b> {sym}\n"
                 f"<b>MODE:</b> Budget (&lt; ₹{budget_val}) | <b>QTY:</b> {LOT_SIZE_QTY} (Δ: {delta:.2f})\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -744,25 +797,44 @@ class DedicatedTradingWorker:
             return
 
         # -------------------------------------------------------------
-        # PE Breakdown Check (Scenario A, B, E, or Immediate Reversal)
+        # PE Breakdown / Continuation Evaluation (ORB Low, PDL, or LOD)
         # -------------------------------------------------------------
-        pe_breakdown = (close_p < orb_l and prev_c["close"] >= orb_l and close_p < vwap_val and close_p < ema9_val)
-        if is_trade_2:
-            pe_breakdown = pe_breakdown and (close_p <= vwap_val - 3.0)
+        is_orb_pe = (close_p < orb_l and prev_c["close"] >= orb_l)
+        is_pdl_pe = (close_p < pdl_val and prev_c["close"] >= pdl_val)
+        is_lod_pe = (close_p < session_lod_prior and prev_c["close"] >= session_lod_prior and close_p < orb_l)
 
-        if pe_breakdown:
+        pe_candidate = (is_orb_pe or is_pdl_pe or is_lod_pe) and (close_p <= vwap_val - 3.0) and (close_p < ema9_val)
+
+        if pe_candidate:
+            # Headroom / Runway Check: Must have >= 25 pts before next underlying support
+            headroom, nearest_sup = self.check_headroom_to_nearest_level(close_p, is_ce=False)
+            if headroom < 25.0:
+                print(f"[Engine Filter]: PE Suppressed. Insufficient headroom ({headroom:.1f} pts) to {nearest_sup}.")
+                return
+
             self.trades_taken_today += 1
             strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=False)
 
-            # Initial SL = Breakout Candle High + 5.0 pts
             init_sl = round(float(last_c["high"]) + 5.0, 1)
-
             opt_ltp = self.last_polled_opt_ltp if self.last_polled_opt_ltp > 0 else 75.0
             risk_pts = round(init_sl - close_p, 1)
             opt_sl = max(0.5, round(opt_ltp - (risk_pts * delta), 2))
 
             targets = self.compute_all_confluence_targets(df_curr, close_p, is_ce=False)
-            scenario_tag = "ORB BREAKDOWN" if trade_num == 1 else "FAILED AUCTION REVERSAL"
+
+            if is_pdl_pe:
+                setup_title = "PREVIOUS DAY LOW (PDL) BREAKDOWN"
+            elif is_lod_pe and not is_orb_pe:
+                setup_title = "LOD SUPPORT BREAKDOWN"
+            elif trade_num == 1:
+                setup_title = "ORB BREAKDOWN"
+            else:
+                setup_title = "FAILED AUCTION REVERSAL"
+
+            date_readable = last_c["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)")
+            close_time_dt = last_c["dt"].astimezone(IST) + datetime.timedelta(minutes=5)
+            close_time_str = close_time_dt.strftime("%H:%M:%S")
+            window_label = "WINDOW 1 (MORNING DRIVE)" if in_w1 else "WINDOW 2 (AFTERNOON EXPANSION)"
 
             self.locked_trade = {
                 "type": "PE",
@@ -796,9 +868,10 @@ class DedicatedTradingWorker:
                 tg_lines += f"• <b>TARGET {i_tg}:</b> {tg_val:.1f} (+{pts_d:.1f} pts) | <b>₹{opt_d:.2f}</b> (+₹{inr_d})\n"
 
             send_telegram_alert(
-                f"🚀 <b>{scenario_tag}: BUY PE [TRADE #{trade_num}/2]</b>\n"
+                f"🚀 <b>{setup_title}: BUY PE [TRADE #{trade_num}/2]</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"<b>SESSION:</b> {window_label}\n"
+                f"<b>HEADROOM:</b> +{headroom:.1f} pts to {nearest_sup} (CLEAR)\n"
                 f"<b>CONTRACT:</b> {sym}\n"
                 f"<b>MODE:</b> Budget (&lt; ₹{budget_val}) | <b>QTY:</b> {LOT_SIZE_QTY} (Δ: {delta:.2f})\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -916,7 +989,6 @@ class DedicatedTradingWorker:
             prev_low = last_closed["low"]
             prev_high = last_closed["high"]
 
-            # ATR Cushion Assurance: Minimum buffer distance
             atr_buffer = max(12.0, round(1.2 * self.current_atr5, 1))
 
             # CLIMAX HARVEST (Peak Gain >= 75 pts OR Target 3 met)
@@ -939,7 +1011,6 @@ class DedicatedTradingWorker:
             # Balanced: Ride 5-min EMA 9 with ATR-guaranteed floor
             elif tr["trail_stage"] >= 2:
                 if is_ce:
-                    # Choose tighter between EMA 9 and Peak minus ATR buffer
                     candidate = max(round(cur_ema9 - 2.0, 1), round(tr["peak_extreme"] - atr_buffer, 1))
                     if candidate > tr["current_sl"] + 3.0:
                         tr["current_sl"] = candidate
