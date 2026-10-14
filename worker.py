@@ -189,16 +189,15 @@ class DedicatedTradingWorker:
         today_str = self.today.strftime("%Y-%m-%d")
         saved_state = read_from_redis("nifty_live_state") or {}
 
-        # Only retain active live trade if currently in market hours today
+        # Reset in-memory marker dictionaries to eliminate stale cached arrows
+        self.markers = []
+        self.history_cards = {}
+
         if is_market_hours() and saved_state.get("trade_date") == today_str:
             self.trades_taken_today = saved_state.get("trades_taken_today", 0)
             self.trade_history_today = saved_state.get("trade_history_today", [])
             if not saved_state.get("trade_closed", False):
                 self.locked_trade = saved_state.get("locked_trade")
-
-        # Explicitly reset markers cache in memory to wipe ghost historical markers
-        self.markers = []
-        self.history_cards = {}
 
         self.nfo_df = self.load_scrip_master()
         self.init_historical_candles()
@@ -430,9 +429,7 @@ class DedicatedTradingWorker:
         orb_range_val = max(15.0, round(curr_orb_h - curr_orb_l, 2))
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
-        # -------------------------------------------------------------
-        # SYNCHRONIZED HISTORICAL SIMULATOR (ZERO DUPLICATE SIGNALS)
-        # -------------------------------------------------------------
+        # Reset markers and recompute historical bars
         self.markers = []
         self.history_cards = {}
 
@@ -441,7 +438,6 @@ class DedicatedTradingWorker:
             if len(day_bars) < 4:
                 continue
 
-            # First 3 candles define the Day's ORB Range
             ow = day_bars.iloc[0:3]
             d_h = round(float(ow["high"].max()), 2)
             d_l = round(float(ow["low"].min()), 2)
