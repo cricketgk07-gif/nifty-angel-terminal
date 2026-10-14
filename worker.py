@@ -189,7 +189,7 @@ class DedicatedTradingWorker:
         today_str = self.today.strftime("%Y-%m-%d")
         saved_state = read_from_redis("nifty_live_state") or {}
 
-        # In-memory clean wipe of cached markers
+        # Reset in-memory marker dictionaries
         self.markers = []
         self.history_cards = {}
 
@@ -397,7 +397,7 @@ class DedicatedTradingWorker:
         orb_range_val = max(15.0, round(curr_orb_h - curr_orb_l, 2))
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
-        # Reset markers and recompute historical bars cleanly
+        # Reset markers completely
         self.markers = []
         self.history_cards = {}
 
@@ -496,26 +496,20 @@ class DedicatedTradingWorker:
                 if in_w1:
                     min_headroom_req = 25.0
 
-                    # 1. Primary ORB Breakout (e.g. Oct 9 Yellow Tick @ 09:30 AM close)
+                    # 1. Primary ORB Breakout (e.g. Oct 9 Yellow Tick @ 09:30 AM close: c > d_h and c > vw)
                     orb_ce = (c > d_h and prev_c <= d_h and c > vw)
                     orb_pe = (c < d_l and prev_c >= d_l and c < vw)
 
                     # 2. Structural Level Breakdown / LOD Continuation (e.g. Oct 12 Green Tick @ 22459.8)
                     lod_break_pe = (c < m_lod and prev_c >= m_lod and c < d_l and c < vw and c < em)
 
-                    # EXHAUSTION FILTER (Blocks Oct 14 Red Cross @ 22561.8):
-                    # Do not enter if current 3-candle sequence has already collapsed > 110 pts vertically
-                    bars_3_high = float(day_bars.iloc[max(0, idx - 2):idx + 1]["high"].max())
-                    bars_3_low = float(day_bars.iloc[max(0, idx - 2):idx + 1]["low"].min())
-                    is_climax_spike = (bars_3_high - bars_3_low) > 110.0
-
-                    if orb_ce and not is_climax_spike:
+                    if orb_ce:
                         hd, near_name, lvl_val = self.check_headroom_to_nearest_level(c, is_ce=True, custom_pivots=day_pivots)
                         if hd >= min_headroom_req:
                             ce_cand = True
                             sl_val = round(l - 5.0, 1)
 
-                    if (orb_pe or lod_break_pe) and not is_climax_spike:
+                    if orb_pe or lod_break_pe:
                         hd, near_name, lvl_val = self.check_headroom_to_nearest_level(c, is_ce=False, custom_pivots=day_pivots)
                         if hd >= min_headroom_req:
                             pe_cand = True
@@ -527,9 +521,14 @@ class DedicatedTradingWorker:
                     if abs(c - day_open_val) > 280.0 or (day_pdc > 0 and abs(c - day_pdc) > 280.0):
                         continue
 
-                    # Window 2 requires taking out the entire day's extreme HOD/LOD
+                    # Climax Vertical Pole Check (Blocks Oct 14 Red Cross @ 22561.8):
+                    # Do not enter PE if previous 4 bars already collapsed > 115 pts straight down
+                    prior_4_high = float(day_bars.iloc[max(0, idx - 4):idx]["high"].max())
+                    vertical_drop = prior_4_high - c
+                    is_exhausted_pole = (vertical_drop > 115.0)
+
                     hod_break_ce = (c > m_hod and prev_c <= m_hod and c > d_h and c > vw + 4.0 and c > em)
-                    lod_break_pe = (c < m_lod and prev_c >= m_lod and c < d_l and c < vw - 4.0 and c < em)
+                    lod_break_pe = (c < m_lod and prev_c >= m_lod and c < d_l and c < vw - 4.0 and c < em and not is_exhausted_pole)
 
                     if hod_break_ce:
                         hd, _, _ = self.check_headroom_to_nearest_level(c, is_ce=True, custom_pivots=day_pivots)
@@ -784,18 +783,14 @@ class DedicatedTradingWorker:
             orb_pe = (close_p < orb_l and prev_c["close"] >= orb_l and close_p < vwap_val)
             lod_break_pe = (close_p < session_lod_prior and prev_c["close"] >= session_lod_prior and close_p < orb_l and close_p < vwap_val and close_p < ema9_val)
 
-            bars_3_high = float(df_curr.iloc[-3:]["high"].max()) if len(df_curr) >= 3 else high_p
-            bars_3_low = float(df_curr.iloc[-3:]["low"].min()) if len(df_curr) >= 3 else low_p
-            is_climax_spike = (bars_3_high - bars_3_low) > 110.0
-
-            if orb_ce and not is_climax_spike:
+            if orb_ce:
                 hd, near_res, lvl_val = self.check_headroom_to_nearest_level(close_p, is_ce=True)
                 if hd >= min_headroom_req:
                     ce_candidate = True
                     setup_title = "ORB HIGH BREAKOUT"
                     init_sl = round(float(last_c["low"]) - 5.0, 1)
 
-            if (orb_pe or lod_break_pe) and not is_climax_spike:
+            if orb_pe or lod_break_pe:
                 hd, near_sup, lvl_val = self.check_headroom_to_nearest_level(close_p, is_ce=False)
                 if hd >= min_headroom_req:
                     pe_candidate = True
@@ -808,8 +803,11 @@ class DedicatedTradingWorker:
             if abs(close_p - day_open_val) > 280.0 or (self.prev_day_close > 0 and abs(close_p - self.prev_day_close) > 280.0):
                 return
 
+            prior_4_high = float(df_curr.iloc[-4:]["high"].max()) if len(df_curr) >= 4 else high_p
+            is_exhausted_pole = (prior_4_high - close_p) > 115.0
+
             hod_break_ce = (close_p > session_hod_prior and prev_c["close"] <= session_hod_prior and close_p > orb_h and close_p > vwap_val + 4.0 and close_p > ema9_val)
-            lod_break_pe = (close_p < session_lod_prior and prev_c["close"] >= session_lod_prior and close_p < orb_l and close_p < vwap_val - 4.0 and close_p < ema9_val)
+            lod_break_pe = (close_p < session_lod_prior and prev_c["close"] >= session_lod_prior and close_p < orb_l and close_p < vwap_val - 4.0 and close_p < ema9_val and not is_exhausted_pole)
 
             if hod_break_ce:
                 hd, near_res, _ = self.check_headroom_to_nearest_level(close_p, is_ce=True)
