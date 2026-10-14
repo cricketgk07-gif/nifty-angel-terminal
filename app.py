@@ -334,7 +334,6 @@ html_code = f"""
       candleSeries.setMarkers(formattedMarkers);
     }}
 
-    // Complete Pivot Definitions: P, R1 through R5, S1 through S5, PDH, PDL
     const visiblePivots = {{
       'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
       'R1':  {{ color: '#ef5350', title: 'R1' }},
@@ -385,7 +384,6 @@ html_code = f"""
       }});
     }}
 
-    // Draw Fibonacci Projections (FIB 100, FIB 161, FIB 261)
     if (fibLines) {{
       const fibTitles = {{
         'fib_100': 'FIB 100',
@@ -410,7 +408,6 @@ html_code = f"""
       chart.timeScale().fitContent();
     }}
 
-    // Hover Card Logic
     chart.subscribeCrosshairMove(param => {{
       if (!param || !param.time || !param.point) {{
         hoverCard.style.display = 'none';
@@ -441,7 +438,7 @@ html_code = f"""
       }}
     }});
 
-    // Real-Time 2-Second Direct Redis Poller
+    // 1-Second Direct Redis Poller for Live Sync
     const redisUrl = "{redis_url_str}";
     const redisToken = "{redis_token_str}";
 
@@ -458,8 +455,11 @@ html_code = f"""
               if (liveState && liveState.candles && liveState.candles.length > 0) {{
                 const latestCandle = liveState.candles[liveState.candles.length - 1];
                 const shiftedCandle = {{
-                  ...latestCandle,
-                  time: latestCandle.time + IST_OFFSET
+                  time: latestCandle.time + IST_OFFSET,
+                  open: latestCandle.open,
+                  high: latestCandle.high,
+                  low: latestCandle.low,
+                  close: latestCandle.close
                 }};
                 candleSeries.update(shiftedCandle);
                 if (latestCandle.vwap) {{
@@ -478,7 +478,7 @@ html_code = f"""
             }}
           }}
         }} catch (err) {{}}
-      }}, 2000);
+      }}, 1000);
     }}
 
     window.addEventListener('resize', () => {{
