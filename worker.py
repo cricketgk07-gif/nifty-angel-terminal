@@ -189,7 +189,6 @@ class DedicatedTradingWorker:
         today_str = self.today.strftime("%Y-%m-%d")
         saved_state = read_from_redis("nifty_live_state") or {}
 
-        # Clear existing marker caches in memory to prevent stale entries
         self.markers = []
         self.history_cards = {}
 
@@ -283,7 +282,7 @@ class DedicatedTradingWorker:
         orb_rng = orb.get("range", 25.0)
 
         p = custom_pivots or self.pivot_lines
-        min_runway = 25.0
+        min_runway = 70.0
 
         if is_ce:
             candidates = [
@@ -297,7 +296,7 @@ class DedicatedTradingWorker:
             ]
             valid = sorted(list(set([round(x, 1) for x in candidates if x is not None and x >= entry_p + min_runway])))
             if not valid:
-                valid = [round(entry_p + 35.0, 1), round(entry_p + 70.0, 1), round(entry_p + 110.0, 1)]
+                valid = [round(entry_p + 75.0, 1), round(entry_p + 125.0, 1), round(entry_p + 175.0, 1)]
         else:
             candidates = [
                 orb_l - (1.000 * orb_rng),
@@ -310,31 +309,9 @@ class DedicatedTradingWorker:
             ]
             valid = sorted(list(set([round(x, 1) for x in candidates if x is not None and x <= entry_p - min_runway])), reverse=True)
             if not valid:
-                valid = [round(entry_p - 35.0, 1), round(entry_p - 70.0, 1), round(entry_p - 110.0, 1)]
+                valid = [round(entry_p - 75.0, 1), round(entry_p - 125.0, 1), round(entry_p - 175.0, 1)]
 
         return valid
-
-    def check_headroom_to_nearest_level(self, entry_p, is_ce, custom_pivots=None):
-        p = custom_pivots or self.pivot_lines
-        all_levels = {}
-        for k, v in p.items():
-            if v is not None:
-                all_levels[k] = float(v)
-
-        if is_ce:
-            overhead = {k: v for k, v in all_levels.items() if v > entry_p}
-            if not overhead:
-                return 999.0, "CLEAR SKY", 0.0
-            nearest_k = min(overhead, key=overhead.get)
-            dist = round(overhead[nearest_k] - entry_p, 1)
-            return dist, nearest_k, overhead[nearest_k]
-        else:
-            underneath = {k: v for k, v in all_levels.items() if v < entry_p}
-            if not underneath:
-                return 999.0, "OPEN FLOOR", 0.0
-            nearest_k = max(underneath, key=underneath.get)
-            dist = round(entry_p - underneath[nearest_k], 1)
-            return dist, nearest_k, underneath[nearest_k]
 
     def run_full_strategy_pipeline(self):
         if not self.candles:
@@ -363,6 +340,7 @@ class DedicatedTradingWorker:
         for i in range(len(self.candles)):
             self.candles[i]["vwap"] = float(df_h.iloc[i]["vwap"])
             self.candles[i]["ema9"] = float(df_h.iloc[i]["ema9"])
+            self.candles[i]["atr14"] = float(df_h.iloc[i]["atr14"])
 
         unique_days = list(df_h["date_str"].unique())
         if len(unique_days) >= 2:
@@ -433,112 +411,125 @@ class DedicatedTradingWorker:
 
             for idx in range(3, len(day_bars)):
                 r = day_bars.iloc[idx]
+                prev_bar = day_bars.iloc[idx - 1]
                 t_open = r["dt"].astimezone(IST).time()
                 c = float(r["close"])
-                o = float(r["open"])
                 h = float(r["high"])
                 l = float(r["low"])
                 vw = float(r["vwap"])
+                bar_atr = float(r.get("atr14", 14.0))
                 t_sec = int(r["time"])
                 candle_close_time = (r["dt"].astimezone(IST) + datetime.timedelta(minutes=5)).strftime("%H:%M")
 
-                # 1. TRADE LIFECYCLE MANAGEMENT (Active trade locks out fresh entries)
+                # 1. TRADE LIFECYCLE MANAGEMENT (ATR-Adaptive Trailing)
                 if sim_active_trade is not None:
                     is_ce_sim = (sim_active_trade["type"] == "CE")
+                    entry_price = sim_active_trade["entry"]
+                    trade_atr = sim_active_trade.get("entry_atr", bar_atr)
 
+                    # Check Stop Loss breach
                     if is_ce_sim and l <= sim_active_trade["sl"]:
                         sim_active_trade = None
                     elif (not is_ce_sim) and h >= sim_active_trade["sl"]:
                         sim_active_trade = None
 
+                    # If still open, manage ATR-based trailing progression
                     if sim_active_trade is not None:
+                        if is_ce_sim:
+                            sim_active_trade["peak"] = max(sim_active_trade.get("peak", entry_price), h)
+                            peak_gain = sim_active_trade["peak"] - entry_price
+                        else:
+                            sim_active_trade["peak"] = min(sim_active_trade.get("peak", entry_price), l)
+                            peak_gain = entry_price - sim_active_trade["peak"]
+
+                        # STAGE 1: Peak gain reaches 2.5x ATR -> Trail at (Peak - 1.5x ATR)
+                        # De-risks the trade while providing a 1.5 ATR buffer for natural pullbacks
+                        if peak_gain >= (2.5 * trade_atr):
+                            if is_ce_sim:
+                                candidate_sl = round(sim_active_trade["peak"] - (1.5 * trade_atr), 1)
+                                if candidate_sl > sim_active_trade["sl"]:
+                                    sim_active_trade["sl"] = candidate_sl
+                            else:
+                                candidate_sl = round(sim_active_trade["peak"] + (1.5 * trade_atr), 1)
+                                if candidate_sl < sim_active_trade["sl"]:
+                                    sim_active_trade["sl"] = candidate_sl
+
+                        # STAGE 2: Peak gain reaches 4.5x ATR (Expansion zone) -> Tighten trail to (Peak - 1.0x ATR)
+                        if peak_gain >= (4.5 * trade_atr):
+                            if is_ce_sim:
+                                candidate_sl = round(sim_active_trade["peak"] - (1.0 * trade_atr), 1)
+                                if candidate_sl > sim_active_trade["sl"]:
+                                    sim_active_trade["sl"] = candidate_sl
+                            else:
+                                candidate_sl = round(sim_active_trade["peak"] + (1.0 * trade_atr), 1)
+                                if candidate_sl < sim_active_trade["sl"]:
+                                    sim_active_trade["sl"] = candidate_sl
+
+                        # STAGE 3: RUNNER BEYOND T1 -> PRIOR BAR LOW + 2.0 (CE) / PRIOR BAR HIGH - 2.0 (PE)
                         targets = sim_active_trade["targets"]
-                        for i_tg, tg_val in enumerate(targets, start=1):
-                            if sim_active_trade["stage"] < i_tg:
-                                if (is_ce_sim and h >= tg_val) or ((not is_ce_sim) and l <= tg_val):
-                                    sim_active_trade["stage"] = i_tg
-                                    if i_tg == 1:
-                                        sim_active_trade["sl"] = sim_active_trade["entry"] + (2.0 if is_ce_sim else -2.0)
-                                    else:
-                                        sim_active_trade["sl"] = targets[i_tg - 2]
+                        t1_dist = abs(targets[0] - entry_price) if targets else 75.0
+                        if peak_gain >= t1_dist:
+                            if is_ce_sim:
+                                candidate_sl = round(float(prev_bar["low"]) + 2.0, 1)
+                                if candidate_sl > sim_active_trade["sl"]:
+                                    sim_active_trade["sl"] = candidate_sl
+                            else:
+                                candidate_sl = round(float(prev_bar["high"]) - 2.0, 1)
+                                if candidate_sl < sim_active_trade["sl"]:
+                                    sim_active_trade["sl"] = candidate_sl
+
                         continue
 
                 # 2. FRESH ENTRY CHECKS
                 if day_trade_count >= 2:
                     continue
 
-                # Strict windows (NO trades during Midday Dead Zone 11:15 to 12:45)
                 in_w1 = datetime.time(9, 30) <= t_open <= datetime.time(11, 15)
                 in_w2 = datetime.time(12, 45) <= t_open <= datetime.time(13, 45)
 
                 if not (in_w1 or in_w2):
                     continue
 
-                prev_c = float(day_bars.iloc[idx - 1]["close"])
+                prev_c = float(prev_bar["close"])
                 prior_bars = day_bars.iloc[:idx]
                 m_hod = float(prior_bars["high"].max())
                 m_lod = float(prior_bars["low"].min())
 
-                candle_range = max(1.0, h - l)
-                upper_wick = h - max(c, o)
-                upper_wick_ratio = upper_wick / candle_range
-
                 ce_cand = False
                 pe_cand = False
-                min_headroom_req = 25.0
-                sl_val = round(l - 5.0, 1)
+                sl_val = 0.0
 
                 # ==============================================================
-                # WINDOW 1 (09:30 - 11:15 IST)
+                # WINDOW 1: PURE BREAKOUT (INITIAL SL: BREAKOUT CANDLE LOW/HIGH -/+ 5.0)
                 # ==============================================================
                 if in_w1:
-                    min_headroom_req = 25.0
-
-                    # CE: Clean close above ORB High
                     if c > d_h and prev_c <= d_h:
-                        hd, _, _ = self.check_headroom_to_nearest_level(c, is_ce=True, custom_pivots=day_pivots)
-                        if hd >= min_headroom_req:
-                            ce_cand = True
-                            sl_val = round(l - 5.0, 1)
+                        ce_cand = True
+                        sl_val = round(l - 5.0, 1)
 
-                    # PE: Must close below ORB Low or Session LOD, WITH VWAP confirmation and NO huge upper rejection wick
-                    elif ((c < d_l and prev_c >= d_l) or (c < m_lod and prev_c >= m_lod and c < d_l)):
-                        # Rejection/Confirmation check: Kills Oct 12 09:35 premature whip, keeps 10:45 structural breakdown
-                        is_valid_pe_bar = (c < vw) and (upper_wick_ratio <= 0.35)
-                        if is_valid_pe_bar:
-                            hd, _, _ = self.check_headroom_to_nearest_level(c, is_ce=False, custom_pivots=day_pivots)
-                            if hd >= min_headroom_req:
-                                pe_cand = True
-                                sl_val = round(h + 5.0, 1)
+                    elif (c < d_l and prev_c >= d_l) or (c < m_lod and prev_c >= m_lod and c < d_l):
+                        if c < vw:
+                            pe_cand = True
+                            sl_val = round(h + 5.0, 1)
 
                 # ==============================================================
-                # WINDOW 2 (12:45 - 13:45 IST) - TREND EXPANSION (>= 50p HEADROOM)
+                # WINDOW 2: AFTERNOON EXPANSION (INITIAL SL: BREAKOUT CANDLE LOW/HIGH -/+ 5.0)
                 # ==============================================================
                 elif in_w2:
-                    min_headroom_req = 50.0
                     day_open_val = float(day_bars.iloc[0]["open"])
                     if abs(c - day_open_val) > 280.0 or (day_pdc > 0 and abs(c - day_pdc) > 280.0):
                         continue
 
-                    # Climax Vertical Pole Check (Blocks Oct 14 Red Cross @ 22561.8):
                     prior_4_high = float(day_bars.iloc[max(0, idx - 4):idx]["high"].max())
-                    vertical_drop = prior_4_high - c
-                    is_exhausted_pole = (vertical_drop > 115.0)
+                    is_exhausted_pole = (prior_4_high - c) > 115.0
 
-                    hod_break_ce = (c > m_hod and prev_c <= m_hod and c > d_h)
-                    lod_break_pe = (c < m_lod and prev_c >= m_lod and c < d_l and not is_exhausted_pole)
+                    if c > m_hod and prev_c <= m_hod and c > d_h:
+                        ce_cand = True
+                        sl_val = round(l - 5.0, 1)
 
-                    if hod_break_ce:
-                        hd, _, _ = self.check_headroom_to_nearest_level(c, is_ce=True, custom_pivots=day_pivots)
-                        if hd >= min_headroom_req:
-                            ce_cand = True
-                            sl_val = round(l - 5.0, 1)
-
-                    if lod_break_pe:
-                        hd, _, _ = self.check_headroom_to_nearest_level(c, is_ce=False, custom_pivots=day_pivots)
-                        if hd >= min_headroom_req:
-                            pe_cand = True
-                            sl_val = round(h + 5.0, 1)
+                    elif c < m_lod and prev_c >= m_lod and c < d_l and not is_exhausted_pole:
+                        pe_cand = True
+                        sl_val = round(h + 5.0, 1)
 
                 if ce_cand:
                     day_trade_count += 1
@@ -563,7 +554,15 @@ class DedicatedTradingWorker:
                         "closed": True,
                         "outcome": "HISTORICAL",
                     }
-                    sim_active_trade = {"type": "CE", "entry": c, "sl": sl_val, "targets": t_list, "stage": 0}
+                    sim_active_trade = {
+                        "type": "CE",
+                        "entry": c,
+                        "sl": sl_val,
+                        "targets": t_list,
+                        "stage": 0,
+                        "peak": c,
+                        "entry_atr": bar_atr
+                    }
 
                 elif pe_cand:
                     day_trade_count += 1
@@ -588,7 +587,15 @@ class DedicatedTradingWorker:
                         "closed": True,
                         "outcome": "HISTORICAL",
                     }
-                    sim_active_trade = {"type": "PE", "entry": c, "sl": sl_val, "targets": t_list, "stage": 0}
+                    sim_active_trade = {
+                        "type": "PE",
+                        "entry": c,
+                        "sl": sl_val,
+                        "targets": t_list,
+                        "stage": 0,
+                        "peak": c,
+                        "entry_atr": bar_atr
+                    }
 
         # Active Trade HUD Card
         if is_market_hours() and self.locked_trade and not self.locked_trade.get("closed"):
@@ -735,14 +742,9 @@ class DedicatedTradingWorker:
         prev_c = self.candles[-2]
         t_open = last_c["dt"].astimezone(IST).time()
         close_p = last_c["close"]
-        open_p = last_c["open"]
         high_p = last_c["high"]
         low_p = last_c["low"]
         vwap_val = last_c.get("vwap", close_p)
-
-        candle_range = max(1.0, high_p - low_p)
-        upper_wick = high_p - max(close_p, open_p)
-        upper_wick_ratio = upper_wick / candle_range
 
         in_w1 = datetime.time(9, 30) <= t_open <= datetime.time(11, 15)
         in_w2 = datetime.time(12, 45) <= t_open <= datetime.time(13, 45)
@@ -763,30 +765,21 @@ class DedicatedTradingWorker:
         ce_candidate = False
         pe_candidate = False
         setup_title = "ORB BREAKOUT"
-        min_headroom_req = 25.0
-        init_sl = round(float(last_c["low"]) - 5.0, 1)
+        sl_val = 0.0
 
         if in_w1:
-            min_headroom_req = 25.0
-
             if close_p > orb_h and prev_c["close"] <= orb_h:
-                hd, near_res, _ = self.check_headroom_to_nearest_level(close_p, is_ce=True)
-                if hd >= min_headroom_req:
-                    ce_candidate = True
-                    setup_title = "ORB HIGH BREAKOUT"
-                    init_sl = round(float(last_c["low"]) - 5.0, 1)
+                ce_candidate = True
+                setup_title = "ORB HIGH BREAKOUT"
+                sl_val = round(low_p - 5.0, 1)
 
-            elif ((close_p < orb_l and prev_c["close"] >= orb_l) or (close_p < session_lod_prior and prev_c["close"] >= session_lod_prior and close_p < orb_l)):
-                is_valid_pe = (close_p < vwap_val) and (upper_wick_ratio <= 0.35)
-                if is_valid_pe:
-                    hd, near_sup, _ = self.check_headroom_to_nearest_level(close_p, is_ce=False)
-                    if hd >= min_headroom_req:
-                        pe_candidate = True
-                        setup_title = "SUPPORT LEVEL BREAKDOWN" if close_p < session_lod_prior else "ORB LOW BREAKDOWN"
-                        init_sl = round(float(last_c["high"]) + 5.0, 1)
+            elif (close_p < orb_l and prev_c["close"] >= orb_l) or (close_p < session_lod_prior and prev_c["close"] >= session_lod_prior and close_p < orb_l):
+                if close_p < vwap_val:
+                    pe_candidate = True
+                    setup_title = "ORB LOW BREAKDOWN"
+                    sl_val = round(high_p + 5.0, 1)
 
         elif in_w2:
-            min_headroom_req = 50.0
             day_open_val = float(df_curr.iloc[0]["open"])
             if abs(close_p - day_open_val) > 280.0 or (self.prev_day_close > 0 and abs(close_p - self.prev_day_close) > 280.0):
                 return
@@ -794,29 +787,22 @@ class DedicatedTradingWorker:
             prior_4_high = float(df_curr.iloc[-4:]["high"].max()) if len(df_curr) >= 4 else high_p
             is_exhausted_pole = (prior_4_high - close_p) > 115.0
 
-            hod_break_ce = (close_p > session_hod_prior and prev_c["close"] <= session_hod_prior and close_p > orb_h)
-            lod_break_pe = (close_p < session_lod_prior and prev_c["close"] >= session_lod_prior and close_p < orb_l and not is_exhausted_pole)
+            if close_p > session_hod_prior and prev_c["close"] <= session_hod_prior and close_p > orb_h:
+                ce_candidate = True
+                setup_title = "HOD BREAKOUT"
+                sl_val = round(low_p - 5.0, 1)
 
-            if hod_break_ce:
-                hd, near_res, _ = self.check_headroom_to_nearest_level(close_p, is_ce=True)
-                if hd >= min_headroom_req:
-                    ce_candidate = True
-                    setup_title = "HOD BREAKOUT"
-                    init_sl = round(float(last_c["low"]) - 5.0, 1)
-
-            if lod_break_pe:
-                hd, near_sup, _ = self.check_headroom_to_nearest_level(close_p, is_ce=False)
-                if hd >= min_headroom_req:
-                    pe_candidate = True
-                    setup_title = "LOD BREAKDOWN"
-                    init_sl = round(float(last_c["high"]) + 5.0, 1)
+            elif close_p < session_lod_prior and prev_c["close"] >= session_lod_prior and close_p < orb_l and not is_exhausted_pole:
+                pe_candidate = True
+                setup_title = "LOD BREAKDOWN"
+                sl_val = round(high_p + 5.0, 1)
 
         if ce_candidate:
             self.trades_taken_today += 1
             strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=True)
 
             opt_ltp = self.last_polled_opt_ltp if self.last_polled_opt_ltp > 0 else 75.0
-            risk_pts = round(close_p - init_sl, 1)
+            risk_pts = round(close_p - sl_val, 1)
             opt_sl = max(0.5, round(opt_ltp - (risk_pts * delta), 2))
 
             targets = self.compute_all_confluence_targets(df_curr, close_p, is_ce=True)
@@ -831,12 +817,13 @@ class DedicatedTradingWorker:
                 "trade_num": trade_num,
                 "strike": strike,
                 "entry": close_p,
-                "init_sl": init_sl,
-                "current_sl": init_sl,
-                "last_alerted_sl": init_sl,
+                "init_sl": sl_val,
+                "current_sl": sl_val,
+                "last_alerted_sl": sl_val,
                 "targets": targets,
                 "trail_stage": 0,
-                "peak_extreme": close_p,
+                "peak": close_p,
+                "entry_atr": self.current_atr5,
                 "closed": False,
                 "symbol": sym,
                 "token": tok,
@@ -861,13 +848,12 @@ class DedicatedTradingWorker:
                 f"🚀 <b>{setup_title}: BUY CE [TRADE #{trade_num}/2]</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"<b>SESSION:</b> {window_label}\n"
-                f"<b>HEADROOM:</b> +{min_headroom_req:.1f}p+ (CLEAR TO NEXT LEVEL)\n"
                 f"<b>CONTRACT:</b> {sym}\n"
                 f"<b>MODE:</b> Budget (&lt; ₹{budget_val}) | <b>QTY:</b> {LOT_SIZE_QTY} (Δ: {delta:.2f})\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"<b>LEVEL | INDEX (SPOT) | OPTION (₹)</b>\n"
                 f"• <b>ENTRY:</b> {close_p:.1f} | <b>₹{opt_ltp:.2f}</b>\n"
-                f"• <b>STOP LOSS:</b> {init_sl:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b> (-₹{total_risk_inr})\n"
+                f"• <b>STOP LOSS:</b> {sl_val:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b> (-₹{total_risk_inr})\n"
                 f"{tg_lines}"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"🛡 <b>SL Anchor:</b> Breakout Low - 5.0 pts\n"
@@ -881,7 +867,7 @@ class DedicatedTradingWorker:
             strike, sym, tok, delta, days_exp = self.find_budget_strike(close_p, is_ce=False)
 
             opt_ltp = self.last_polled_opt_ltp if self.last_polled_opt_ltp > 0 else 75.0
-            risk_pts = round(init_sl - close_p, 1)
+            risk_pts = round(sl_val - close_p, 1)
             opt_sl = max(0.5, round(opt_ltp - (risk_pts * delta), 2))
 
             targets = self.compute_all_confluence_targets(df_curr, close_p, is_ce=False)
@@ -896,12 +882,13 @@ class DedicatedTradingWorker:
                 "trade_num": trade_num,
                 "strike": strike,
                 "entry": close_p,
-                "init_sl": init_sl,
-                "current_sl": init_sl,
-                "last_alerted_sl": init_sl,
+                "init_sl": sl_val,
+                "current_sl": sl_val,
+                "last_alerted_sl": sl_val,
                 "targets": targets,
                 "trail_stage": 0,
-                "peak_extreme": close_p,
+                "peak": close_p,
+                "entry_atr": self.current_atr5,
                 "closed": False,
                 "symbol": sym,
                 "token": tok,
@@ -926,13 +913,12 @@ class DedicatedTradingWorker:
                 f"🚀 <b>{setup_title}: BUY PE [TRADE #{trade_num}/2]</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"<b>SESSION:</b> {window_label}\n"
-                f"<b>HEADROOM:</b> +{min_headroom_req:.1f}p+ (CLEAR TO NEXT LEVEL)\n"
                 f"<b>CONTRACT:</b> {sym}\n"
                 f"<b>MODE:</b> Budget (&lt; ₹{budget_val}) | <b>QTY:</b> {LOT_SIZE_QTY} (Δ: {delta:.2f})\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"<b>LEVEL | INDEX (SPOT) | OPTION (₹)</b>\n"
                 f"• <b>ENTRY:</b> {close_p:.1f} | <b>₹{opt_ltp:.2f}</b>\n"
-                f"• <b>STOP LOSS:</b> {init_sl:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b> (-₹{total_risk_inr})\n"
+                f"• <b>STOP LOSS:</b> {sl_val:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b> (-₹{total_risk_inr})\n"
                 f"{tg_lines}"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"🛡 <b>SL Anchor:</b> Breakout High + 5.0 pts\n"
@@ -953,10 +939,11 @@ class DedicatedTradingWorker:
         delta_v = tr.get("delta", 0.50)
         opt_entry = tr.get("opt_entry_ltp", 75.0)
         targets = tr.get("targets", [])
-        current_stage = tr.get("trail_stage", 0)
+        trade_atr = tr.get("entry_atr", self.current_atr5)
         t_now = datetime.datetime.now(IST).strftime("%H:%M:%S")
         date_readable = tr.get("date_readable", datetime.datetime.now(IST).strftime("%d-%b-%Y (%A)"))
 
+        # Check Stop Loss breach
         stop_hit = (live_spot <= tr["current_sl"]) if is_ce else (live_spot >= tr["current_sl"])
         if stop_hit:
             exit_spot = tr["current_sl"]
@@ -980,11 +967,7 @@ class DedicatedTradingWorker:
             self.hud_data = {}
 
             can_reenter = (self.trades_taken_today < 2)
-
-            if can_reenter:
-                next_status = "Position closed. Bot armed for Trade #2 (Window 2: 12:45-13:45 with >= 50p headroom)."
-            else:
-                next_status = "Daily limit (2/2) reached. Trading closed for the day."
+            next_status = "Armed for Trade #2 (Window 2: 12:45-13:45)." if can_reenter else "Daily limit (2/2) reached. Trading closed."
 
             send_telegram_alert(
                 f"🏁 <b>TRADE #{trade_n} CLOSED (STOP HIT)</b>\n"
@@ -998,72 +981,63 @@ class DedicatedTradingWorker:
             )
             return
 
+        # Track Maximum Favorable Excursion (Peak)
         if is_ce:
-            tr["peak_extreme"] = max(tr.get("peak_extreme", entry_p), live_spot)
-            peak_gain = tr["peak_extreme"] - entry_p
+            tr["peak"] = max(tr.get("peak", entry_p), live_spot)
+            peak_gain = tr["peak"] - entry_p
         else:
-            tr["peak_extreme"] = min(tr.get("peak_extreme", entry_p), live_spot)
-            peak_gain = entry_p - tr["peak_extreme"]
+            tr["peak"] = min(tr.get("peak", entry_p), live_spot)
+            peak_gain = entry_p - tr["peak"]
 
         sl_updated = False
         update_reason = ""
 
-        for idx, tg_p in enumerate(targets, start=1):
-            if current_stage < idx:
-                target_dist = abs(tg_p - entry_p)
-                current_gain = (live_spot - entry_p) if is_ce else (entry_p - live_spot)
+        # STAGE 1: Peak reaches 2.5x ATR -> Trail at (Peak - 1.5x ATR)
+        if peak_gain >= (2.5 * trade_atr):
+            if is_ce:
+                candidate_sl = round(tr["peak"] - (1.5 * trade_atr), 1)
+                if candidate_sl > tr["current_sl"]:
+                    tr["current_sl"] = candidate_sl
+                    update_reason = f"STAGE 1 (2.5x ATR PEAK): TRAILED TO -1.5x ATR ({cur_sl:.1f})"
+                    sl_updated = True
+            else:
+                candidate_sl = round(tr["peak"] + (1.5 * trade_atr), 1)
+                if candidate_sl < tr["current_sl"]:
+                    tr["current_sl"] = candidate_sl
+                    update_reason = f"STAGE 1 (2.5x ATR PEAK): TRAILED TO +1.5x ATR ({cur_sl:.1f})"
+                    sl_updated = True
 
-                if current_gain >= (0.85 * target_dist):
-                    tr["trail_stage"] = idx
-                    if idx == 1:
-                        cost_buffer = 2.0 if is_ce else -2.0
-                        new_sl = round(entry_p + cost_buffer, 1)
-                        if (is_ce and new_sl > tr["current_sl"]) or (not is_ce and new_sl < tr["current_sl"]):
-                            tr["current_sl"] = new_sl
-                            update_reason = f"TARGET 1 (85%+ ZONE): COST LOCKED +2.0 pts"
-                            sl_updated = True
-                    else:
-                        prev_tg = targets[idx - 2]
-                        if (is_ce and prev_tg > tr["current_sl"]) or (not is_ce and prev_tg < tr["current_sl"]):
-                            tr["current_sl"] = prev_tg
-                            update_reason = f"TARGET {idx} PROXIMITY: LOCKED TARGET {idx-1}"
-                            sl_updated = True
+        # STAGE 2: Peak reaches 4.5x ATR -> Tighten trail to (Peak - 1.0x ATR)
+        if peak_gain >= (4.5 * trade_atr):
+            if is_ce:
+                candidate_sl = round(tr["peak"] - (1.0 * trade_atr), 1)
+                if candidate_sl > tr["current_sl"]:
+                    tr["current_sl"] = candidate_sl
+                    update_reason = f"STAGE 2 (4.5x ATR EXPANSION): TIGHTENED TO -1.0x ATR ({cur_sl:.1f})"
+                    sl_updated = True
+            else:
+                candidate_sl = round(tr["peak"] + (1.0 * trade_atr), 1)
+                if candidate_sl < tr["current_sl"]:
+                    tr["current_sl"] = candidate_sl
+                    update_reason = f"STAGE 2 (4.5x ATR EXPANSION): TIGHTENED TO +1.0x ATR ({cur_sl:.1f})"
+                    sl_updated = True
 
-        if tr["trail_stage"] >= 1 and len(self.candles) >= 2:
-            last_closed = self.candles[-1]
-            cur_ema9 = last_closed.get("ema9", live_spot)
-            prev_low = last_closed["low"]
-            prev_high = last_closed["high"]
-
-            atr_buffer = max(12.0, round(1.2 * self.current_atr5, 1))
-
-            if peak_gain >= 75.0 or tr["trail_stage"] >= 3:
-                if is_ce:
-                    candidate = round(prev_low - 2.0, 1)
-                    if candidate > tr["current_sl"] + 3.0:
-                        tr["current_sl"] = candidate
-                        update_reason = f"CLIMAX HARVEST: PRIOR BAR LOW - 2.0 (PEAK: +{peak_gain:.1f}p)"
-                        sl_updated = True
-                else:
-                    candidate = round(prev_high + 2.0, 1)
-                    if candidate < tr["current_sl"] - 3.0:
-                        tr["current_sl"] = candidate
-                        update_reason = f"CLIMAX HARVEST: PRIOR BAR HIGH + 2.0 (PEAK: +{peak_gain:.1f}p)"
-                        sl_updated = True
-
-            elif tr["trail_stage"] >= 2:
-                if is_ce:
-                    candidate = max(round(cur_ema9 - 2.0, 1), round(tr["peak_extreme"] - atr_buffer, 1))
-                    if candidate > tr["current_sl"] + 3.0:
-                        tr["current_sl"] = candidate
-                        update_reason = f"TREND RIDE: EMA 9 / ATR PROTECTED"
-                        sl_updated = True
-                else:
-                    candidate = min(round(cur_ema9 + 2.0, 1), round(tr["peak_extreme"] + atr_buffer, 1))
-                    if candidate < tr["current_sl"] - 3.0:
-                        tr["current_sl"] = candidate
-                        update_reason = f"TREND RIDE: EMA 9 / ATR PROTECTED"
-                        sl_updated = True
+        # STAGE 3: RUNNER BEYOND T1 -> PRIOR BAR LOW + 2.0 (CE) / PRIOR BAR HIGH - 2.0 (PE)
+        t1_dist = abs(targets[0] - entry_p) if targets else 75.0
+        if peak_gain >= t1_dist and len(self.candles) >= 2:
+            prev_closed = self.candles[-1]
+            if is_ce:
+                candidate_sl = round(float(prev_closed["low"]) + 2.0, 1)
+                if candidate_sl > tr["current_sl"]:
+                    tr["current_sl"] = candidate_sl
+                    update_reason = "STAGE 3 (RUNNER): PRIOR BAR LOW + 2.0 LOCKED"
+                    sl_updated = True
+            else:
+                candidate_sl = round(float(prev_closed["high"]) - 2.0, 1)
+                if candidate_sl < tr["current_sl"]:
+                    tr["current_sl"] = candidate_sl
+                    update_reason = "STAGE 3 (RUNNER): PRIOR BAR HIGH - 2.0 LOCKED"
+                    sl_updated = True
 
         last_alerted = tr.get("last_alerted_sl", tr["init_sl"])
         if sl_updated or abs(tr["current_sl"] - last_alerted) >= 4.0:
@@ -1086,7 +1060,7 @@ class DedicatedTradingWorker:
                 f"• <b>OPTION (GTT ₹):</b> ₹{gtt_opt:.2f}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"🔒 <b>LOCKED PROFIT:</b> {sign}{locked_pts:.1f} pts (₹{sign}{locked_inr})\n"
-                f"📍 <b>Status:</b> RUNNER TIGHTENED\n"
+                f"📍 <b>Status:</b> RUNNER TRAILED\n"
                 f"📅 <b>Date:</b> {date_readable} | ⏰ <b>Time:</b> {t_now}"
             )
 
