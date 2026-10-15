@@ -189,7 +189,7 @@ class DedicatedTradingWorker:
         today_str = self.today.strftime("%Y-%m-%d")
         saved_state = read_from_redis("nifty_live_state") or {}
 
-        # Fresh reset of markers memory to remove ghost historical markers
+        # Clear existing marker caches in memory to prevent stale entries
         self.markers = []
         self.history_cards = {}
 
@@ -397,7 +397,6 @@ class DedicatedTradingWorker:
         orb_range_val = max(15.0, round(curr_orb_h - curr_orb_l, 2))
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
-        # Clear historical state markers cleanly
         self.markers = []
         self.history_cards = {}
 
@@ -439,6 +438,7 @@ class DedicatedTradingWorker:
                 o = float(r["open"])
                 h = float(r["high"])
                 l = float(r["low"])
+                vw = float(r["vwap"])
                 t_sec = int(r["time"])
                 candle_close_time = (r["dt"].astimezone(IST) + datetime.timedelta(minutes=5)).strftime("%H:%M")
 
@@ -461,7 +461,6 @@ class DedicatedTradingWorker:
                                         sim_active_trade["sl"] = sim_active_trade["entry"] + (2.0 if is_ce_sim else -2.0)
                                     else:
                                         sim_active_trade["sl"] = targets[i_tg - 2]
-                        # Position is still active. Skip to next candle completely!
                         continue
 
                 # 2. FRESH ENTRY CHECKS
@@ -480,13 +479,17 @@ class DedicatedTradingWorker:
                 m_hod = float(prior_bars["high"].max())
                 m_lod = float(prior_bars["low"].min())
 
+                candle_range = max(1.0, h - l)
+                upper_wick = h - max(c, o)
+                upper_wick_ratio = upper_wick / candle_range
+
                 ce_cand = False
                 pe_cand = False
                 min_headroom_req = 25.0
                 sl_val = round(l - 5.0, 1)
 
                 # ==============================================================
-                # WINDOW 1 (09:30 - 11:15 IST) - MINIMAL CRITERIA (>= 25p HEADROOM ONLY)
+                # WINDOW 1 (09:30 - 11:15 IST)
                 # ==============================================================
                 if in_w1:
                     min_headroom_req = 25.0
@@ -498,12 +501,15 @@ class DedicatedTradingWorker:
                             ce_cand = True
                             sl_val = round(l - 5.0, 1)
 
-                    # PE: Clean close below ORB Low OR S1 / Session LOD Breakdown
-                    elif (c < d_l and prev_c >= d_l) or (c < m_lod and prev_c >= m_lod and c < d_l):
-                        hd, _, _ = self.check_headroom_to_nearest_level(c, is_ce=False, custom_pivots=day_pivots)
-                        if hd >= min_headroom_req:
-                            pe_cand = True
-                            sl_val = round(h + 5.0, 1)
+                    # PE: Must close below ORB Low or Session LOD, WITH VWAP confirmation and NO huge upper rejection wick
+                    elif ((c < d_l and prev_c >= d_l) or (c < m_lod and prev_c >= m_lod and c < d_l)):
+                        # Rejection/Confirmation check: Kills Oct 12 09:35 premature whip, keeps 10:45 structural breakdown
+                        is_valid_pe_bar = (c < vw) and (upper_wick_ratio <= 0.35)
+                        if is_valid_pe_bar:
+                            hd, _, _ = self.check_headroom_to_nearest_level(c, is_ce=False, custom_pivots=day_pivots)
+                            if hd >= min_headroom_req:
+                                pe_cand = True
+                                sl_val = round(h + 5.0, 1)
 
                 # ==============================================================
                 # WINDOW 2 (12:45 - 13:45 IST) - TREND EXPANSION (>= 50p HEADROOM)
@@ -729,8 +735,14 @@ class DedicatedTradingWorker:
         prev_c = self.candles[-2]
         t_open = last_c["dt"].astimezone(IST).time()
         close_p = last_c["close"]
+        open_p = last_c["open"]
         high_p = last_c["high"]
         low_p = last_c["low"]
+        vwap_val = last_c.get("vwap", close_p)
+
+        candle_range = max(1.0, high_p - low_p)
+        upper_wick = high_p - max(close_p, open_p)
+        upper_wick_ratio = upper_wick / candle_range
 
         in_w1 = datetime.time(9, 30) <= t_open <= datetime.time(11, 15)
         in_w2 = datetime.time(12, 45) <= t_open <= datetime.time(13, 45)
@@ -764,12 +776,14 @@ class DedicatedTradingWorker:
                     setup_title = "ORB HIGH BREAKOUT"
                     init_sl = round(float(last_c["low"]) - 5.0, 1)
 
-            elif (close_p < orb_l and prev_c["close"] >= orb_l) or (close_p < session_lod_prior and prev_c["close"] >= session_lod_prior and close_p < orb_l):
-                hd, near_sup, _ = self.check_headroom_to_nearest_level(close_p, is_ce=False)
-                if hd >= min_headroom_req:
-                    pe_candidate = True
-                    setup_title = "SUPPORT LEVEL BREAKDOWN" if close_p < session_lod_prior else "ORB LOW BREAKDOWN"
-                    init_sl = round(float(last_c["high"]) + 5.0, 1)
+            elif ((close_p < orb_l and prev_c["close"] >= orb_l) or (close_p < session_lod_prior and prev_c["close"] >= session_lod_prior and close_p < orb_l)):
+                is_valid_pe = (close_p < vwap_val) and (upper_wick_ratio <= 0.35)
+                if is_valid_pe:
+                    hd, near_sup, _ = self.check_headroom_to_nearest_level(close_p, is_ce=False)
+                    if hd >= min_headroom_req:
+                        pe_candidate = True
+                        setup_title = "SUPPORT LEVEL BREAKDOWN" if close_p < session_lod_prior else "ORB LOW BREAKDOWN"
+                        init_sl = round(float(last_c["high"]) + 5.0, 1)
 
         elif in_w2:
             min_headroom_req = 50.0
