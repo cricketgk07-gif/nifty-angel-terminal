@@ -168,6 +168,7 @@ class DedicatedTradingWorker:
         self.markers = []
         self.history_cards = {}
         self.pivot_lines = {}
+        self.fib_lines = {}
         self.orb_levels = {}
         self.hud_data = {}
 
@@ -175,7 +176,7 @@ class DedicatedTradingWorker:
         self.trades_taken_today = 0
         self.trade_history_today = []
 
-        # Dual-Regime Specific Variables
+        # Dual-Regime Specific States
         self.daily_atr10 = 150.0
         self.current_atr14 = 14.0
         self.is_high_vol = False
@@ -246,6 +247,7 @@ class DedicatedTradingWorker:
             return pd.DataFrame()
 
     def fetch_daily_atr_and_levels(self):
+        """Calculates 10-day Daily ATR and full Pivots (P, R1-R5, S1-S5, PDH, PDL)."""
         now = datetime.datetime.now(IST)
         from_str = (now - datetime.timedelta(days=25)).strftime("%Y-%m-%d 09:15")
         to_str = now.strftime("%Y-%m-%d 15:30")
@@ -275,6 +277,7 @@ class DedicatedTradingWorker:
                 self.daily_atr10 = round(float(atr_series.iloc[-1]), 1)
                 self.is_high_vol = (self.daily_atr10 >= VOL_THRESHOLD)
 
+                # Prior Day Pivots up to R5 / S5
                 prev_bar = df_closed.iloc[-1]
                 pdh = round(float(prev_bar["high"]), 2)
                 pdl = round(float(prev_bar["low"]), 2)
@@ -282,16 +285,31 @@ class DedicatedTradingWorker:
                 P = round((pdh + pdl + pdc) / 3.0, 2)
                 rng = round(pdh - pdl, 2)
 
+                r1 = round((2.0 * P) - pdl, 2)
+                s1 = round((2.0 * P) - pdh, 2)
+                r2 = round(P + rng, 2)
+                s2 = round(P - rng, 2)
+                r3 = round(pdh + (2.0 * (P - pdl)), 2)
+                s3 = round(pdl - (2.0 * (pdh - P)), 2)
+                r4 = round(r3 + rng, 2)
+                s4 = round(s3 - rng, 2)
+                r5 = round(r4 + rng, 2)
+                s5 = round(s4 - rng, 2)
+
                 self.pivot_lines = {
-                    "P": P, "PDH": pdh, "PDL": pdl,
-                    "R1": round((2.0 * P) - pdl, 2), "S1": round((2.0 * P) - pdh, 2),
-                    "R2": round(P + rng, 2), "S2": round(P - rng, 2),
-                    "R3": round(pdh + (2.0 * (P - pdl)), 2), "S3": round(pdl - (2.0 * (pdh - P)), 2),
+                    "P": P,
+                    "R1": r1, "S1": s1,
+                    "R2": r2, "S2": s2,
+                    "R3": r3, "S3": s3,
+                    "R4": r4, "S4": s4,
+                    "R5": r5, "S5": s5,
+                    "PDH": pdh,
+                    "PDL": pdl,
                 }
-                print(f"[Daily ATR Loaded]: 10-ATR={self.daily_atr10} | High-Vol Mode={self.is_high_vol}")
+                print(f"[Daily Loaded]: 10-ATR={self.daily_atr10} | Mode={'BO' if self.is_high_vol else 'FADE'} | Pivots P={P}, PDH={pdh}, PDL={pdl}")
                 return
         except Exception as e:
-            print(f"[Daily ATR Error]: {e}")
+            print(f"[Daily ATR/Pivot Error]: {e}")
             self.daily_atr10 = 160.0
             self.is_high_vol = False
 
@@ -392,7 +410,7 @@ class DedicatedTradingWorker:
         df_h = pd.DataFrame(self.candles)
         df_h["date_str"] = df_h["dt"].apply(lambda d: d.astimezone(IST).strftime("%Y-%m-%d"))
 
-        # Pure VWAP (hlc3 matching ta.vwap(hlc3))
+        # Pure VWAP matching Pine Script ta.vwap(hlc3)
         df_h["hlc3"] = (df_h["high"] + df_h["low"] + df_h["close"]) / 3.0
         candle_spread = (df_h["high"] - df_h["low"]) + (df_h["close"] - df_h["open"]).abs()
         df_h["calc_vol"] = candle_spread * 1250.0 + 500.0
@@ -422,6 +440,28 @@ class DedicatedTradingWorker:
         curr_orb_l = round(float(orb_bars["low"].min()), 2)
         orb_range_val = max(15.0, round(curr_orb_h - curr_orb_l, 2))
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
+
+        # Dynamic ORB Fibonacci Calculation (Flipping based on ORB Midpoint)
+        orb_mid = round((curr_orb_h + curr_orb_l) / 2.0, 2)
+        curr_price = float(today_bars.iloc[-1]["close"]) if len(today_bars) > 0 else curr_orb_h
+        is_bullish_bias = (curr_price >= orb_mid)
+
+        if is_bullish_bias:
+            self.fib_lines = {
+                "ORB_MID": orb_mid,
+                "fib_50": round(curr_orb_h + (0.500 * orb_range_val), 2),
+                "fib_100": round(curr_orb_h + (1.000 * orb_range_val), 2),
+                "fib_161": round(curr_orb_h + (1.618 * orb_range_val), 2),
+                "direction": "UP"
+            }
+        else:
+            self.fib_lines = {
+                "ORB_MID": orb_mid,
+                "fib_50": round(curr_orb_l - (0.500 * orb_range_val), 2),
+                "fib_100": round(curr_orb_l - (1.000 * orb_range_val), 2),
+                "fib_161": round(curr_orb_l - (1.618 * orb_range_val), 2),
+                "direction": "DOWN"
+            }
 
         # Track breached levels strictly during 09:30 - 10:00 window
         self.pierced_orbH = False
@@ -598,6 +638,25 @@ class DedicatedTradingWorker:
             regime_type_str = f"BREAKOUT DAY (10-ATR: {self.daily_atr10:.0f} ≥ {VOL_THRESHOLD:.0f})" if self.is_high_vol else f"FADE DAY (10-ATR: {self.daily_atr10:.0f} < {VOL_THRESHOLD:.0f})"
             tg_target_label = "3x ATR Runner Bank" if current_mode == "BREAKOUT" else "Session VWAP Retest"
             total_risk_inr = int(round(risk_pts * delta * LOT_SIZE_QTY))
+
+            # Add marker on chart
+            self.markers.append({
+                "time": last_c["time"],
+                "position": "belowBar" if is_ce else "aboveBar",
+                "color": "#00bfa5" if is_ce else "#f23645",
+                "shape": "arrowUp" if is_ce else "arrowDown",
+                "text": f"{current_mode} {trade_type} @ {close_p:.1f}",
+            })
+
+            self.history_cards[str(last_c["time"])] = {
+                "title": f"{current_mode} {trade_type}",
+                "entry": round(close_p, 1),
+                "sl": sl_val,
+                "target": target_val,
+                "type": trade_type,
+                "time_str": close_time_str,
+                "outcome": "ACTIVE",
+            }
 
             send_telegram_alert(
                 f"⚡ <b>NIFTY DUAL-REGIME: BUY {trade_type} ({current_mode})</b>\n"
@@ -795,7 +854,10 @@ class DedicatedTradingWorker:
             "is_high_vol": self.is_high_vol,
             "vol_threshold": VOL_THRESHOLD,
             "orb_levels": self.orb_levels,
+            "fib_lines": self.fib_lines,
             "pivots": self.pivot_lines,
+            "markers": self.markers,
+            "history_cards": self.history_cards,
             "hud": self.hud_data if is_market_hours() else {},
             "updated_at": time.time(),
         }
