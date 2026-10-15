@@ -92,10 +92,7 @@ def is_market_hours():
 
 
 def send_telegram_alert(message: str):
-    if not is_market_hours():
-        return False
-
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not is_market_hours() or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -118,8 +115,8 @@ def push_to_redis(key, data_obj):
     headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
     try:
         requests.post(url, headers=headers, data=json.dumps(data_obj), timeout=3)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Redis Set Error]: {e}")
 
 
 def read_from_redis(key="nifty_live_state"):
@@ -187,9 +184,6 @@ class DedicatedTradingWorker:
 
         today_str = self.today.strftime("%Y-%m-%d")
         saved_state = read_from_redis("nifty_live_state") or {}
-
-        self.markers = []
-        self.history_cards = {}
 
         if is_market_hours() and saved_state.get("trade_date") == today_str:
             if saved_state.get("locked_trade") and not saved_state.get("locked_trade", {}).get("closed", False):
@@ -375,7 +369,6 @@ class DedicatedTradingWorker:
         exp_slice = future_exp[future_exp["expiry"] == curr_exp]
         days_to_exp = max(1, (exp_slice.iloc[0]["exp_dt"].date() - self.today).days)
 
-        # Direction-aware candidate evaluation (strictly OTM/ATM)
         candidates = []
         strike_offsets = range(0, 8) if is_ce else range(0, -8, -1)
 
@@ -492,7 +485,6 @@ class DedicatedTradingWorker:
                 t_sec = int(r["time"])
                 candle_close_time = (r["dt"].astimezone(IST) + datetime.timedelta(minutes=5)).strftime("%H:%M")
 
-                # Trailing Execution Loop
                 if sim_active_trade is not None:
                     is_ce_sim = (sim_active_trade["type"] == "CE")
                     entry_price = sim_active_trade["entry"]
@@ -585,12 +577,10 @@ class DedicatedTradingWorker:
                     session_high = float(day_bars.iloc[:idx+1]["high"].max())
                     session_low = float(day_bars.iloc[:idx+1]["low"].min())
                     day_spread = session_high - session_low
-                    
-                    # Lockout if day moved > 250 points
+
                     if day_spread >= 250.0:
                         continue
 
-                    # Lockout if overextended from VWAP by > 80 points
                     if abs(c - vw) > 80.0:
                         continue
 
@@ -794,8 +784,7 @@ class DedicatedTradingWorker:
             session_high = float(df_curr["high"].max())
             session_low = float(df_curr["low"].min())
             day_spread = session_high - session_low
-            
-            # Exhaustion Filters
+
             if day_spread >= 250.0:
                 print(f"[W2 Blocked]: Daily spread {day_spread:.1f}p exceeds 250p exhaustion limit.")
                 return
@@ -1076,35 +1065,48 @@ class DedicatedTradingWorker:
             pts_gain = (live_ltp - self.locked_trade["entry"]) if self.locked_trade["type"] == "CE" else (self.locked_trade["entry"] - live_ltp)
             opt_ltp = max(0.5, round(self.locked_trade.get("opt_entry_ltp", 75.0) + (pts_gain * self.locked_trade.get("delta", 0.50)), 2))
 
-        # Send 140 most recent bars to avoid payload drops in Upstash Redis
-        recent_candles = [
-            {
-                "time": c["time"],
-                "open": c["open"],
-                "high": c["high"],
-                "low": c["low"],
-                "close": c["close"],
-                "vwap": c.get("vwap", c["close"]),
-                "ema9": c.get("ema9", c["close"]),
-            }
-            for c in self.candles[-140:]
-        ]
+        # 1. Clean, validate, and sanitize candle data for Lightweight Charts
+        clean_candles = []
+        seen_timestamps = set()
+
+        all_bars = list(self.candles)
         if self.active_bar:
-            recent_candles.append({
-                "time": self.active_bar["time"],
-                "open": self.active_bar["open"],
-                "high": self.active_bar["high"],
-                "low": self.active_bar["low"],
-                "close": self.active_bar["close"],
-                "vwap": recent_candles[-1]["vwap"] if recent_candles else self.active_bar["close"],
-                "ema9": recent_candles[-1]["ema9"] if recent_candles else self.active_bar["close"],
-            })
+            all_bars.append(self.active_bar)
+
+        for c in all_bars:
+            try:
+                t = int(c.get("time", 0))
+                o = float(c.get("open", 0.0))
+                h = float(c.get("high", 0.0))
+                l = float(c.get("low", 0.0))
+                cl = float(c.get("close", 0.0))
+                vw = float(c.get("vwap", cl))
+                em = float(c.get("ema9", cl))
+
+                if t <= 0 or t in seen_timestamps or o <= 0 or cl <= 0:
+                    continue
+
+                seen_timestamps.add(t)
+                clean_candles.append({
+                    "time": t,
+                    "open": o,
+                    "high": max(h, o, cl),
+                    "low": min(l, o, cl),
+                    "close": cl,
+                    "vwap": vw,
+                    "ema9": em
+                })
+            except (ValueError, TypeError):
+                continue
+
+        clean_candles.sort(key=lambda x: x["time"])
+        recent_candles = clean_candles[-120:]
 
         all_trades_done = (self.trades_taken_today >= 2)
 
         payload = {
-            "ltp": live_ltp,
-            "opt_ltp": opt_ltp,
+            "ltp": float(live_ltp),
+            "opt_ltp": float(opt_ltp),
             "candles": recent_candles,
             "locked_trade": self.locked_trade if (is_market_hours() and self.locked_trade and not self.locked_trade.get("closed")) else None,
             "trades_taken_today": self.trades_taken_today,
