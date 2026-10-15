@@ -185,8 +185,7 @@ class DedicatedTradingWorker:
         today_str = self.today.strftime("%Y-%m-%d")
         saved_state = read_from_redis("nifty_live_state") or {}
 
-        # Reset state cleanly if date mismatch or if prior trade closed
-        if saved_state.get("trade_date") == today_str and saved_state.get("locked_trade"):
+        if is_market_hours() and saved_state.get("trade_date") == today_str and saved_state.get("locked_trade"):
             if not saved_state.get("locked_trade", {}).get("closed", False):
                 self.locked_trade = saved_state.get("locked_trade")
                 self.trades_taken_today = saved_state.get("trades_taken_today", 1)
@@ -239,7 +238,6 @@ class DedicatedTradingWorker:
         now = datetime.datetime.now(IST)
         loaded = False
 
-        # Query 5-minute candles over the last 4 calendar days
         for days_back in [4, 2]:
             from_dt = now - datetime.timedelta(days=days_back)
             from_str = from_dt.strftime("%Y-%m-%d 09:15")
@@ -255,9 +253,7 @@ class DedicatedTradingWorker:
                 if resp and resp.get("status") and resp.get("data") and len(resp["data"]) > 10:
                     cand_list = []
                     for b in resp["data"]:
-                        # Standardize ISO date parsing
-                        dt_str = b[0]
-                        dt_parsed = pd.to_datetime(dt_str)
+                        dt_parsed = pd.to_datetime(b[0])
                         if dt_parsed.tzinfo is None:
                             dt_ist = dt_parsed.tz_localize(IST)
                         else:
@@ -279,7 +275,6 @@ class DedicatedTradingWorker:
             except Exception as e:
                 print(f"[Candles Error]: {e}")
 
-        # Always pull daily candles to verify PDH, PDL, PDC & Pivots
         self.fetch_daily_fallback_levels()
 
     def fetch_daily_fallback_levels(self):
@@ -295,7 +290,6 @@ class DedicatedTradingWorker:
                 "todate": to_str,
             })
             if resp and resp.get("status") and resp.get("data") and len(resp["data"]) >= 2:
-                # The bar prior to today is completed previous day
                 prev_bar = resp["data"][-2]
                 pdh = round(float(prev_bar[2]), 2)
                 pdl = round(float(prev_bar[3]), 2)
@@ -320,7 +314,6 @@ class DedicatedTradingWorker:
         except Exception as e:
             print(f"[Daily Fallback Error]: {e}")
 
-        # If SmartAPI ONE_DAY failed, calculate directly from 5-minute candles
         if self.candles:
             df_temp = pd.DataFrame(self.candles)
             df_temp["d_str"] = df_temp["dt"].apply(lambda d: d.astimezone(IST).strftime("%Y-%m-%d"))
@@ -476,12 +469,27 @@ class DedicatedTradingWorker:
         orb_range_val = max(15.0, round(curr_orb_h - curr_orb_l, 2))
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
-        self.fib_lines = {
-            "FIB_1_0_H": round(curr_orb_h + orb_range_val, 2),
-            "FIB_1_618_H": round(curr_orb_h + (1.618 * orb_range_val), 2),
-            "FIB_1_0_L": round(curr_orb_l - orb_range_val, 2),
-            "FIB_1_618_L": round(curr_orb_l - (1.618 * orb_range_val), 2),
-        }
+        # Directional ORB Fibonacci Calculation
+        orb_mid = round((curr_orb_h + curr_orb_l) / 2.0, 2)
+        curr_price = float(today_bars.iloc[-1]["close"]) if len(today_bars) > 0 else curr_orb_h
+        is_bullish_bias = (curr_price >= orb_mid)
+
+        if is_bullish_bias:
+            self.fib_lines = {
+                "ORB_MID": orb_mid,
+                "FIB_0_50": round(curr_orb_h + (0.500 * orb_range_val), 2),
+                "FIB_1_00": round(curr_orb_h + (1.000 * orb_range_val), 2),
+                "FIB_1_618": round(curr_orb_h + (1.618 * orb_range_val), 2),
+                "direction": "UP"
+            }
+        else:
+            self.fib_lines = {
+                "ORB_MID": orb_mid,
+                "FIB_0_50": round(curr_orb_l - (0.500 * orb_range_val), 2),
+                "FIB_1_00": round(curr_orb_l - (1.000 * orb_range_val), 2),
+                "FIB_1_618": round(curr_orb_l - (1.618 * orb_range_val), 2),
+                "direction": "DOWN"
+            }
 
         self.markers = []
         self.history_cards = {}
@@ -1044,12 +1052,11 @@ class DedicatedTradingWorker:
             pts_gain = (live_ltp - self.locked_trade["entry"]) if self.locked_trade["type"] == "CE" else (self.locked_trade["entry"] - live_ltp)
             opt_ltp = max(0.5, round(self.locked_trade.get("opt_entry_ltp", 75.0) + (pts_gain * self.locked_trade.get("delta", 0.50)), 2))
 
-        # Build clean chronological candlestick sequence for Lightweight Charts
+        # Enforce unique timestamps and strictly ascending order for Lightweight Charts
         raw_list = list(self.candles)
         if self.active_bar:
             raw_list.append(self.active_bar)
 
-        # Enforce unique timestamps and strictly ascending order
         clean_map = {}
         for c in raw_list:
             t = int(c.get("time", 0))
