@@ -208,7 +208,7 @@ else:
     )
 
 # -------------------------------------------------------------
-# Lightweight Charts Component (All Pivots P, R1-R5, S1-S5)
+# Lightweight Charts Component (Pivots, ORB & Directional Fib)
 # -------------------------------------------------------------
 candles_json = json.dumps(candles)
 markers_json = json.dumps(markers)
@@ -271,15 +271,25 @@ html_code = f"""
 
     const IST_OFFSET = 19800;
 
-    const formattedCandles = rawCandles.map(c => ({{
-      time: c.time + IST_OFFSET,
-      open: c.open,
-      high: c.high,
-      low: c.low,
-      close: c.close,
-      vwap: c.vwap,
-      ema9: c.ema9
-    }}));
+    // Build deduplicated and ascending sorted candles
+    const seenTimes = new Set();
+    const formattedCandles = [];
+    rawCandles.forEach(c => {{
+      const shifted = c.time + IST_OFFSET;
+      if (!seenTimes.has(shifted)) {{
+        seenTimes.add(shifted);
+        formattedCandles.push({{
+          time: shifted,
+          open: Number(c.open),
+          high: Number(c.high),
+          low: Number(c.low),
+          close: Number(c.close),
+          vwap: c.vwap !== undefined ? Number(c.vwap) : undefined,
+          ema9: c.ema9 !== undefined ? Number(c.ema9) : undefined
+        }});
+      }}
+    }});
+    formattedCandles.sort((a, b) => a.time - b.time);
 
     const formattedMarkers = rawMarkers.map(m => ({{
       ...m,
@@ -343,6 +353,7 @@ html_code = f"""
       candleSeries.setMarkers(formattedMarkers);
     }}
 
+    // Pivots Levels
     const visiblePivots = {{
       'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
       'R1':  {{ color: '#ef5350', title: 'R1' }},
@@ -372,6 +383,7 @@ html_code = f"""
       }}
     }});
 
+    // ORB Base Range Lines
     if (orbLevels && orbLevels.orb_h) {{
       candleSeries.createPriceLine({{
         price: parseFloat(orbLevels.orb_h),
@@ -393,7 +405,58 @@ html_code = f"""
       }});
     }}
 
+    // Dynamic Directional ORB Fibonacci Levels
     if (fibLines) {{
+      // 1. Plot ORB Mid Equilibrium Line
+      if (fibLines.ORB_MID) {{
+        candleSeries.createPriceLine({{
+          price: parseFloat(fibLines.ORB_MID),
+          color: '#787b86',
+          lineWidth: 1,
+          lineStyle: LightweightCharts.LineStyle.Dotted,
+          axisLabelVisible: true,
+          title: 'ORB MID',
+        }});
+      }}
+
+      // 2. Plot Directional Extensions
+      const isUp = (fibLines.direction === 'UP');
+      const fibColor = isUp ? '#00e676' : '#ff5252';
+      const goldenColor = isUp ? '#ffd600' : '#ff1744';
+      const tag = isUp ? '▲' : '▼';
+
+      if (fibLines.FIB_0_50) {{
+        candleSeries.createPriceLine({{
+          price: parseFloat(fibLines.FIB_0_50),
+          color: fibColor,
+          lineWidth: 1,
+          lineStyle: LightweightCharts.LineStyle.Dashed,
+          axisLabelVisible: true,
+          title: `FIB 0.50 ${{tag}}`,
+        }});
+      }}
+      if (fibLines.FIB_1_00) {{
+        candleSeries.createPriceLine({{
+          price: parseFloat(fibLines.FIB_1_00),
+          color: fibColor,
+          lineWidth: 1,
+          lineStyle: LightweightCharts.LineStyle.LargeDashed,
+          axisLabelVisible: true,
+          title: `FIB 1.00 ${{tag}}`,
+        }});
+      }}
+      if (fibLines.FIB_1_618) {{
+        candleSeries.createPriceLine({{
+          price: parseFloat(fibLines.FIB_1_618),
+          color: goldenColor,
+          lineWidth: 2,
+          lineStyle: LightweightCharts.LineStyle.Solid,
+          axisLabelVisible: true,
+          title: `FIB 1.618 ${{tag}}`,
+        }});
+      }}
+
+      // Fallback for static legacy Fib keys
       const fibTitles = {{
         'fib_100': 'FIB 100',
         'fib_161': 'FIB 161',
@@ -464,17 +527,17 @@ html_code = f"""
                 const latestCandle = liveState.candles[liveState.candles.length - 1];
                 const shiftedCandle = {{
                   time: latestCandle.time + IST_OFFSET,
-                  open: latestCandle.open,
-                  high: latestCandle.high,
-                  low: latestCandle.low,
-                  close: latestCandle.close
+                  open: Number(latestCandle.open),
+                  high: Number(latestCandle.high),
+                  low: Number(latestCandle.low),
+                  close: Number(latestCandle.close)
                 }};
                 candleSeries.update(shiftedCandle);
-                if (latestCandle.vwap) {{
-                  vwapSeries.update({{ time: shiftedCandle.time, value: latestCandle.vwap }});
+                if (latestCandle.vwap !== undefined) {{
+                  vwapSeries.update({{ time: shiftedCandle.time, value: Number(latestCandle.vwap) }});
                 }}
-                if (latestCandle.ema9) {{
-                  emaSeries.update({{ time: shiftedCandle.time, value: latestCandle.ema9 }});
+                if (latestCandle.ema9 !== undefined) {{
+                  emaSeries.update({{ time: shiftedCandle.time, value: Number(latestCandle.ema9) }});
                 }}
               }}
               if (liveState && liveState.ltp) {{
