@@ -71,7 +71,8 @@ col_title, col_budget, col_refresh = st.columns([3, 2, 1])
 
 regime_str = "BREAKOUT DAY" if is_high_vol else "FADE DAY"
 badge_color = "#00e676" if is_high_vol else "#2962ff"
-regime_badge = f"<span style='background:{badge_color}; color:#000 if {is_high_vol} else #fff; padding:3px 10px; border-radius:4px; font-size:12px; font-weight:bold; margin-left:10px;'>{regime_str} (10-ATR: {daily_atr10:.0f})</span>"
+badge_text_color = "#000000" if is_high_vol else "#ffffff"
+regime_badge = f"<span style='background:{badge_color}; color:{badge_text_color}; padding:3px 10px; border-radius:4px; font-size:12px; font-weight:bold; margin-left:10px;'>{regime_str} (10-ATR: {daily_atr10:.1f})</span>"
 
 with col_title:
     st.markdown(
@@ -118,46 +119,42 @@ if hud and hud.get("entry_spot"):
     delta = float(hud.get("delta", 0.50))
     secured_pts = float(hud.get("secured_pts", 0.0))
 
-    st.markdown(
-        f"""
-        <div style="background:#131722; border:1px solid #2a2e39; border-radius:8px; padding:12px 16px; margin-bottom:12px;">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; flex-wrap:wrap; gap:8px;">
-                <div style="display:flex; align-items:center; gap:8px;">
-                    <span style="background:{badge_bg}; color:#fff; font-size:12px; font-weight:bold; padding:3px 8px; border-radius:4px;">{trade_type}</span>
-                    <span style="background:#2a2e39; color:#ffb74d; font-size:11px; font-weight:bold; padding:3px 6px; border-radius:4px;">{mode}</span>
-                    <span style="color:#ffffff; font-size:15px; font-weight:bold;">{symbol}</span>
-                    <span style="color:#787b86; font-size:12px;">(Delta: {delta:.2f})</span>
-                </div>
-                <div style="font-size:12px; color:#00e676; font-weight:bold;">
-                    ● ACTIVE RUNNER [1/1 DAILY TRADE IN PROGRESS]
-                </div>
-            </div>
-            <div style="display:flex; gap:12px; align-items:stretch; flex-wrap:wrap;">
-                <div style="background:#1f2430; padding:6px 12px; border-radius:4px; min-width:130px;">
-                    <div style="font-size:11px; color:#90a4ae;">ENTRY (INDEX / OPTION)</div>
-                    <div style="font-size:14px; font-weight:bold; color:#fff;">{entry_spot:.1f}</div>
-                    <div style="font-size:11px; color:#4fc3f7;">LTP: ₹{entry_opt:.2f}</div>
-                </div>
-                <div style="background:#1f2430; padding:6px 12px; border-radius:4px; min-width:130px;">
-                    <div style="font-size:11px; color:#90a4ae;">INITIAL STOP LOSS</div>
-                    <div style="font-size:14px; font-weight:bold; color:#ef5350;">{sl_spot:.1f}</div>
-                    <div style="font-size:11px; color:#ef5350;">GTT: ₹{sl_opt:.2f} (-{abs(entry_spot-sl_spot):.1f}p)</div>
-                </div>
-                <div style="background:#1f2430; padding:6px 12px; border-radius:4px; min-width:130px;">
-                    <div style="font-size:11px; color:#90a4ae;">CURRENT TRAIL SL</div>
-                    <div style="font-size:14px; font-weight:bold; color:#00e676;">{trail_spot:.1f}</div>
-                    <div style="font-size:11px; color:#00e676;">GTT: ₹{trail_opt:.2f} ({'+' if secured_pts>=0 else ''}{secured_pts:.1f}p)</div>
-                </div>
-                <div style="background:#1f2430; padding:6px 12px; border-radius:4px; min-width:130px;">
-                    <div style="font-size:11px; color:#90a4ae;">{'3x ATR TARGET' if mode == 'BREAKOUT' else 'VWAP TARGET'}</div>
-                    <div style="font-size:14px; font-weight:bold; color:#ffb74d;">{target_p:.1f}</div>
-                    <div style="font-size:11px; color:#ffb74d;">Target: ₹{opt_target:.2f} (+{abs(target_p-entry_spot):.1f}p)</div>
-                </div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    active_html = (
+        '<div style="background:#131722; border:1px solid #2a2e39; border-radius:8px; padding:12px 16px; margin-bottom:12px;">'
+        '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; flex-wrap:wrap; gap:8px;">'
+        '<div style="display:flex; align-items:center; gap:8px;">'
+        f'<span style="background:{badge_bg}; color:#fff; font-size:12px; font-weight:bold; padding:3px 8px; border-radius:4px;">{trade_type}</span>'
+        f'<span style="background:#2a2e39; color:#ffb74d; font-size:11px; font-weight:bold; padding:3px 6px; border-radius:4px;">{mode}</span>'
+        f'<span style="color:#ffffff; font-size:15px; font-weight:bold;">{symbol}</span>'
+        f'<span style="color:#787b86; font-size:12px;">(Delta: {delta:.2f})</span>'
+        '</div>'
+        '<div style="font-size:12px; color:#00e676; font-weight:bold;">● ACTIVE RUNNER [1/1 DAILY TRADE IN PROGRESS]</div>'
+        '</div>'
+        '<div style="display:flex; gap:12px; align-items:stretch; flex-wrap:wrap;">'
+        '<div style="background:#1f2430; padding:6px 12px; border-radius:4px; min-width:130px;">'
+        '<div style="font-size:11px; color:#90a4ae;">ENTRY (INDEX / OPTION)</div>'
+        f'<div style="font-size:14px; font-weight:bold; color:#fff;">{entry_spot:.1f}</div>'
+        f'<div style="font-size:11px; color:#4fc3f7;">LTP: ₹{entry_opt:.2f}</div>'
+        '</div>'
+        '<div style="background:#1f2430; padding:6px 12px; border-radius:4px; min-width:130px;">'
+        '<div style="font-size:11px; color:#90a4ae;">INITIAL STOP LOSS</div>'
+        f'<div style="font-size:14px; font-weight:bold; color:#ef5350;">{sl_spot:.1f}</div>'
+        f'<div style="font-size:11px; color:#ef5350;">GTT: ₹{sl_opt:.2f} (-{abs(entry_spot-sl_spot):.1f}p)</div>'
+        '</div>'
+        '<div style="background:#1f2430; padding:6px 12px; border-radius:4px; min-width:130px;">'
+        '<div style="font-size:11px; color:#90a4ae;">CURRENT TRAIL SL</div>'
+        f'<div style="font-size:14px; font-weight:bold; color:#00e676;">{trail_spot:.1f}</div>'
+        f'<div style="font-size:11px; color:#00e676;">GTT: ₹{trail_opt:.2f} ({"+" if secured_pts>=0 else ""}{secured_pts:.1f}p)</div>'
+        '</div>'
+        '<div style="background:#1f2430; padding:6px 12px; border-radius:4px; min-width:130px;">'
+        f'<div style="font-size:11px; color:#90a4ae;">{"3x ATR TARGET" if mode == "BREAKOUT" else "VWAP TARGET"}</div>'
+        f'<div style="font-size:14px; font-weight:bold; color:#ffb74d;">{target_p:.1f}</div>'
+        f'<div style="font-size:11px; color:#ffb74d;">Target: ₹{opt_target:.2f} (+{abs(target_p-entry_spot):.1f}p)</div>'
+        '</div>'
+        '</div>'
+        '</div>'
     )
+    st.markdown(active_html, unsafe_allow_html=True)
 else:
     orb_h_display = orb_levels.get("orb_h", "—")
     orb_l_display = orb_levels.get("orb_l", "—")
@@ -174,63 +171,60 @@ else:
     regime_mode_desc = f"BREAKOUT (≥{vol_threshold:.0f} ATR: 3x ATR Runner)" if is_high_vol else f"FADE (<{vol_threshold:.0f} ATR: 0.5 ATR Sweep to VWAP)"
     status_label = "Awaiting 09:30-10:00 Window Trigger" if trades_taken == 0 else "Daily Trade Completed (1/1 Limit Reached)"
 
-    st.markdown(
-        f"""
-        <div style="background:#131722; border:1px solid #2a2e39; border-radius:8px; padding:12px 16px; margin-bottom:12px;">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                <span style="color:#90a4ae; font-size:13px; font-weight:bold;">STANDBY MONITOR • DUAL REGIME SESSION LEVELS</span>
-                <span style="color:#787b86; font-size:12px;">{status_label}</span>
-            </div>
-            <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:10px;">
-                <div style="background:#1f2430; padding:6px 12px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">DAILY 10-ATR</div>
-                    <div style="font-size:13px; font-weight:bold; color:#ffb74d;">{daily_atr10:.1f} / {vol_threshold:.0f}</div>
-                </div>
-                <div style="background:#1f2430; padding:6px 12px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">REGIME MODE</div>
-                    <div style="font-size:13px; font-weight:bold; color:#42a5f5;">{regime_mode_desc}</div>
-                </div>
-                <div style="background:#1f2430; padding:6px 12px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">ORB HIGH</div>
-                    <div style="font-size:13px; font-weight:bold; color:#00e676;">{orb_h_display}</div>
-                </div>
-                <div style="background:#1f2430; padding:6px 12px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">ORB LOW</div>
-                    <div style="font-size:13px; font-weight:bold; color:#ff5252;">{orb_l_display}</div>
-                </div>
-                <div style="background:#1f2430; padding:6px 12px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">PIVOT P</div>
-                    <div style="font-size:13px; font-weight:bold; color:#ffeb3b;">{pivot_p_display}</div>
-                </div>
-                <div style="background:#1f2430; padding:6px 12px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">PDH / PDL</div>
-                    <div style="font-size:13px; font-weight:bold; color:#42a5f5;">{pdh_display} / {pdl_display}</div>
-                </div>
-                <div style="background:#1f2430; padding:6px 12px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">FIB 50% / 100% / 161% ({fib_dir})</div>
-                    <div style="font-size:13px; font-weight:bold; color:#b388ff;">{fib_50} / {fib_100} / {fib_161}</div>
-                </div>
-            </div>
-
-            <div style="border-top:1px solid #2a2e39; padding-top:8px;">
-                <div style="font-size:11px; color:#787b86; margin-bottom:6px; font-weight:bold;">PRE-TRIGGER STRIKE FORECAST (BUDGET: ≤ ₹{current_budget:.0f})</div>
-                <div style="display:flex; gap:12px; flex-wrap:wrap;">
-                    <div style="background:#1f2430; padding:6px 10px; border-radius:4px; flex:1; min-width:240px; border-left:3px solid #00e676;">
-                        <div style="font-size:11px; color:#00e676; font-weight:bold;">CALL OPTION (CE) • {ce_f.get('symbol', 'NIFTY CE')} (Δ: {ce_f.get('delta', 0.5):.2f})</div>
-                        <div style="font-size:12px; color:#d1d4dc;">LTP: <b>₹{ce_f.get('opt_ltp', 0.0):.2f}</b> | Trig: <b>{ce_f.get('exp_entry_spot', 0.0):.1f}</b></div>
-                        <div style="font-size:11px; color:#90a4ae;">SL: {ce_f.get('exp_sl_spot', 0.0):.1f} (₹{ce_f.get('exp_sl_opt', 0.0):.2f}) | Target: {ce_f.get('exp_target_spot', 0.0):.1f} (₹{ce_f.get('exp_target_opt', 0.0):.2f})</div>
-                    </div>
-                    <div style="background:#1f2430; padding:6px 10px; border-radius:4px; flex:1; min-width:240px; border-left:3px solid #ff5252;">
-                        <div style="font-size:11px; color:#ff5252; font-weight:bold;">PUT OPTION (PE) • {pe_f.get('symbol', 'NIFTY PE')} (Δ: {pe_f.get('delta', 0.5):.2f})</div>
-                        <div style="font-size:12px; color:#d1d4dc;">LTP: <b>₹{pe_f.get('opt_ltp', 0.0):.2f}</b> | Trig: <b>{pe_f.get('exp_entry_spot', 0.0):.1f}</b></div>
-                        <div style="font-size:11px; color:#90a4ae;">SL: {pe_f.get('exp_sl_spot', 0.0):.1f} (₹{pe_f.get('exp_sl_opt', 0.0):.2f}) | Target: {pe_f.get('exp_target_spot', 0.0):.1f} (₹{pe_f.get('exp_target_opt', 0.0):.2f})</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    standby_html = (
+        '<div style="background:#131722; border:1px solid #2a2e39; border-radius:8px; padding:12px 16px; margin-bottom:12px;">'
+        '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">'
+        '<span style="color:#90a4ae; font-size:13px; font-weight:bold;">STANDBY MONITOR • DUAL REGIME SESSION LEVELS</span>'
+        f'<span style="color:#787b86; font-size:12px;">{status_label}</span>'
+        '</div>'
+        '<div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:10px;">'
+        '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
+        '<div style="font-size:11px; color:#90a4ae;">DAILY 10-ATR</div>'
+        f'<div style="font-size:13px; font-weight:bold; color:#ffb74d;">{daily_atr10:.1f} / {vol_threshold:.0f}</div>'
+        '</div>'
+        '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
+        '<div style="font-size:11px; color:#90a4ae;">REGIME MODE</div>'
+        f'<div style="font-size:13px; font-weight:bold; color:#42a5f5;">{regime_mode_desc}</div>'
+        '</div>'
+        '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
+        '<div style="font-size:11px; color:#90a4ae;">ORB HIGH</div>'
+        f'<div style="font-size:13px; font-weight:bold; color:#00e676;">{orb_h_display}</div>'
+        '</div>'
+        '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
+        '<div style="font-size:11px; color:#90a4ae;">ORB LOW</div>'
+        f'<div style="font-size:13px; font-weight:bold; color:#ff5252;">{orb_l_display}</div>'
+        '</div>'
+        '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
+        '<div style="font-size:11px; color:#90a4ae;">PIVOT P</div>'
+        f'<div style="font-size:13px; font-weight:bold; color:#ffeb3b;">{pivot_p_display}</div>'
+        '</div>'
+        '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
+        '<div style="font-size:11px; color:#90a4ae;">PDH / PDL</div>'
+        f'<div style="font-size:13px; font-weight:bold; color:#42a5f5;">{pdh_display} / {pdl_display}</div>'
+        '</div>'
+        '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
+        f'<div style="font-size:11px; color:#90a4ae;">FIB 50% / 100% / 161% ({fib_dir})</div>'
+        f'<div style="font-size:13px; font-weight:bold; color:#b388ff;">{fib_50} / {fib_100} / {fib_161}</div>'
+        '</div>'
+        '</div>'
+        '<div style="border-top:1px solid #2a2e39; padding-top:8px;">'
+        f'<div style="font-size:11px; color:#787b86; margin-bottom:6px; font-weight:bold;">PRE-TRIGGER STRIKE FORECAST (BUDGET: ≤ ₹{current_budget:.0f})</div>'
+        '<div style="display:flex; gap:12px; flex-wrap:wrap;">'
+        '<div style="background:#1f2430; padding:6px 10px; border-radius:4px; flex:1; min-width:240px; border-left:3px solid #00e676;">'
+        f'<div style="font-size:11px; color:#00e676; font-weight:bold;">CALL OPTION (CE) • {ce_f.get("symbol", "NIFTY CE")} (Δ: {ce_f.get("delta", 0.5):.2f})</div>'
+        f'<div style="font-size:12px; color:#d1d4dc;">LTP: <b>₹{ce_f.get("opt_ltp", 0.0):.2f}</b> | Trig: <b>{ce_f.get("exp_entry_spot", 0.0):.1f}</b></div>'
+        f'<div style="font-size:11px; color:#90a4ae;">SL: {ce_f.get("exp_sl_spot", 0.0):.1f} (₹{ce_f.get("exp_sl_opt", 0.0):.2f}) | Target: {ce_f.get("exp_target_spot", 0.0):.1f} (₹{ce_f.get("exp_target_opt", 0.0):.2f})</div>'
+        '</div>'
+        '<div style="background:#1f2430; padding:6px 10px; border-radius:4px; flex:1; min-width:240px; border-left:3px solid #ff5252;">'
+        f'<div style="font-size:11px; color:#ff5252; font-weight:bold;">PUT OPTION (PE) • {pe_f.get("symbol", "NIFTY PE")} (Δ: {pe_f.get("delta", 0.5):.2f})</div>'
+        f'<div style="font-size:12px; color:#d1d4dc;">LTP: <b>₹{pe_f.get("opt_ltp", 0.0):.2f}</b> | Trig: <b>{pe_f.get("exp_entry_spot", 0.0):.1f}</b></div>'
+        f'<div style="font-size:11px; color:#90a4ae;">SL: {pe_f.get("exp_sl_spot", 0.0):.1f} (₹{pe_f.get("exp_sl_opt", 0.0):.2f}) | Target: {pe_f.get("exp_target_spot", 0.0):.1f} (₹{pe_f.get("exp_target_opt", 0.0):.2f})</div>'
+        '</div>'
+        '</div>'
+        '</div>'
+        '</div>'
     )
+    st.markdown(standby_html, unsafe_allow_html=True)
 
 # -------------------------------------------------------------
 # Lightweight Charts Component (Interactive Chart with Pivots & Fibs)
@@ -378,7 +372,6 @@ html_code = f"""
       candleSeries.setMarkers(formattedMarkers);
     }}
 
-    // 1. Full Pivots P, R1-R5, S1-S5, PDH, PDL
     const visiblePivots = {{
       'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
       'R1':  {{ color: '#ef5350', title: 'R1' }},
@@ -409,7 +402,6 @@ html_code = f"""
       }}
     }});
 
-    // 2. ORB High & Low
     if (orbLevels && orbLevels.orb_h) {{
       candleSeries.createPriceLine({{
         price: parseFloat(orbLevels.orb_h),
@@ -431,7 +423,6 @@ html_code = f"""
       }});
     }}
 
-    // 3. Dynamic ORB Fibonacci Lines (Dotted Purple)
     if (fibLines) {{
       const fibTitles = {{
         'ORB_MID': 'ORB MID',
