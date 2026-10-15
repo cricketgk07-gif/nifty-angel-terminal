@@ -1,4 +1,5 @@
 import datetime
+import html
 import http.server
 import json
 import math
@@ -29,6 +30,7 @@ UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 BUDGET_CEILING = float(os.getenv("BUDGET_CEILING", "80.0"))
 PORT = int(os.getenv("PORT", 10000))
 
+
 # ==========================================
 # 1. Health Server & Keepalive
 # ==========================================
@@ -47,11 +49,14 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+
 def run_ping_server():
     with socketserver.TCPServer(("0.0.0.0", PORT), HealthHandler) as httpd:
         httpd.serve_forever()
 
+
 threading.Thread(target=run_ping_server, daemon=True).start()
+
 
 def self_ping_keepalive():
     while True:
@@ -61,7 +66,9 @@ def self_ping_keepalive():
         except Exception:
             pass
 
+
 threading.Thread(target=self_ping_keepalive, daemon=True).start()
+
 
 # ==========================================
 # 2. Math & Redis Helpers
@@ -69,11 +76,13 @@ threading.Thread(target=self_ping_keepalive, daemon=True).start()
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
+
 def compute_contract_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
     tau = max(days_to_exp / 365.0, 0.001)
     d1 = (math.log(s / k) + (r + 0.5 * iv ** 2) * tau) / (iv * math.sqrt(tau))
     ce_delta = norm_cdf(d1)
     return round(ce_delta if is_ce else (1.0 - ce_delta), 2)
+
 
 def is_market_hours():
     now = datetime.datetime.now(IST)
@@ -81,8 +90,12 @@ def is_market_hours():
         return False
     return datetime.time(9, 15) <= now.time() <= datetime.time(15, 30)
 
+
 def send_telegram_alert(message: str):
-    if not is_market_hours() or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not is_market_hours():
+        return False
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -97,15 +110,17 @@ def send_telegram_alert(message: str):
     except Exception:
         return False
 
+
 def push_to_redis(key, data_obj):
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
         return
     url = f"{UPSTASH_REDIS_REST_URL}/set/{key}"
     headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
     try:
-        requests.post(url, headers=headers, data=json.dumps(data_obj), timeout=4)
-    except Exception as e:
-        print(f"[Redis Set Error]: {e}")
+        requests.post(url, headers=headers, data=json.dumps(data_obj), timeout=3)
+    except Exception:
+        pass
+
 
 def read_from_redis(key="nifty_live_state"):
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
@@ -113,7 +128,7 @@ def read_from_redis(key="nifty_live_state"):
     url = f"{UPSTASH_REDIS_REST_URL}/get/{key}"
     headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
     try:
-        r = requests.get(url, headers=headers, timeout=3)
+        r = requests.get(url, headers=headers, timeout=2)
         if r.status_code == 200:
             val = r.json().get("result")
             if val:
@@ -121,6 +136,7 @@ def read_from_redis(key="nifty_live_state"):
     except Exception:
         pass
     return None
+
 
 def get_dynamic_budget():
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
@@ -136,6 +152,7 @@ def get_dynamic_budget():
     except Exception:
         pass
     return BUDGET_CEILING
+
 
 # ==========================================
 # 3. Strategy Core Engine
@@ -170,6 +187,9 @@ class DedicatedTradingWorker:
 
         today_str = self.today.strftime("%Y-%m-%d")
         saved_state = read_from_redis("nifty_live_state") or {}
+
+        self.markers = []
+        self.history_cards = {}
 
         if is_market_hours() and saved_state.get("trade_date") == today_str:
             if saved_state.get("locked_trade") and not saved_state.get("locked_trade", {}).get("closed", False):
@@ -223,6 +243,7 @@ class DedicatedTradingWorker:
     def init_historical_candles(self):
         now = datetime.datetime.now(IST)
         loaded = False
+
         for days_back in [5, 3]:
             from_str = (now - datetime.timedelta(days=days_back)).strftime("%Y-%m-%d 09:15")
             to_str = now.strftime("%Y-%m-%d %H:%M")
@@ -254,12 +275,11 @@ class DedicatedTradingWorker:
                         })
                     self.candles = cand_list
                     loaded = True
-                    print(f"[Candles Loaded]: {len(self.candles)} candles over {days_back} days.")
+                    print(f"[Candles Loaded]: {len(self.candles)} candles initialized over {days_back} days.")
                     break
             except Exception as e:
                 print(f"[Candles Error]: {e}")
 
-        # Always pull daily candles to verify PDH, PDL, PDC and Pivots
         self.fetch_daily_fallback_levels()
 
     def fetch_daily_fallback_levels(self):
@@ -289,6 +309,8 @@ class DedicatedTradingWorker:
                     "R1": round((2.0 * P) - pdl, 2), "S1": round((2.0 * P) - pdh, 2),
                     "R2": round(P + rng, 2), "S2": round(P - rng, 2),
                     "R3": round(pdh + (2.0 * (P - pdl)), 2), "S3": round(pdl - (2.0 * (pdh - P)), 2),
+                    "R4": round(round(pdh + (2.0 * (P - pdl)), 2) + rng, 2), "S4": round(round(pdl - (2.0 * (pdh - P)), 2) - rng, 2),
+                    "R5": round(round(round(pdh + (2.0 * (P - pdl)), 2) + rng, 2) + rng, 2), "S5": round(round(round(pdl - (2.0 * (pdh - P)), 2) - rng, 2) - rng, 2),
                     "PDH": pdh,
                     "PDL": pdl,
                 }
@@ -353,6 +375,7 @@ class DedicatedTradingWorker:
         exp_slice = future_exp[future_exp["expiry"] == curr_exp]
         days_to_exp = max(1, (exp_slice.iloc[0]["exp_dt"].date() - self.today).days)
 
+        # Direction-aware candidate evaluation (strictly OTM/ATM)
         candidates = []
         strike_offsets = range(0, 8) if is_ce else range(0, -8, -1)
 
@@ -426,14 +449,12 @@ class DedicatedTradingWorker:
         if len(today_bars) > 0:
             self.session_open_price = float(today_bars.iloc[0]["open"])
 
-        # ORB Range based on 09:15 to 09:30 AM
         orb_bars = today_bars.iloc[0:3] if len(today_bars) >= 3 else today_bars
         curr_orb_h = round(float(orb_bars["high"].max()), 2)
         curr_orb_l = round(float(orb_bars["low"].min()), 2)
         orb_range_val = max(15.0, round(curr_orb_h - curr_orb_l, 2))
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
-        # Fibonacci Expansion Lines for Chart
         self.fib_lines = {
             "FIB_1_0_H": round(curr_orb_h + orb_range_val, 2),
             "FIB_1_618_H": round(curr_orb_h + (1.618 * orb_range_val), 2),
@@ -561,15 +582,34 @@ class DedicatedTradingWorker:
                             sl_val = round(h + 5.0, 1)
 
                 elif in_w2:
+                    session_high = float(day_bars.iloc[:idx+1]["high"].max())
+                    session_low = float(day_bars.iloc[:idx+1]["low"].min())
+                    day_spread = session_high - session_low
+                    
+                    # Lockout if day moved > 250 points
+                    if day_spread >= 250.0:
+                        continue
+
+                    # Lockout if overextended from VWAP by > 80 points
+                    if abs(c - vw) > 80.0:
+                        continue
+
                     prior_4_high = float(day_bars.iloc[max(0, idx - 4):idx]["high"].max())
-                    is_exhausted_pole = (prior_4_high - c) > 115.0
+                    is_exhausted_pole = (prior_4_high - c) > 100.0
 
                     if c > m_hod and prev_c <= m_hod and c > d_h:
-                        ce_cand = True
-                        sl_val = round(l - 5.0, 1)
+                        potential_tgs = self.compute_all_confluence_targets(day_bars.iloc[:idx+1], c, is_ce=True, custom_pivots=day_pivots, custom_orb=day_orb)
+                        runway = (potential_tgs[0] - c) if potential_tgs else 0.0
+                        if runway >= 70.0:
+                            ce_cand = True
+                            sl_val = round(l - 5.0, 1)
+
                     elif c < m_lod and prev_c >= m_lod and c < d_l and not is_exhausted_pole:
-                        pe_cand = True
-                        sl_val = round(h + 5.0, 1)
+                        potential_tgs = self.compute_all_confluence_targets(day_bars.iloc[:idx+1], c, is_ce=False, custom_pivots=day_pivots, custom_orb=day_orb)
+                        runway = (c - potential_tgs[0]) if potential_tgs else 0.0
+                        if runway >= 70.0:
+                            pe_cand = True
+                            sl_val = round(h + 5.0, 1)
 
                 if ce_cand:
                     day_trade_count += 1
@@ -751,16 +791,40 @@ class DedicatedTradingWorker:
                     sl_val = round(high_p + 5.0, 1)
 
         elif in_w2:
+            session_high = float(df_curr["high"].max())
+            session_low = float(df_curr["low"].min())
+            day_spread = session_high - session_low
+            
+            # Exhaustion Filters
+            if day_spread >= 250.0:
+                print(f"[W2 Blocked]: Daily spread {day_spread:.1f}p exceeds 250p exhaustion limit.")
+                return
+
+            if abs(close_p - vwap_val) > 80.0:
+                print(f"[W2 Blocked]: Overextended from VWAP by {abs(close_p - vwap_val):.1f}p.")
+                return
+
             prior_4_high = float(df_curr.iloc[-4:]["high"].max()) if len(df_curr) >= 4 else high_p
-            is_exhausted_pole = (prior_4_high - close_p) > 115.0
+            is_exhausted_pole = (prior_4_high - close_p) > 100.0
 
             if close_p > session_hod_prior and prev_c["close"] <= session_hod_prior and close_p > orb_h:
+                potential_targets = self.compute_all_confluence_targets(df_curr, close_p, is_ce=True)
+                runway = (potential_targets[0] - close_p) if potential_targets else 0.0
+                if runway < 70.0:
+                    print(f"[W2 Blocked]: Target 1 runway only {runway:.1f}p (minimum 70p required).")
+                    return
                 ce_candidate = True
-                setup_title = "HOD BREAKOUT"
+                setup_title = "HOD BREAKOUT (W2)"
                 sl_val = round(low_p - 5.0, 1)
+
             elif close_p < session_lod_prior and prev_c["close"] >= session_lod_prior and close_p < orb_l and not is_exhausted_pole:
+                potential_targets = self.compute_all_confluence_targets(df_curr, close_p, is_ce=False)
+                runway = (close_p - potential_targets[0]) if potential_targets else 0.0
+                if runway < 70.0:
+                    print(f"[W2 Blocked]: Target 1 runway only {runway:.1f}p (minimum 70p required).")
+                    return
                 pe_candidate = True
-                setup_title = "LOD BREAKDOWN"
+                setup_title = "LOD BREAKDOWN (W2)"
                 sl_val = round(high_p + 5.0, 1)
 
         if ce_candidate:
@@ -1057,6 +1121,7 @@ class DedicatedTradingWorker:
         }
         push_to_redis("nifty_live_state", payload)
 
+
 # ==========================================
 # 4. Supervisor Loop
 # ==========================================
@@ -1116,6 +1181,7 @@ def run_worker():
         except Exception as e:
             print(f"[Supervisor Error]: {e}. Reconnecting in 10s...")
             time.sleep(10)
+
 
 if __name__ == "__main__":
     run_worker()
