@@ -403,7 +403,7 @@ class DedicatedTradingWorker:
         return chosen_strike, chosen_sym, chosen_tok, delta, days_to_exp, chosen_ltp
 
     def simulate_previous_day_trades(self):
-        """Simulates yesterday's complete trading session matching the Pine Script dual regime."""
+        """Simulates yesterday's complete session: Entry, Initial SL, Trailing SL steps, Target & Exit."""
         if not self.candles:
             return
 
@@ -420,7 +420,6 @@ class DedicatedTradingWorker:
         if len(prev_bars) < 4:
             return
 
-        # Previous Day ORB (First 3 bars: 09:15 - 09:30)
         ow = prev_bars.iloc[0:3]
         p_orb_h = round(float(ow["high"].max()), 2)
         p_orb_l = round(float(ow["low"].min()), 2)
@@ -445,7 +444,6 @@ class DedicatedTradingWorker:
             t_sec = int(r["time"])
             time_label = (r["dt"].astimezone(IST) + datetime.timedelta(minutes=5)).strftime("%H:%M")
 
-            # 1. Evaluate Trailing SL or Exits if in an active trade
             if sim_trade is not None:
                 is_ce = (sim_trade["type"] == "CE")
                 entry_p = sim_trade["entry"]
@@ -485,13 +483,13 @@ class DedicatedTradingWorker:
                     final_inr = int(round(final_pts * sim_trade["delta"] * LOT_SIZE_QTY))
                     sign = "+" if final_pts >= 0 else ""
 
-                    # Add Exit Marker
+                    # Add Exit Marker on Chart
                     self.markers.append({
                         "time": t_sec,
                         "position": "aboveBar" if is_ce else "belowBar",
                         "color": "#ffa726",
-                        "shape": "circle",
-                        "text": f"EXIT {sim_trade['type']}: {sign}{final_pts}p ({exit_reason})",
+                        "shape": "square",
+                        "text": f"EXIT {sim_trade['type']}: {sign}{final_pts}p",
                     })
 
                     self.history_cards[str(t_sec)] = {
@@ -513,6 +511,8 @@ class DedicatedTradingWorker:
                         "entry_spot": entry_p,
                         "opt_entry": sim_trade["opt_entry"],
                         "init_sl": sim_trade["init_sl"],
+                        "final_trail_sl": cur_sl,
+                        "target_p": target_p,
                         "exit_time": time_label,
                         "exit_spot": exit_price,
                         "final_pts": final_pts,
@@ -522,8 +522,9 @@ class DedicatedTradingWorker:
                     sim_trade = None
                     break
 
-                # Trailing mechanism for Breakout Mode
+                # Trailing logic for Breakout Mode
                 if mode == "BREAKOUT":
+                    old_sl = sim_trade["current_sl"]
                     if is_ce:
                         sim_trade["peak"] = max(sim_trade["peak"], h)
                         gain_l = sim_trade["peak"] - entry_p
@@ -544,9 +545,20 @@ class DedicatedTradingWorker:
                             min_guar_sl = entry_p - sim_trade["bank_dist"] + (0.3 * trade_atr)
                             prev_bar_sl = float(prev_bars.iloc[idx - 1]["high"]) - 2.0
                             sim_trade["current_sl"] = min(sim_trade["current_sl"], min(fib_tight_sl, min(min_guar_sl, prev_bar_sl)))
+
+                    # Add marker if Trailing SL tightened
+                    if abs(sim_trade["current_sl"] - old_sl) >= 4.0:
+                        locked_pts = round((sim_trade["current_sl"] - entry_p) if is_ce else (entry_p - sim_trade["current_sl"]), 1)
+                        self.markers.append({
+                            "time": t_sec,
+                            "position": "belowBar" if is_ce else "aboveBar",
+                            "color": "#00e676",
+                            "shape": "circle",
+                            "text": f"TRAIL SL: {sim_trade['current_sl']:.1f} (+{locked_pts}p)",
+                        })
                 continue
 
-            # 2. Check for Signal strictly within 09:30 - 10:00 AM
+            # Check for Signal strictly within 09:30 - 10:00 AM
             if not trade_fired and datetime.time(9, 30) <= b_time < datetime.time(10, 0):
                 if h > p_orb_h:
                     p_pierced_h = True
@@ -610,7 +622,6 @@ class DedicatedTradingWorker:
                     est_opt = 75.0
                     risk_pts = round(abs(c - sl_val), 1)
 
-                    # Add Entry Marker
                     self.markers.append({
                         "time": t_sec,
                         "position": "belowBar" if is_ce else "aboveBar",
@@ -1143,8 +1154,7 @@ class DedicatedTradingWorker:
                 }
 
         sorted_times = sorted(clean_map.keys())
-        # Provide enough historical candles to cover full previous day + today
-        recent_candles = [clean_map[t] for t in sorted_times][-200:]
+        recent_candles = [clean_map[t] for t in sorted_times][-240:]
 
         payload = {
             "ltp": float(live_ltp),
