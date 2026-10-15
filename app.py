@@ -54,6 +54,7 @@ pivots = state_data.get("pivots", {})
 orb_levels = state_data.get("orb_levels", {})
 fib_lines = state_data.get("fib_lines", {})
 contract_preview = state_data.get("contract_preview", {})
+prev_day_summary = state_data.get("prev_day_summary", {})
 hud = state_data.get("hud", {})
 
 daily_atr10 = float(state_data.get("daily_atr10", 0.0))
@@ -101,7 +102,7 @@ with col_refresh:
         st.rerun()
 
 # -------------------------------------------------------------
-# Active Trade Execution HUD or Standby Forecast Table
+# Active Trade HUD Card or Standby Forecast Table
 # -------------------------------------------------------------
 if hud and hud.get("entry_spot"):
     trade_type = hud.get("type", "CE")
@@ -171,8 +172,30 @@ else:
     regime_mode_desc = f"BREAKOUT (≥{vol_threshold:.0f} ATR: 3x ATR Runner)" if is_high_vol else f"FADE (<{vol_threshold:.0f} ATR: 0.5 ATR Sweep to VWAP)"
     status_label = "Awaiting 09:30-10:00 Window Trigger" if trades_taken == 0 else "Daily Trade Completed (1/1 Limit Reached)"
 
+    # Previous Day Summary Banner
+    prev_summary_html = ""
+    if prev_day_summary and prev_day_summary.get("type"):
+        p_type = prev_day_summary.get("type", "—")
+        p_color = "#00e676" if p_type == "CE" else "#ff5252"
+        p_pts = prev_day_summary.get("final_pts", 0.0)
+        p_inr = prev_day_summary.get("final_inr", 0)
+        p_sign = "+" if p_pts >= 0 else ""
+        p_pnl_color = "#00e676" if p_pts >= 0 else "#ff5252"
+
+        prev_summary_html = (
+            '<div style="background:#1a1f2c; border:1px solid #363a45; border-radius:6px; padding:8px 12px; margin-bottom:10px;">'
+            '<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">'
+            f'<div style="font-size:12px; color:#d1d4dc;"><b>PREVIOUS DAY SESSION ({prev_day_summary.get("date")}):</b> '
+            f'<span style="color:{p_color}; font-weight:bold;">BUY {p_type} ({prev_day_summary.get("regime")})</span> @ <b>{prev_day_summary.get("entry_spot")}</b> '
+            f'| Initial SL: <b>{prev_day_summary.get("init_sl")}</b> | Exit: <b>{prev_day_summary.get("exit_spot")}</b> ({prev_day_summary.get("exit_reason")})</div>'
+            f'<div style="font-size:13px; font-weight:bold; color:{p_pnl_color};">NET PnL: {p_sign}{p_pts:.1f} pts (₹{p_sign}{p_inr})</div>'
+            '</div>'
+            '</div>'
+        )
+
     standby_html = (
         '<div style="background:#131722; border:1px solid #2a2e39; border-radius:8px; padding:12px 16px; margin-bottom:12px;">'
+        + prev_summary_html +
         '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">'
         '<span style="color:#90a4ae; font-size:13px; font-weight:bold;">STANDBY MONITOR • DUAL REGIME SESSION LEVELS</span>'
         f'<span style="color:#787b86; font-size:12px;">{status_label}</span>'
@@ -290,7 +313,7 @@ html_code = f"""
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
       z-index: 1000;
       pointer-events: none;
-      min-width: 220px;
+      min-width: 230px;
     }}
   </style>
 </head>
@@ -462,11 +485,9 @@ html_code = f"""
         hoverCard.innerHTML = `
           <div style="font-weight:bold; color:${{color}}; margin-bottom:4px;">${{cardData.title}}</div>
           <div><b>Time:</b> ${{cardData.time_str}}</div>
-          <div><b>Contract:</b> ${{cardData.symbol || ''}} (Δ: ${{cardData.delta || 0.5}})</div>
-          <div><b>Index Entry:</b> ${{cardData.entry}} | <b>Opt:</b> ₹${{cardData.opt_entry || '—'}}</div>
-          <div><b>Index SL:</b> ${{cardData.sl}} | <b>GTT:</b> ₹${{cardData.opt_sl || '—'}}</div>
-          <div><b>Target:</b> ${{cardData.target}} | <b>Opt Target:</b> ₹${{cardData.opt_target || '—'}}</div>
-          <div><b>Status:</b> ${{cardData.outcome || 'ACTIVE'}}</div>
+          <div><b>Index Entry:</b> ${{cardData.entry}} | <b>SL:</b> ${{cardData.sl}}</div>
+          <div><b>Target:</b> ${{cardData.target}}</div>
+          <div><b>Outcome:</b> ${{cardData.outcome}}</div>
         `;
         hoverCard.style.display = 'block';
         hoverCard.style.left = Math.min(param.point.x + 15, container.clientWidth - 240) + 'px';
