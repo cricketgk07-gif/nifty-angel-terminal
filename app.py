@@ -66,7 +66,7 @@ saved_budget = read_redis_key("user_selected_budget")
 current_budget = float(saved_budget) if saved_budget is not None else BUDGET_CEILING_DEFAULT
 
 # -------------------------------------------------------------
-# Header Bar & Live Point Monitor
+# 1. Header Bar & Real-time Point Monitor
 # -------------------------------------------------------------
 col_title, col_budget, col_refresh = st.columns([3, 2, 1])
 
@@ -102,25 +102,8 @@ with col_refresh:
         st.rerun()
 
 # -------------------------------------------------------------
-# Dynamic Previous Day & Live Execution Card
+# 2. Previous Day Trade Cycle & Verification Card
 # -------------------------------------------------------------
-orb_h_display = orb_levels.get("orb_h", "—")
-orb_l_display = orb_levels.get("orb_l", "—")
-pivot_p_display = pivots.get("P", "—")
-pdh_display = pivots.get("PDH", "—")
-pdl_display = pivots.get("PDL", "—")
-fib_dir = fib_lines.get("direction", "NEUTRAL")
-fib_50 = fib_lines.get("fib_50", "—")
-fib_100 = fib_lines.get("fib_100", "—")
-fib_161 = fib_lines.get("fib_161", "—")
-
-ce_f = contract_preview.get("CE", {})
-pe_f = contract_preview.get("PE", {})
-regime_mode_desc = f"BREAKOUT (≥{vol_threshold:.0f} ATR: 3x ATR Runner)" if is_high_vol else f"FADE (<{vol_threshold:.0f} ATR: 0.5 ATR Sweep to VWAP)"
-
-active_trade_type = hud.get("type") if (hud and hud.get("entry_spot")) else None
-
-# 1. Full Previous Day Card (Entry, Initial SL, Trail SL, Target, Exit & Points Secured)
 prev_summary_html = ""
 if prev_day_summary and prev_day_summary.get("type"):
     p_type = prev_day_summary.get("type", "—")
@@ -147,7 +130,25 @@ if prev_day_summary and prev_day_summary.get("type"):
         '</div>'
     )
 
-# 2. Dynamic Live Box (Empty/Disable Inactive Side)
+# -------------------------------------------------------------
+# 3. Dynamic Execution & Strike Monitor Table
+# -------------------------------------------------------------
+orb_h_display = orb_levels.get("orb_h", "—")
+orb_l_display = orb_levels.get("orb_l", "—")
+pivot_p_display = pivots.get("P", "—")
+pdh_display = pivots.get("PDH", "—")
+pdl_display = pivots.get("PDL", "—")
+fib_dir = fib_lines.get("direction", "NEUTRAL")
+fib_50 = fib_lines.get("fib_50", "—")
+fib_100 = fib_lines.get("fib_100", "—")
+fib_161 = fib_lines.get("fib_161", "—")
+
+ce_f = contract_preview.get("CE", {})
+pe_f = contract_preview.get("PE", {})
+regime_mode_desc = f"BREAKOUT (≥{vol_threshold:.0f} ATR: 3x ATR Runner)" if is_high_vol else f"FADE (<{vol_threshold:.0f} ATR: 0.5 ATR Sweep to VWAP)"
+
+active_trade_type = hud.get("type") if (hud and hud.get("entry_spot")) else None
+
 if active_trade_type == "CE":
     entry_spot = float(hud.get("entry_spot", 0.0))
     entry_opt = float(hud.get("entry_opt", 0.0))
@@ -201,7 +202,6 @@ elif active_trade_type == "PE":
     )
 
 else:
-    # Standby Preview Mode
     ce_box_html = (
         '<div style="background:#1f2430; padding:10px 14px; border-radius:6px; flex:1; min-width:280px; border-left:4px solid #00e676;">'
         f'<div style="font-size:12px; color:#00e676; font-weight:bold;">CALL OPTION (CE) • {ce_f.get("symbol", "NIFTY CE")} (Δ: {ce_f.get("delta", 0.5):.2f})</div>'
@@ -268,7 +268,7 @@ complete_banner_html = (
 st.markdown(complete_banner_html, unsafe_allow_html=True)
 
 # -------------------------------------------------------------
-# Lightweight Charts Component (Interactive Chart with Pivots & Fibs)
+# 4. Interactive Candlestick Chart (Lightweight Charts Canvas)
 # -------------------------------------------------------------
 candles_json = json.dumps(candles)
 markers_json = json.dumps(markers)
@@ -345,4 +345,236 @@ html_code = f"""
     const rawCandles = {candles_json} || [];
     const rawMarkers = {markers_json} || [];
     const historyCards = {history_cards_json} || {{}};
-    const pivots
+    const pivots = {pivots_json} || {{}};
+    const orbLevels = {orb_json} || {{}};
+    const fibLines = {fib_json} || {{}};
+    const IST_OFFSET = 19800;
+
+    const formattedCandles = rawCandles.map(c => ({{
+      time: c.time + IST_OFFSET,
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+      vwap: c.vwap,
+      ema9: c.ema9
+    }}));
+
+    const formattedMarkers = rawMarkers.map(m => ({{
+      ...m,
+      time: m.time + IST_OFFSET
+    }}));
+
+    const container = document.getElementById('chart_container');
+    const hoverCard = document.getElementById('hover_card');
+
+    const chart = LightweightCharts.createChart(container, {{
+      width: container.clientWidth,
+      height: 620,
+      layout: {{
+        background: {{ color: '#131722' }},
+        textColor: '#d1d4dc',
+      }},
+      grid: {{
+        vertLines: {{ color: '#1f2430' }},
+        horzLines: {{ color: '#1f2430' }},
+      }},
+      crosshair: {{
+        mode: LightweightCharts.CrosshairMode.Normal,
+      }},
+      rightPriceScale: {{
+        borderColor: '#2a2e39',
+        autoScale: true,
+      }},
+      timeScale: {{
+        borderColor: '#2a2e39',
+        timeVisible: true,
+        secondsVisible: false,
+      }},
+    }});
+
+    const candleSeries = chart.addCandlestickSeries({{
+      upColor: '#089981',
+      downColor: '#f23645',
+      borderVisible: false,
+      wickUpColor: '#089981',
+      wickDownColor: '#f23645',
+    }});
+    candleSeries.setData(formattedCandles);
+
+    const vwapSeries = chart.addLineSeries({{
+      color: '#9c27b0',
+      lineWidth: 2,
+      priceLineVisible: false,
+      title: 'VWAP',
+    }});
+    vwapSeries.setData(formattedCandles.filter(d => d.vwap).map(d => ({{ time: d.time, value: d.vwap }})));
+
+    const emaSeries = chart.addLineSeries({{
+      color: '#2962ff',
+      lineWidth: 1,
+      priceLineVisible: false,
+      title: 'EMA 9',
+    }});
+    emaSeries.setData(formattedCandles.filter(d => d.ema9).map(d => ({{ time: d.time, value: d.ema9 }})));
+
+    if (formattedMarkers.length > 0) {{
+      candleSeries.setMarkers(formattedMarkers);
+    }}
+
+    // 1. Classical Floor Pivots (P, R1-R5, S1-S5, PDH, PDL)
+    const visiblePivots = {{
+      'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
+      'R1':  {{ color: '#ef5350', title: 'R1' }},
+      'R2':  {{ color: '#e53935', title: 'R2' }},
+      'R3':  {{ color: '#d32f2f', title: 'R3' }},
+      'R4':  {{ color: '#c62828', title: 'R4' }},
+      'R5':  {{ color: '#b71c1c', title: 'R5' }},
+      'S1':  {{ color: '#26a69a', title: 'S1' }},
+      'S2':  {{ color: '#00897b', title: 'S2' }},
+      'S3':  {{ color: '#00796b', title: 'S3' }},
+      'S4':  {{ color: '#00695c', title: 'S4' }},
+      'S5':  {{ color: '#004d40', title: 'S5' }},
+      'PDH': {{ color: '#42a5f5', title: 'PDH' }},
+      'PDL': {{ color: '#ab47bc', title: 'PDL' }},
+    }};
+
+    Object.entries(pivots).forEach(([k, val]) => {{
+      const numVal = parseFloat(val);
+      if (!isNaN(numVal) && numVal > 0 && visiblePivots[k]) {{
+        candleSeries.createPriceLine({{
+          price: numVal,
+          color: visiblePivots[k].color,
+          lineWidth: 1,
+          lineStyle: LightweightCharts.LineStyle.Dashed,
+          axisLabelVisible: true,
+          title: visiblePivots[k].title,
+        }});
+      }}
+    }});
+
+    // 2. ORB High & Low Bands
+    if (orbLevels && orbLevels.orb_h) {{
+      candleSeries.createPriceLine({{
+        price: parseFloat(orbLevels.orb_h),
+        color: '#00e676',
+        lineWidth: 2,
+        lineStyle: LightweightCharts.LineStyle.Solid,
+        axisLabelVisible: true,
+        title: 'ORB HIGH',
+      }});
+    }}
+    if (orbLevels && orbLevels.orb_l) {{
+      candleSeries.createPriceLine({{
+        price: parseFloat(orbLevels.orb_l),
+        color: '#ff5252',
+        lineWidth: 2,
+        lineStyle: LightweightCharts.LineStyle.Solid,
+        axisLabelVisible: true,
+        title: 'ORB LOW',
+      }});
+    }}
+
+    // 3. Dynamic ORB Fibonacci Lines
+    if (fibLines) {{
+      const fibTitles = {{
+        'ORB_MID': 'ORB MID',
+        'fib_50': 'FIB 50%',
+        'fib_100': 'FIB 100%',
+        'fib_161': 'FIB 161.8%'
+      }};
+      Object.entries(fibLines).forEach(([fKey, fVal]) => {{
+        const numVal = parseFloat(fVal);
+        if (!isNaN(numVal) && numVal > 0 && fibTitles[fKey]) {{
+          candleSeries.createPriceLine({{
+            price: numVal,
+            color: '#b388ff',
+            lineWidth: 1,
+            lineStyle: LightweightCharts.LineStyle.Dotted,
+            axisLabelVisible: true,
+            title: fibTitles[fKey],
+          }});
+        }}
+      }});
+    }}
+
+    if (formattedCandles.length > 0) {{
+      chart.timeScale().fitContent();
+    }}
+
+    chart.subscribeCrosshairMove(param => {{
+      if (!param || !param.time || !param.point) {{
+        hoverCard.style.display = 'none';
+        return;
+      }}
+      const rawSecKey = String(param.time - IST_OFFSET);
+      const cardData = historyCards[rawSecKey] || historyCards[String(param.time)];
+      if (cardData) {{
+        const isCe = cardData.type === 'CE';
+        const color = isCe ? '#00e676' : '#ff5252';
+        hoverCard.innerHTML = `
+          <div style="font-weight:bold; color:${{color}}; margin-bottom:4px;">${{cardData.title}}</div>
+          <div><b>Time:</b> ${{cardData.time_str}}</div>
+          <div><b>Index Entry:</b> ${{cardData.entry}} | <b>SL:</b> ${{cardData.sl}}</div>
+          <div><b>Target:</b> ${{cardData.target || '—'}}</div>
+          <div><b>Outcome:</b> ${{cardData.outcome}}</div>
+        `;
+        hoverCard.style.display = 'block';
+        hoverCard.style.left = Math.min(param.point.x + 15, container.clientWidth - 240) + 'px';
+        hoverCard.style.top = Math.max(param.point.y - 80, 10) + 'px';
+      }} else {{
+        hoverCard.style.display = 'none';
+      }}
+    }});
+
+    const redisUrl = "{redis_url_str}";
+    const redisToken = "{redis_token_str}";
+
+    if (redisUrl && redisToken) {{
+      setInterval(async () => {{
+        try {{
+          const res = await fetch(redisUrl + '/get/nifty_live_state', {{
+            headers: {{ 'Authorization': 'Bearer ' + redisToken }}
+          }});
+          if (res.ok) {{
+            const dataObj = await res.json();
+            if (dataObj && dataObj.result) {{
+              const liveState = JSON.parse(dataObj.result);
+              if (liveState && liveState.candles && liveState.candles.length > 0) {{
+                const latestCandle = liveState.candles[liveState.candles.length - 1];
+                const shiftedCandle = {{
+                  time: latestCandle.time + IST_OFFSET,
+                  open: latestCandle.open,
+                  high: latestCandle.high,
+                  low: latestCandle.low,
+                  close: latestCandle.close
+                }};
+                candleSeries.update(shiftedCandle);
+                if (latestCandle.vwap) {{
+                  vwapSeries.update({{ time: shiftedCandle.time, value: latestCandle.vwap }});
+                }}
+                if (latestCandle.ema9) {{
+                  emaSeries.update({{ time: shiftedCandle.time, value: latestCandle.ema9 }});
+                }}
+              }}
+              if (liveState && liveState.ltp) {{
+                const el = window.parent.document.getElementById('live_ltp_display');
+                if (el) {{
+                  el.innerText = '₹' + Number(liveState.ltp).toFixed(2);
+                }}
+              }}
+            }}
+          }}
+        }} catch (err) {{}}
+      }}, 1000);
+    }}
+
+    window.addEventListener('resize', () => {{
+      chart.applyOptions({{ width: container.clientWidth }});
+    }});
+  </script>
+</body>
+</html>
+"""
+
+components.html(html_code, height=640)
