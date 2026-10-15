@@ -51,7 +51,11 @@ state_data = read_redis_key("nifty_live_state") or {}
 ltp = float(state_data.get("ltp", 0.0))
 opt_ltp = float(state_data.get("opt_ltp", 0.0))
 candles = state_data.get("candles", [])
+markers = state_data.get("markers", [])
+history_cards = state_data.get("history_cards", {})
+pivots = state_data.get("pivots", {})
 orb_levels = state_data.get("orb_levels", {})
+fib_lines = state_data.get("fib_lines", {})
 hud = state_data.get("hud", {})
 
 daily_atr10 = float(state_data.get("daily_atr10", 0.0))
@@ -147,7 +151,10 @@ if hud and hud.get("entry_spot"):
 else:
     orb_h_display = orb_levels.get("orb_h", "—")
     orb_l_display = orb_levels.get("orb_l", "—")
-    regime_mode_desc = f"BREAKOUT DAY (≥{vol_threshold:.0f} ATR: 3x ATR Runner)" if is_high_vol else f"FADE DAY (<{vol_threshold:.0f} ATR: 0.5 ATR Sweep to VWAP)"
+    pivot_p_display = pivots.get("P", "—")
+    pdh_display = pivots.get("PDH", "—")
+    pdl_display = pivots.get("PDL", "—")
+    regime_mode_desc = f"BREAKOUT (≥{vol_threshold:.0f} ATR: 3x ATR Runner)" if is_high_vol else f"FADE (<{vol_threshold:.0f} ATR: 0.5 ATR Sweep to VWAP)"
     status_label = "Awaiting 09:30-10:00 Window Trigger" if trades_taken == 0 else "Daily Trade Completed (1/1 Limit Reached)"
 
     st.markdown(
@@ -167,12 +174,24 @@ else:
                     <div style="font-size:14px; font-weight:bold; color:#42a5f5;">{regime_mode_desc}</div>
                 </div>
                 <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">ORB HIGH (09:15-09:30)</div>
+                    <div style="font-size:11px; color:#90a4ae;">ORB HIGH</div>
                     <div style="font-size:14px; font-weight:bold; color:#00e676;">{orb_h_display}</div>
                 </div>
                 <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">ORB LOW (09:15-09:30)</div>
+                    <div style="font-size:11px; color:#90a4ae;">ORB LOW</div>
                     <div style="font-size:14px; font-weight:bold; color:#ff5252;">{orb_l_display}</div>
+                </div>
+                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
+                    <div style="font-size:11px; color:#90a4ae;">PIVOT P</div>
+                    <div style="font-size:14px; font-weight:bold; color:#ffeb3b;">{pivot_p_display}</div>
+                </div>
+                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
+                    <div style="font-size:11px; color:#90a4ae;">PREV DAY HIGH</div>
+                    <div style="font-size:14px; font-weight:bold; color:#42a5f5;">{pdh_display}</div>
+                </div>
+                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
+                    <div style="font-size:11px; color:#90a4ae;">PREV DAY LOW</div>
+                    <div style="font-size:14px; font-weight:bold; color:#ab47bc;">{pdl_display}</div>
                 </div>
             </div>
         </div>
@@ -181,10 +200,14 @@ else:
     )
 
 # -------------------------------------------------------------
-# Lightweight Charts Component (Interactive Chart with Regime HUD)
+# Lightweight Charts Component (Interactive Chart with Pivots & Fibs)
 # -------------------------------------------------------------
 candles_json = json.dumps(candles)
+markers_json = json.dumps(markers)
+history_cards_json = json.dumps(history_cards)
+pivots_json = json.dumps(pivots)
 orb_json = json.dumps(orb_levels)
+fib_json = json.dumps(fib_lines)
 redis_url_str = UPSTASH_REDIS_REST_URL
 redis_token_str = UPSTASH_REDIS_REST_TOKEN
 
@@ -227,16 +250,36 @@ html_code = f"""
       pointer-events: none;
       box-shadow: 0 2px 6px rgba(0,0,0,0.5);
     }}
+    #hover_card {{
+      position: absolute;
+      display: none;
+      background: #1e222d;
+      border: 1px solid #363a45;
+      border-radius: 6px;
+      padding: 10px 14px;
+      font-size: 12px;
+      line-height: 1.5;
+      color: #d1d4dc;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+      z-index: 1000;
+      pointer-events: none;
+      min-width: 200px;
+    }}
   </style>
 </head>
 <body>
   <div id="chart_container">
     <div id="regime_pill">⚡ REGIME: {chart_regime_text}</div>
+    <div id="hover_card"></div>
   </div>
 
   <script>
     const rawCandles = {candles_json} || [];
+    const rawMarkers = {markers_json} || [];
+    const historyCards = {history_cards_json} || {{}};
+    const pivots = {pivots_json} || {{}};
     const orbLevels = {orb_json} || {{}};
+    const fibLines = {fib_json} || {{}};
     const IST_OFFSET = 19800;
 
     const formattedCandles = rawCandles.map(c => ({{
@@ -248,7 +291,13 @@ html_code = f"""
       vwap: c.vwap
     }}));
 
+    const formattedMarkers = rawMarkers.map(m => ({{
+      ...m,
+      time: m.time + IST_OFFSET
+    }}));
+
     const container = document.getElementById('chart_container');
+    const hoverCard = document.getElementById('hover_card');
 
     const chart = LightweightCharts.createChart(container, {{
       width: container.clientWidth,
@@ -292,6 +341,41 @@ html_code = f"""
     }});
     vwapSeries.setData(formattedCandles.filter(d => d.vwap).map(d => ({{ time: d.time, value: d.vwap }})));
 
+    if (formattedMarkers.length > 0) {{
+      candleSeries.setMarkers(formattedMarkers);
+    }}
+
+    // Pivots P, R1-R5, S1-S5, PDH, PDL
+    const visiblePivots = {{
+      'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
+      'R1':  {{ color: '#ef5350', title: 'R1' }},
+      'R2':  {{ color: '#e53935', title: 'R2' }},
+      'R3':  {{ color: '#d32f2f', title: 'R3' }},
+      'R4':  {{ color: '#c62828', title: 'R4' }},
+      'R5':  {{ color: '#b71c1c', title: 'R5' }},
+      'S1':  {{ color: '#26a69a', title: 'S1' }},
+      'S2':  {{ color: '#00897b', title: 'S2' }},
+      'S3':  {{ color: '#00796b', title: 'S3' }},
+      'S4':  {{ color: '#00695c', title: 'S4' }},
+      'S5':  {{ color: '#004d40', title: 'S5' }},
+      'PDH': {{ color: '#42a5f5', title: 'PDH' }},
+      'PDL': {{ color: '#ab47bc', title: 'PDL' }},
+    }};
+
+    Object.entries(pivots).forEach(([k, val]) => {{
+      if (val && visiblePivots[k]) {{
+        candleSeries.createPriceLine({{
+          price: parseFloat(val),
+          color: visiblePivots[k].color,
+          lineWidth: 1,
+          lineStyle: LightweightCharts.LineStyle.Dashed,
+          axisLabelVisible: true,
+          title: visiblePivots[k].title,
+        }});
+      }}
+    }});
+
+    // ORB High & Low
     if (orbLevels && orbLevels.orb_h) {{
       candleSeries.createPriceLine({{
         price: parseFloat(orbLevels.orb_h),
@@ -313,9 +397,56 @@ html_code = f"""
       }});
     }}
 
+    // Dynamic ORB Fibonacci Lines
+    if (fibLines) {{
+      const fibTitles = {{
+        'ORB_MID': 'ORB MID',
+        'fib_50': 'FIB 50%',
+        'fib_100': 'FIB 100%',
+        'fib_161': 'FIB 161.8%'
+      }};
+      Object.entries(fibLines).forEach(([fKey, fVal]) => {{
+        if (fVal && fibTitles[fKey]) {{
+          candleSeries.createPriceLine({{
+            price: parseFloat(fVal),
+            color: '#b388ff',
+            lineWidth: 1,
+            lineStyle: LightweightCharts.LineStyle.Dotted,
+            axisLabelVisible: true,
+            title: fibTitles[fKey],
+          }});
+        }}
+      }});
+    }}
+
     if (formattedCandles.length > 0) {{
       chart.timeScale().fitContent();
     }}
+
+    chart.subscribeCrosshairMove(param => {{
+      if (!param || !param.time || !param.point) {{
+        hoverCard.style.display = 'none';
+        return;
+      }}
+      const rawSecKey = String(param.time - IST_OFFSET);
+      const cardData = historyCards[rawSecKey] || historyCards[String(param.time)];
+      if (cardData) {{
+        const isCe = cardData.type === 'CE';
+        const color = isCe ? '#00e676' : '#ff5252';
+        hoverCard.innerHTML = `
+          <div style="font-weight:bold; color:${{color}}; margin-bottom:4px;">${{cardData.title}}</div>
+          <div><b>Time:</b> ${{cardData.time_str}}</div>
+          <div><b>Entry:</b> ${{cardData.entry}} | <b>SL:</b> ${{cardData.sl}}</div>
+          <div><b>Target:</b> ${{cardData.target}}</div>
+          <div><b>Status:</b> ${{cardData.outcome || 'ACTIVE'}}</div>
+        `;
+        hoverCard.style.display = 'block';
+        hoverCard.style.left = Math.min(param.point.x + 15, container.clientWidth - 220) + 'px';
+        hoverCard.style.top = Math.max(param.point.y - 70, 10) + 'px';
+      }} else {{
+        hoverCard.style.display = 'none';
+      }}
+    }});
 
     const redisUrl = "{redis_url_str}";
     const redisToken = "{redis_token_str}";
