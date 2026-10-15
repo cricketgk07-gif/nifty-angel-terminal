@@ -117,7 +117,7 @@ def push_to_redis(key, data_obj):
     url = f"{UPSTASH_REDIS_REST_URL}/set/{key}"
     headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
     try:
-        requests.post(url, headers=headers, data=json.dumps(data_obj), timeout=2)
+        requests.post(url, headers=headers, data=json.dumps(data_obj), timeout=3)
     except Exception:
         pass
 
@@ -192,10 +192,13 @@ class DedicatedTradingWorker:
         self.history_cards = {}
 
         if is_market_hours() and saved_state.get("trade_date") == today_str:
-            self.trades_taken_today = saved_state.get("trades_taken_today", 0)
-            self.trade_history_today = saved_state.get("trade_history_today", [])
-            if not saved_state.get("trade_closed", False):
+            if saved_state.get("locked_trade") and not saved_state.get("locked_trade", {}).get("closed", False):
                 self.locked_trade = saved_state.get("locked_trade")
+                self.trades_taken_today = saved_state.get("trades_taken_today", 1)
+                self.trade_history_today = saved_state.get("trade_history_today", [])
+            else:
+                self.trades_taken_today = saved_state.get("trades_taken_today", 0)
+                self.trade_history_today = saved_state.get("trade_history_today", [])
 
         self.nfo_df = self.load_scrip_master()
         self.init_historical_candles()
@@ -239,41 +242,89 @@ class DedicatedTradingWorker:
 
     def init_historical_candles(self):
         now = datetime.datetime.now(IST)
-        from_str = (now - datetime.timedelta(days=7)).strftime("%Y-%m-%d 09:15")
+        loaded = False
+
+        # Attempt multi-day fetch with fallback to 4 days if 8 days rate-limits
+        for days_back in [8, 4]:
+            from_str = (now - datetime.timedelta(days=days_back)).strftime("%Y-%m-%d 09:15")
+            to_str = now.strftime("%Y-%m-%d %H:%M")
+            try:
+                resp = self.api.getCandleData({
+                    "exchange": "NSE",
+                    "symboltoken": INDEX_TOKEN,
+                    "interval": "FIVE_MINUTE",
+                    "fromdate": from_str,
+                    "todate": to_str,
+                })
+                if resp and resp.get("status") and resp.get("data") and len(resp["data"]) > 20:
+                    cand_list = []
+                    for b in resp["data"]:
+                        dt_parsed = pd.to_datetime(b[0])
+                        if dt_parsed.tzinfo is None:
+                            dt_ist = dt_parsed.tz_localize("Asia/Kolkata")
+                        else:
+                            dt_ist = dt_parsed.astimezone(IST)
+
+                        t_sec = int(dt_ist.timestamp())
+                        cand_list.append({
+                            "time": t_sec,
+                            "open": float(b[1]),
+                            "high": float(b[2]),
+                            "low": float(b[3]),
+                            "close": float(b[4]),
+                            "dt": dt_ist,
+                        })
+                    self.candles = cand_list
+                    loaded = True
+                    print(f"[Candles Loaded]: {len(self.candles)} candles initialized over {days_back} days.")
+                    break
+            except Exception as e:
+                print(f"[Candles Error days_back={days_back}]: {e}")
+
+        # If 5-minute candles are still missing, query daily candles to guarantee PDH, PDL, PDC & Pivots
+        if not loaded or len(self.candles) < 20:
+            self.fetch_daily_fallback_levels()
+
+    def fetch_daily_fallback_levels(self):
+        now = datetime.datetime.now(IST)
+        from_str = (now - datetime.timedelta(days=15)).strftime("%Y-%m-%d 09:15")
         to_str = now.strftime("%Y-%m-%d %H:%M")
         try:
             resp = self.api.getCandleData({
                 "exchange": "NSE",
                 "symboltoken": INDEX_TOKEN,
-                "interval": "FIVE_MINUTE",
+                "interval": "ONE_DAY",
                 "fromdate": from_str,
                 "todate": to_str,
             })
-            if resp and resp.get("status") and resp.get("data"):
-                self.candles = []
-                for b in resp["data"]:
-                    dt_parsed = pd.to_datetime(b[0])
-                    if dt_parsed.tzinfo is None:
-                        dt_ist = dt_parsed.tz_localize("Asia/Kolkata")
-                    else:
-                        dt_ist = dt_parsed.astimezone(IST)
+            if resp and resp.get("status") and resp.get("data") and len(resp["data"]) >= 2:
+                # Second to last daily bar is the completed previous day
+                prev_bar = resp["data"][-2]
+                pdh = round(float(prev_bar[2]), 2)
+                pdl = round(float(prev_bar[3]), 2)
+                pdc = round(float(prev_bar[4]), 2)
+                self.prev_day_close = pdc
+                P = round((pdh + pdl + pdc) / 3.0, 2)
+                rng = round(pdh - pdl, 2)
+                self.daily_atr = max(140.0, rng)
 
-                    t_sec = int(dt_ist.timestamp())
-                    self.candles.append({
-                        "time": t_sec,
-                        "open": float(b[1]),
-                        "high": float(b[2]),
-                        "low": float(b[3]),
-                        "close": float(b[4]),
-                        "dt": dt_ist,
-                    })
-                print(f"[Candles Loaded]: {len(self.candles)} candles initialized.")
+                self.pivot_lines = {
+                    "P": P,
+                    "R1": round((2.0 * P) - pdl, 2), "S1": round((2.0 * P) - pdh, 2),
+                    "R2": round(P + rng, 2), "S2": round(P - rng, 2),
+                    "R3": round(pdh + (2.0 * (P - pdl)), 2), "S3": round(pdl - (2.0 * (pdh - P)), 2),
+                    "R4": round(round(pdh + (2.0 * (P - pdl)), 2) + rng, 2), "S4": round(round(pdl - (2.0 * (pdh - P)), 2) - rng, 2),
+                    "R5": round(round(round(pdh + (2.0 * (P - pdl)), 2) + rng, 2) + rng, 2), "S5": round(round(round(pdl - (2.0 * (pdh - P)), 2) - rng, 2) - rng, 2),
+                    "PDH": pdh,
+                    "PDL": pdl,
+                }
+                print(f"[Daily Pivots Fallback Loaded]: PDH={pdh}, PDL={pdl}, P={P}")
         except Exception as e:
-            print(f"[Candles Error]: {e}")
+            print(f"[Daily Fallback Error]: {e}")
 
     def compute_all_confluence_targets(self, df_h, entry_p, is_ce, custom_pivots=None, custom_orb=None):
-        recent_swing_h = float(df_h["high"].iloc[-20:].max())
-        recent_swing_l = float(df_h["low"].iloc[-20:].min())
+        recent_swing_h = float(df_h["high"].iloc[-20:].max()) if len(df_h) >= 20 else entry_p + 75.0
+        recent_swing_l = float(df_h["low"].iloc[-20:].min()) if len(df_h) >= 20 else entry_p - 75.0
 
         orb = custom_orb or self.orb_levels
         orb_h = orb.get("orb_h", entry_p)
@@ -399,6 +450,8 @@ class DedicatedTradingWorker:
             self.candles[i]["atr14"] = float(df_h.iloc[i]["atr14"])
 
         unique_days = list(df_h["date_str"].unique())
+        
+        # Calculate daily pivot levels
         if len(unique_days) >= 2:
             prev_day_df = df_h[df_h["date_str"] == unique_days[-2]]
             if len(prev_day_df) > 0:
@@ -420,11 +473,14 @@ class DedicatedTradingWorker:
                     "PDH": pdh,
                     "PDL": pdl,
                 }
+        elif not self.pivot_lines:
+            self.fetch_daily_fallback_levels()
 
         today_bars = df_h[df_h["date_str"] == unique_days[-1]].sort_values("time").reset_index(drop=True)
         if len(today_bars) > 0:
             self.session_open_price = float(today_bars.iloc[0]["open"])
 
+        # ORB Range based strictly on the 09:15 to 09:30 AM bars (first 3 bars)
         orb_bars = today_bars.iloc[0:3] if len(today_bars) >= 3 else today_bars
         curr_orb_h = round(float(orb_bars["high"].max()), 2)
         curr_orb_l = round(float(orb_bars["low"].min()), 2)
@@ -461,6 +517,8 @@ class DedicatedTradingWorker:
                         "R1": (2.0 * h_P) - h_pdl, "S1": (2.0 * h_P) - h_pdh,
                         "R2": h_P + h_rng, "S2": h_P - h_rng,
                     }
+            elif self.pivot_lines:
+                day_pivots = self.pivot_lines
 
             day_trade_count = 0
             sim_active_trade = None
@@ -559,7 +617,7 @@ class DedicatedTradingWorker:
                 sl_val = 0.0
 
                 # ==============================================================
-                # WINDOW 1: PURE BREAKOUT (INITIAL SL: BREAKOUT CANDLE LOW/HIGH -/+ 5.0)
+                # WINDOW 1: PURE BREAKOUT (ZERO HEADROOM GATE)
                 # ==============================================================
                 if in_w1:
                     if c > d_h and prev_c <= d_h:
@@ -572,7 +630,7 @@ class DedicatedTradingWorker:
                             sl_val = round(h + 5.0, 1)
 
                 # ==============================================================
-                # WINDOW 2: AFTERNOON EXPANSION (INITIAL SL: BREAKOUT CANDLE LOW/HIGH -/+ 5.0)
+                # WINDOW 2: AFTERNOON EXPANSION
                 # ==============================================================
                 elif in_w2:
                     day_open_val = float(day_bars.iloc[0]["open"])
@@ -1093,6 +1151,7 @@ class DedicatedTradingWorker:
             pts_gain = (live_ltp - self.locked_trade["entry"]) if self.locked_trade["type"] == "CE" else (self.locked_trade["entry"] - live_ltp)
             opt_ltp = max(0.5, round(self.locked_trade.get("opt_entry_ltp", 75.0) + (pts_gain * self.locked_trade.get("delta", 0.50)), 2))
 
+        # Send full candle history to the dashboard (up to 400 bars)
         recent_candles = [
             {
                 "time": c["time"],
@@ -1103,7 +1162,7 @@ class DedicatedTradingWorker:
                 "vwap": c.get("vwap", c["close"]),
                 "ema9": c.get("ema9", c["close"]),
             }
-            for c in self.candles[-300:]
+            for c in self.candles[-400:]
         ]
         if self.active_bar:
             recent_candles.append({
