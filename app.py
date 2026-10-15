@@ -43,9 +43,6 @@ def write_redis_key(key: str, value):
         pass
 
 
-# -------------------------------------------------------------
-# Read Live Trading State from Redis
-# -------------------------------------------------------------
 state_data = read_redis_key("nifty_live_state") or {}
 
 ltp = float(state_data.get("ltp", 0.0))
@@ -56,6 +53,7 @@ history_cards = state_data.get("history_cards", {})
 pivots = state_data.get("pivots", {})
 orb_levels = state_data.get("orb_levels", {})
 fib_lines = state_data.get("fib_lines", {})
+contract_preview = state_data.get("contract_preview", {})
 hud = state_data.get("hud", {})
 
 daily_atr10 = float(state_data.get("daily_atr10", 0.0))
@@ -102,7 +100,7 @@ with col_refresh:
         st.rerun()
 
 # -------------------------------------------------------------
-# Comprehensive Execution Tables (Active HUD vs Standby Monitor)
+# Active Trade Execution HUD or Standby Forecast Table
 # -------------------------------------------------------------
 if hud and hud.get("entry_spot"):
     trade_type = hud.get("type", "CE")
@@ -131,7 +129,7 @@ if hud and hud.get("entry_spot"):
                     <span style="color:#787b86; font-size:12px;">(Delta: {delta:.2f})</span>
                 </div>
                 <div style="font-size:12px; color:#00e676; font-weight:bold;">
-                    ● ACTIVE RUNNER [1/1 DAILY TRADE COMPLETED]
+                    ● ACTIVE RUNNER [1/1 DAILY TRADE IN PROGRESS]
                 </div>
             </div>
             <div style="display:flex; gap:12px; align-items:stretch; flex-wrap:wrap;">
@@ -169,6 +167,10 @@ else:
     fib_dir = fib_lines.get("direction", "NEUTRAL")
     fib_50 = fib_lines.get("fib_50", "—")
     fib_100 = fib_lines.get("fib_100", "—")
+    fib_161 = fib_lines.get("fib_161", "—")
+
+    ce_f = contract_preview.get("CE", {})
+    pe_f = contract_preview.get("PE", {})
     regime_mode_desc = f"BREAKOUT (≥{vol_threshold:.0f} ATR: 3x ATR Runner)" if is_high_vol else f"FADE (<{vol_threshold:.0f} ATR: 0.5 ATR Sweep to VWAP)"
     status_label = "Awaiting 09:30-10:00 Window Trigger" if trades_taken == 0 else "Daily Trade Completed (1/1 Limit Reached)"
 
@@ -179,13 +181,13 @@ else:
                 <span style="color:#90a4ae; font-size:13px; font-weight:bold;">STANDBY MONITOR • DUAL REGIME SESSION LEVELS</span>
                 <span style="color:#787b86; font-size:12px;">{status_label}</span>
             </div>
-            <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+            <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:10px;">
                 <div style="background:#1f2430; padding:6px 12px; border-radius:4px;">
                     <div style="font-size:11px; color:#90a4ae;">DAILY 10-ATR</div>
                     <div style="font-size:13px; font-weight:bold; color:#ffb74d;">{daily_atr10:.1f} / {vol_threshold:.0f}</div>
                 </div>
                 <div style="background:#1f2430; padding:6px 12px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">ACTIVE STRATEGY</div>
+                    <div style="font-size:11px; color:#90a4ae;">REGIME MODE</div>
                     <div style="font-size:13px; font-weight:bold; color:#42a5f5;">{regime_mode_desc}</div>
                 </div>
                 <div style="background:#1f2430; padding:6px 12px; border-radius:4px;">
@@ -201,12 +203,28 @@ else:
                     <div style="font-size:13px; font-weight:bold; color:#ffeb3b;">{pivot_p_display}</div>
                 </div>
                 <div style="background:#1f2430; padding:6px 12px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">PREV HIGH / LOW</div>
+                    <div style="font-size:11px; color:#90a4ae;">PDH / PDL</div>
                     <div style="font-size:13px; font-weight:bold; color:#42a5f5;">{pdh_display} / {pdl_display}</div>
                 </div>
                 <div style="background:#1f2430; padding:6px 12px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">FIB 50% / 100% ({fib_dir})</div>
-                    <div style="font-size:13px; font-weight:bold; color:#b388ff;">{fib_50} / {fib_100}</div>
+                    <div style="font-size:11px; color:#90a4ae;">FIB 50% / 100% / 161% ({fib_dir})</div>
+                    <div style="font-size:13px; font-weight:bold; color:#b388ff;">{fib_50} / {fib_100} / {fib_161}</div>
+                </div>
+            </div>
+
+            <div style="border-top:1px solid #2a2e39; padding-top:8px;">
+                <div style="font-size:11px; color:#787b86; margin-bottom:6px; font-weight:bold;">PRE-TRIGGER STRIKE FORECAST (BUDGET: ≤ ₹{current_budget:.0f})</div>
+                <div style="display:flex; gap:12px; flex-wrap:wrap;">
+                    <div style="background:#1f2430; padding:6px 10px; border-radius:4px; flex:1; min-width:240px; border-left:3px solid #00e676;">
+                        <div style="font-size:11px; color:#00e676; font-weight:bold;">CALL OPTION (CE) • {ce_f.get('symbol', 'NIFTY CE')} (Δ: {ce_f.get('delta', 0.5):.2f})</div>
+                        <div style="font-size:12px; color:#d1d4dc;">LTP: <b>₹{ce_f.get('opt_ltp', 0.0):.2f}</b> | Trig: <b>{ce_f.get('exp_entry_spot', 0.0):.1f}</b></div>
+                        <div style="font-size:11px; color:#90a4ae;">SL: {ce_f.get('exp_sl_spot', 0.0):.1f} (₹{ce_f.get('exp_sl_opt', 0.0):.2f}) | Target: {ce_f.get('exp_target_spot', 0.0):.1f} (₹{ce_f.get('exp_target_opt', 0.0):.2f})</div>
+                    </div>
+                    <div style="background:#1f2430; padding:6px 10px; border-radius:4px; flex:1; min-width:240px; border-left:3px solid #ff5252;">
+                        <div style="font-size:11px; color:#ff5252; font-weight:bold;">PUT OPTION (PE) • {pe_f.get('symbol', 'NIFTY PE')} (Δ: {pe_f.get('delta', 0.5):.2f})</div>
+                        <div style="font-size:12px; color:#d1d4dc;">LTP: <b>₹{pe_f.get('opt_ltp', 0.0):.2f}</b> | Trig: <b>{pe_f.get('exp_entry_spot', 0.0):.1f}</b></div>
+                        <div style="font-size:11px; color:#90a4ae;">SL: {pe_f.get('exp_sl_spot', 0.0):.1f} (₹{pe_f.get('exp_sl_opt', 0.0):.2f}) | Target: {pe_f.get('exp_target_spot', 0.0):.1f} (₹{pe_f.get('exp_target_opt', 0.0):.2f})</div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -360,7 +378,7 @@ html_code = f"""
       candleSeries.setMarkers(formattedMarkers);
     }}
 
-    // Pivots P, R1-R5, S1-S5, PDH, PDL[cite: 3]
+    // 1. Full Pivots P, R1-R5, S1-S5, PDH, PDL
     const visiblePivots = {{
       'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
       'R1':  {{ color: '#ef5350', title: 'R1' }},
@@ -378,9 +396,10 @@ html_code = f"""
     }};
 
     Object.entries(pivots).forEach(([k, val]) => {{
-      if (val && visiblePivots[k]) {{
+      const numVal = parseFloat(val);
+      if (!isNaN(numVal) && numVal > 0 && visiblePivots[k]) {{
         candleSeries.createPriceLine({{
-          price: parseFloat(val),
+          price: numVal,
           color: visiblePivots[k].color,
           lineWidth: 1,
           lineStyle: LightweightCharts.LineStyle.Dashed,
@@ -390,7 +409,7 @@ html_code = f"""
       }}
     }});
 
-    // ORB High & Low[cite: 3]
+    // 2. ORB High & Low
     if (orbLevels && orbLevels.orb_h) {{
       candleSeries.createPriceLine({{
         price: parseFloat(orbLevels.orb_h),
@@ -412,7 +431,7 @@ html_code = f"""
       }});
     }}
 
-    // Dynamic ORB Fibonacci Lines[cite: 3]
+    // 3. Dynamic ORB Fibonacci Lines (Dotted Purple)
     if (fibLines) {{
       const fibTitles = {{
         'ORB_MID': 'ORB MID',
@@ -421,9 +440,10 @@ html_code = f"""
         'fib_161': 'FIB 161.8%'
       }};
       Object.entries(fibLines).forEach(([fKey, fVal]) => {{
-        if (fVal && fibTitles[fKey]) {{
+        const numVal = parseFloat(fVal);
+        if (!isNaN(numVal) && numVal > 0 && fibTitles[fKey]) {{
           candleSeries.createPriceLine({{
-            price: parseFloat(fVal),
+            price: numVal,
             color: '#b388ff',
             lineWidth: 1,
             lineStyle: LightweightCharts.LineStyle.Dotted,
