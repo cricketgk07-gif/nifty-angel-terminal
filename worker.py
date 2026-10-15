@@ -116,7 +116,7 @@ def push_to_redis(key, data_obj):
     try:
         requests.post(url, headers=headers, data=json.dumps(data_obj), timeout=3)
     except Exception as e:
-        print(f"[Redis Set Error]: {e}")
+        print(f"[Redis Push Error]: {e}")
 
 
 def read_from_redis(key="nifty_live_state"):
@@ -185,14 +185,15 @@ class DedicatedTradingWorker:
         today_str = self.today.strftime("%Y-%m-%d")
         saved_state = read_from_redis("nifty_live_state") or {}
 
-        if is_market_hours() and saved_state.get("trade_date") == today_str:
-            if saved_state.get("locked_trade") and not saved_state.get("locked_trade", {}).get("closed", False):
+        # Reset state cleanly if date mismatch or if prior trade closed
+        if saved_state.get("trade_date") == today_str and saved_state.get("locked_trade"):
+            if not saved_state.get("locked_trade", {}).get("closed", False):
                 self.locked_trade = saved_state.get("locked_trade")
                 self.trades_taken_today = saved_state.get("trades_taken_today", 1)
                 self.trade_history_today = saved_state.get("trade_history_today", [])
-            else:
-                self.trades_taken_today = saved_state.get("trades_taken_today", 0)
-                self.trade_history_today = saved_state.get("trade_history_today", [])
+        else:
+            self.trades_taken_today = 0
+            self.trade_history_today = []
 
         self.nfo_df = self.load_scrip_master()
         self.init_historical_candles()
@@ -238,8 +239,10 @@ class DedicatedTradingWorker:
         now = datetime.datetime.now(IST)
         loaded = False
 
-        for days_back in [5, 3]:
-            from_str = (now - datetime.timedelta(days=days_back)).strftime("%Y-%m-%d 09:15")
+        # Query 5-minute candles over the last 4 calendar days
+        for days_back in [4, 2]:
+            from_dt = now - datetime.timedelta(days=days_back)
+            from_str = from_dt.strftime("%Y-%m-%d 09:15")
             to_str = now.strftime("%Y-%m-%d %H:%M")
             try:
                 resp = self.api.getCandleData({
@@ -252,9 +255,11 @@ class DedicatedTradingWorker:
                 if resp and resp.get("status") and resp.get("data") and len(resp["data"]) > 10:
                     cand_list = []
                     for b in resp["data"]:
-                        dt_parsed = pd.to_datetime(b[0])
+                        # Standardize ISO date parsing
+                        dt_str = b[0]
+                        dt_parsed = pd.to_datetime(dt_str)
                         if dt_parsed.tzinfo is None:
-                            dt_ist = dt_parsed.tz_localize("Asia/Kolkata")
+                            dt_ist = dt_parsed.tz_localize(IST)
                         else:
                             dt_ist = dt_parsed.astimezone(IST)
 
@@ -269,16 +274,17 @@ class DedicatedTradingWorker:
                         })
                     self.candles = cand_list
                     loaded = True
-                    print(f"[Candles Loaded]: {len(self.candles)} candles initialized over {days_back} days.")
+                    print(f"[Candles Loaded]: {len(self.candles)} candles initialized.")
                     break
             except Exception as e:
                 print(f"[Candles Error]: {e}")
 
+        # Always pull daily candles to verify PDH, PDL, PDC & Pivots
         self.fetch_daily_fallback_levels()
 
     def fetch_daily_fallback_levels(self):
         now = datetime.datetime.now(IST)
-        from_str = (now - datetime.timedelta(days=12)).strftime("%Y-%m-%d 09:15")
+        from_str = (now - datetime.timedelta(days=14)).strftime("%Y-%m-%d 09:15")
         to_str = now.strftime("%Y-%m-%d 15:30")
         try:
             resp = self.api.getCandleData({
@@ -289,6 +295,7 @@ class DedicatedTradingWorker:
                 "todate": to_str,
             })
             if resp and resp.get("status") and resp.get("data") and len(resp["data"]) >= 2:
+                # The bar prior to today is completed previous day
                 prev_bar = resp["data"][-2]
                 pdh = round(float(prev_bar[2]), 2)
                 pdl = round(float(prev_bar[3]), 2)
@@ -308,9 +315,30 @@ class DedicatedTradingWorker:
                     "PDH": pdh,
                     "PDL": pdl,
                 }
-                print(f"[Daily Levels Verified]: PDH={pdh}, PDL={pdl}, PIVOT={P}")
+                print(f"[Daily Pivots Loaded]: PDH={pdh}, PDL={pdl}, PIVOT={P}")
+                return
         except Exception as e:
             print(f"[Daily Fallback Error]: {e}")
+
+        # If SmartAPI ONE_DAY failed, calculate directly from 5-minute candles
+        if self.candles:
+            df_temp = pd.DataFrame(self.candles)
+            df_temp["d_str"] = df_temp["dt"].apply(lambda d: d.astimezone(IST).strftime("%Y-%m-%d"))
+            u_days = list(df_temp["d_str"].unique())
+            if len(u_days) >= 2:
+                p_day = df_temp[df_temp["d_str"] == u_days[-2]]
+                pdh = round(float(p_day["high"].max()), 2)
+                pdl = round(float(p_day["low"].min()), 2)
+                pdc = round(float(p_day["close"].iloc[-1]), 2)
+                self.prev_day_close = pdc
+                P = round((pdh + pdl + pdc) / 3.0, 2)
+                rng = round(pdh - pdl, 2)
+                self.pivot_lines = {
+                    "P": P, "PDH": pdh, "PDL": pdl,
+                    "R1": round((2.0 * P) - pdl, 2), "S1": round((2.0 * P) - pdh, 2),
+                    "R2": round(P + rng, 2), "S2": round(P - rng, 2),
+                    "R3": round(pdh + (2.0 * (P - pdl)), 2), "S3": round(pdl - (2.0 * (pdh - P)), 2),
+                }
 
     def compute_all_confluence_targets(self, df_h, entry_p, is_ce, custom_pivots=None, custom_orb=None):
         recent_swing_h = float(df_h["high"].iloc[-20:].max()) if len(df_h) >= 20 else entry_p + 75.0
@@ -649,51 +677,6 @@ class DedicatedTradingWorker:
                     }
                     sim_active_trade = {"type": "PE", "entry": c, "sl": sl_val, "targets": t_list, "stage": 0, "peak": c, "entry_atr": bar_atr}
 
-        # Active Trade HUD Card
-        if is_market_hours() and self.locked_trade and not self.locked_trade.get("closed"):
-            tr = self.locked_trade
-            t_type = tr["type"]
-            entry_p = float(tr["entry"])
-            sl_p = float(tr["init_sl"])
-            trail_p = float(tr.get("current_sl", sl_p))
-            target_list = tr.get("targets", [])
-            opt_entry = float(tr.get("opt_entry_ltp", 75.0))
-            delta_v = float(tr.get("delta", 0.50))
-            sym = tr.get("symbol", f"NIFTY {t_type}")
-
-            risk_pts = round(abs(entry_p - sl_p), 1)
-            secured_pts = round(trail_p - entry_p, 1) if t_type == "CE" else round(entry_p - trail_p, 1)
-
-            hud_targets = []
-            for idx_tg, tg_spot in enumerate(target_list, start=1):
-                tg_pts = round(abs(tg_spot - entry_p), 1)
-                tg_opt = round(opt_entry + (tg_pts * delta_v), 2)
-                hud_targets.append({
-                    "label": f"Target {idx_tg}",
-                    "spot": tg_spot,
-                    "pts": tg_pts,
-                    "opt": tg_opt,
-                })
-
-            self.hud_data = {
-                "type": t_type,
-                "symbol": sym,
-                "delta": delta_v,
-                "entry_spot": entry_p,
-                "entry_opt": opt_entry,
-                "sl_spot": sl_p,
-                "sl_opt": max(0.5, round(opt_entry - (risk_pts * delta_v), 2)),
-                "risk_pts": risk_pts,
-                "targets": hud_targets,
-                "trail_spot": trail_p,
-                "trail_opt": max(0.5, round(opt_entry + (secured_pts * delta_v), 2)),
-                "secured_pts": secured_pts,
-                "date_readable": tr.get("date_readable", str(self.today)),
-                "trade_closed": False,
-            }
-        else:
-            self.hud_data = {}
-
     def background_option_poller(self):
         while True:
             time.sleep(15)
@@ -786,11 +769,9 @@ class DedicatedTradingWorker:
             day_spread = session_high - session_low
 
             if day_spread >= 250.0:
-                print(f"[W2 Blocked]: Daily spread {day_spread:.1f}p exceeds 250p exhaustion limit.")
                 return
 
             if abs(close_p - vwap_val) > 80.0:
-                print(f"[W2 Blocked]: Overextended from VWAP by {abs(close_p - vwap_val):.1f}p.")
                 return
 
             prior_4_high = float(df_curr.iloc[-4:]["high"].max()) if len(df_curr) >= 4 else high_p
@@ -800,7 +781,6 @@ class DedicatedTradingWorker:
                 potential_targets = self.compute_all_confluence_targets(df_curr, close_p, is_ce=True)
                 runway = (potential_targets[0] - close_p) if potential_targets else 0.0
                 if runway < 70.0:
-                    print(f"[W2 Blocked]: Target 1 runway only {runway:.1f}p (minimum 70p required).")
                     return
                 ce_candidate = True
                 setup_title = "HOD BREAKOUT (W2)"
@@ -810,7 +790,6 @@ class DedicatedTradingWorker:
                 potential_targets = self.compute_all_confluence_targets(df_curr, close_p, is_ce=False)
                 runway = (close_p - potential_targets[0]) if potential_targets else 0.0
                 if runway < 70.0:
-                    print(f"[W2 Blocked]: Target 1 runway only {runway:.1f}p (minimum 70p required).")
                     return
                 pe_candidate = True
                 setup_title = "LOD BREAKDOWN (W2)"
@@ -1065,42 +1044,28 @@ class DedicatedTradingWorker:
             pts_gain = (live_ltp - self.locked_trade["entry"]) if self.locked_trade["type"] == "CE" else (self.locked_trade["entry"] - live_ltp)
             opt_ltp = max(0.5, round(self.locked_trade.get("opt_entry_ltp", 75.0) + (pts_gain * self.locked_trade.get("delta", 0.50)), 2))
 
-        # 1. Clean, validate, and sanitize candle data for Lightweight Charts
-        clean_candles = []
-        seen_timestamps = set()
-
-        all_bars = list(self.candles)
+        # Build clean chronological candlestick sequence for Lightweight Charts
+        raw_list = list(self.candles)
         if self.active_bar:
-            all_bars.append(self.active_bar)
+            raw_list.append(self.active_bar)
 
-        for c in all_bars:
-            try:
-                t = int(c.get("time", 0))
-                o = float(c.get("open", 0.0))
-                h = float(c.get("high", 0.0))
-                l = float(c.get("low", 0.0))
-                cl = float(c.get("close", 0.0))
-                vw = float(c.get("vwap", cl))
-                em = float(c.get("ema9", cl))
-
-                if t <= 0 or t in seen_timestamps or o <= 0 or cl <= 0:
-                    continue
-
-                seen_timestamps.add(t)
-                clean_candles.append({
+        # Enforce unique timestamps and strictly ascending order
+        clean_map = {}
+        for c in raw_list:
+            t = int(c.get("time", 0))
+            if t > 0:
+                clean_map[t] = {
                     "time": t,
-                    "open": o,
-                    "high": max(h, o, cl),
-                    "low": min(l, o, cl),
-                    "close": cl,
-                    "vwap": vw,
-                    "ema9": em
-                })
-            except (ValueError, TypeError):
-                continue
+                    "open": float(c["open"]),
+                    "high": float(c["high"]),
+                    "low": float(c["low"]),
+                    "close": float(c["close"]),
+                    "vwap": float(c.get("vwap", c["close"])),
+                    "ema9": float(c.get("ema9", c["close"]))
+                }
 
-        clean_candles.sort(key=lambda x: x["time"])
-        recent_candles = clean_candles[-120:]
+        sorted_times = sorted(clean_map.keys())
+        recent_candles = [clean_map[t] for t in sorted_times][-120:]
 
         all_trades_done = (self.trades_taken_today >= 2)
 
