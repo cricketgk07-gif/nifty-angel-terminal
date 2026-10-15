@@ -30,6 +30,7 @@ UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 BUDGET_CEILING = float(os.getenv("BUDGET_CEILING", "80.0"))
 PORT = int(os.getenv("PORT", 10000))
 
+# Dual-Regime Constants Matching Pine Script
 VOL_THRESHOLD = 229.0
 MAX_BREACH_MULT = 0.5
 ATR_TARGET_MULT = 3.0
@@ -171,6 +172,7 @@ class DedicatedTradingWorker:
         self.orb_levels = {}
         self.hud_data = {}
         self.contract_preview = {}
+        self.prev_day_summary = {}
 
         self.locked_trade = None
         self.trades_taken_today = 0
@@ -208,6 +210,7 @@ class DedicatedTradingWorker:
         self.fetch_daily_atr_and_levels()
         self.init_historical_candles()
         self.run_full_strategy_pipeline()
+        self.simulate_previous_day_trades()
         self.update_pretrade_contract_forecast()
 
         threading.Thread(target=self.background_option_poller, daemon=True).start()
@@ -282,29 +285,17 @@ class DedicatedTradingWorker:
                 P = round((pdh + pdl + pdc) / 3.0, 2)
                 rng = round(pdh - pdl, 2)
 
-                r1 = round((2.0 * P) - pdl, 2)
-                s1 = round((2.0 * P) - pdh, 2)
-                r2 = round(P + rng, 2)
-                s2 = round(P - rng, 2)
-                r3 = round(pdh + (2.0 * (P - pdl)), 2)
-                s3 = round(pdl - (2.0 * (pdh - P)), 2)
-                r4 = round(r3 + rng, 2)
-                s4 = round(s3 - rng, 2)
-                r5 = round(r4 + rng, 2)
-                s5 = round(s4 - rng, 2)
-
                 self.pivot_lines = {
                     "P": P,
-                    "R1": r1, "S1": s1,
-                    "R2": r2, "S2": s2,
-                    "R3": r3, "S3": s3,
-                    "R4": r4, "S4": s4,
-                    "R5": r5, "S5": s5,
+                    "R1": round((2.0 * P) - pdl, 2), "S1": round((2.0 * P) - pdh, 2),
+                    "R2": round(P + rng, 2), "S2": round(P - rng, 2),
+                    "R3": round(pdh + (2.0 * (P - pdl)), 2), "S3": round(pdl - (2.0 * (pdh - P)), 2),
+                    "R4": round(round(pdh + (2.0 * (P - pdl)), 2) + rng, 2), "S4": round(round(pdl - (2.0 * (pdh - P)), 2) - rng, 2),
+                    "R5": round(round(round(pdh + (2.0 * (P - pdl)), 2) + rng, 2) + rng, 2), "S5": round(round(round(pdl - (2.0 * (pdh - P)), 2) - rng, 2) - rng, 2),
                     "PDH": pdh,
                     "PDL": pdl,
                 }
 
-                # Pre-seed default fib levels using PDH / PDL so chart is never empty
                 p_mid = round((pdh + pdl) / 2.0, 2)
                 self.fib_lines = {
                     "ORB_MID": float(p_mid),
@@ -322,7 +313,7 @@ class DedicatedTradingWorker:
 
     def init_historical_candles(self):
         now = datetime.datetime.now(IST)
-        for days_back in [4, 2]:
+        for days_back in [5, 3]:
             from_dt = now - datetime.timedelta(days=days_back)
             from_str = from_dt.strftime("%Y-%m-%d 09:15")
             to_str = now.strftime("%Y-%m-%d %H:%M")
@@ -411,8 +402,253 @@ class DedicatedTradingWorker:
         delta = compute_contract_delta(spot_ref, chosen_strike, days_to_exp, is_ce=is_ce)
         return chosen_strike, chosen_sym, chosen_tok, delta, days_to_exp, chosen_ltp
 
+    def simulate_previous_day_trades(self):
+        """Simulates yesterday's complete trading session matching the Pine Script dual regime."""
+        if not self.candles:
+            return
+
+        df_h = pd.DataFrame(self.candles)
+        df_h["date_str"] = df_h["dt"].apply(lambda d: d.astimezone(IST).strftime("%Y-%m-%d"))
+        unique_days = list(df_h["date_str"].unique())
+
+        if len(unique_days) < 2:
+            return
+
+        prev_day_str = unique_days[-2]
+        prev_bars = df_h[df_h["date_str"] == prev_day_str].sort_values("time").reset_index(drop=True)
+
+        if len(prev_bars) < 4:
+            return
+
+        # Previous Day ORB (First 3 bars: 09:15 - 09:30)
+        ow = prev_bars.iloc[0:3]
+        p_orb_h = round(float(ow["high"].max()), 2)
+        p_orb_l = round(float(ow["low"].min()), 2)
+
+        p_pierced_h = False
+        p_pierced_l = False
+        p_max_h_outside = p_orb_h
+        p_min_l_outside = p_orb_l
+
+        sim_trade = None
+        trade_fired = False
+
+        for idx in range(3, len(prev_bars)):
+            r = prev_bars.iloc[idx]
+            b_time = r["dt"].astimezone(IST).time()
+            c = float(r["close"])
+            o = float(r["open"])
+            h = float(r["high"])
+            l = float(r["low"])
+            vw = float(r["vwap"])
+            bar_atr = float(r.get("atr14", 14.0))
+            t_sec = int(r["time"])
+            time_label = (r["dt"].astimezone(IST) + datetime.timedelta(minutes=5)).strftime("%H:%M")
+
+            # 1. Evaluate Trailing SL or Exits if in an active trade
+            if sim_trade is not None:
+                is_ce = (sim_trade["type"] == "CE")
+                entry_p = sim_trade["entry"]
+                cur_sl = sim_trade["current_sl"]
+                target_p = sim_trade["target_p"]
+                mode = sim_trade["mode"]
+                trade_atr = sim_trade["atr"]
+
+                exit_triggered = False
+                exit_price = 0.0
+                exit_reason = ""
+
+                # Target Exit
+                if mode == "FADE":
+                    if (is_ce and h >= target_p) or ((not is_ce) and l <= target_p):
+                        exit_triggered = True
+                        exit_price = target_p
+                        exit_reason = "TARGET HIT (VWAP)"
+                elif mode == "BREAKOUT":
+                    pass
+
+                # Stop Loss Exit
+                if not exit_triggered:
+                    if (is_ce and l <= cur_sl) or ((not is_ce) and h >= cur_sl):
+                        exit_triggered = True
+                        exit_price = cur_sl
+                        exit_reason = "STOP LOSS HIT"
+
+                # Mandatory 15:15 IST Square-off
+                if not exit_triggered and b_time >= datetime.time(15, 15):
+                    exit_triggered = True
+                    exit_price = c
+                    exit_reason = "15:15 EOD SQUARE-OFF"
+
+                if exit_triggered:
+                    final_pts = round((exit_price - entry_p) if is_ce else (entry_p - exit_price), 1)
+                    final_inr = int(round(final_pts * sim_trade["delta"] * LOT_SIZE_QTY))
+                    sign = "+" if final_pts >= 0 else ""
+
+                    # Add Exit Marker
+                    self.markers.append({
+                        "time": t_sec,
+                        "position": "aboveBar" if is_ce else "belowBar",
+                        "color": "#ffa726",
+                        "shape": "circle",
+                        "text": f"EXIT {sim_trade['type']}: {sign}{final_pts}p ({exit_reason})",
+                    })
+
+                    self.history_cards[str(t_sec)] = {
+                        "title": f"PREV DAY EXIT • {sim_trade['type']} ({exit_reason})",
+                        "time_str": time_label,
+                        "entry": entry_p,
+                        "sl": cur_sl,
+                        "target": target_p,
+                        "exit_price": exit_price,
+                        "outcome": f"{sign}{final_pts} pts (₹{sign}{final_inr})",
+                        "type": sim_trade["type"],
+                    }
+
+                    self.prev_day_summary = {
+                        "date": prev_day_str,
+                        "regime": "BREAKOUT" if self.is_high_vol else "FADE",
+                        "type": sim_trade["type"],
+                        "entry_time": sim_trade["time_label"],
+                        "entry_spot": entry_p,
+                        "opt_entry": sim_trade["opt_entry"],
+                        "init_sl": sim_trade["init_sl"],
+                        "exit_time": time_label,
+                        "exit_spot": exit_price,
+                        "final_pts": final_pts,
+                        "final_inr": final_inr,
+                        "exit_reason": exit_reason,
+                    }
+                    sim_trade = None
+                    break
+
+                # Trailing mechanism for Breakout Mode
+                if mode == "BREAKOUT":
+                    if is_ce:
+                        sim_trade["peak"] = max(sim_trade["peak"], h)
+                        gain_l = sim_trade["peak"] - entry_p
+                        if gain_l >= sim_trade["bank_dist"]:
+                            sim_trade["bank_achieved"] = True
+                        if sim_trade["bank_achieved"]:
+                            fib_tight_sl = (sim_trade["peak"] - (0.236 * gain_l)) - (0.3 * trade_atr)
+                            min_guar_sl = entry_p + sim_trade["bank_dist"] - (0.3 * trade_atr)
+                            prev_bar_sl = float(prev_bars.iloc[idx - 1]["low"]) + 2.0
+                            sim_trade["current_sl"] = max(sim_trade["current_sl"], max(fib_tight_sl, max(min_guar_sl, prev_bar_sl)))
+                    else:
+                        sim_trade["peak"] = min(sim_trade["peak"], l)
+                        gain_s = entry_p - sim_trade["peak"]
+                        if gain_s >= sim_trade["bank_dist"]:
+                            sim_trade["bank_achieved"] = True
+                        if sim_trade["bank_achieved"]:
+                            fib_tight_sl = (sim_trade["peak"] + (0.236 * gain_s)) + (0.3 * trade_atr)
+                            min_guar_sl = entry_p - sim_trade["bank_dist"] + (0.3 * trade_atr)
+                            prev_bar_sl = float(prev_bars.iloc[idx - 1]["high"]) - 2.0
+                            sim_trade["current_sl"] = min(sim_trade["current_sl"], min(fib_tight_sl, min(min_guar_sl, prev_bar_sl)))
+                continue
+
+            # 2. Check for Signal strictly within 09:30 - 10:00 AM
+            if not trade_fired and datetime.time(9, 30) <= b_time < datetime.time(10, 0):
+                if h > p_orb_h:
+                    p_pierced_h = True
+                    p_max_h_outside = max(p_max_h_outside, h)
+                if l < p_orb_l:
+                    p_pierced_l = True
+                    p_min_l_outside = min(p_min_l_outside, l)
+
+                fire_ce_bo = False
+                fire_pe_bo = False
+                fire_pe_fd = False
+                fire_ce_fd = False
+
+                if self.is_high_vol:
+                    if c > p_orb_h and c > vw and c > o:
+                        fire_ce_bo = True
+                    elif c < p_orb_l and c < vw and c < o:
+                        fire_pe_bo = True
+                else:
+                    shallow_h = (p_max_h_outside - p_orb_h) <= (MAX_BREACH_MULT * bar_atr)
+                    shallow_l = (p_orb_l - p_min_l_outside) <= (MAX_BREACH_MULT * bar_atr)
+                    decisive_pe = c <= (p_orb_h - (0.2 * bar_atr)) and c < o
+                    decisive_ce = c >= (p_orb_l + (0.2 * bar_atr)) and c > o
+
+                    if p_pierced_h and shallow_h and decisive_pe:
+                        fire_pe_fd = True
+                    if p_pierced_l and shallow_l and decisive_ce:
+                        fire_ce_fd = True
+
+                trade_type = None
+                mode = ""
+                sl_val = 0.0
+                tg_val = 0.0
+                bank_d = bar_atr * ATR_TARGET_MULT
+
+                if fire_ce_bo:
+                    trade_type = "CE"
+                    mode = "BREAKOUT"
+                    sl_val = round(l - SL_BUFFER, 1)
+                    tg_val = round(c + bank_d, 1)
+                elif fire_pe_bo:
+                    trade_type = "PE"
+                    mode = "BREAKOUT"
+                    sl_val = round(h + SL_BUFFER, 1)
+                    tg_val = round(c - bank_d, 1)
+                elif fire_pe_fd:
+                    trade_type = "PE"
+                    mode = "FADE"
+                    sl_val = round(p_max_h_outside + SL_BUFFER, 1)
+                    tg_val = round(vw, 1)
+                elif fire_ce_fd:
+                    trade_type = "CE"
+                    mode = "FADE"
+                    sl_val = round(p_min_l_outside - SL_BUFFER, 1)
+                    tg_val = round(vw, 1)
+
+                if trade_type:
+                    trade_fired = True
+                    is_ce = (trade_type == "CE")
+                    delta = 0.50
+                    est_opt = 75.0
+                    risk_pts = round(abs(c - sl_val), 1)
+
+                    # Add Entry Marker
+                    self.markers.append({
+                        "time": t_sec,
+                        "position": "belowBar" if is_ce else "aboveBar",
+                        "color": "#00e676" if is_ce else "#f23645",
+                        "shape": "arrowUp" if is_ce else "arrowDown",
+                        "text": f"PREV DAY {mode} {trade_type} @ {c:.1f}",
+                    })
+
+                    self.history_cards[str(t_sec)] = {
+                        "title": f"PREV DAY • {mode} {trade_type}",
+                        "time_str": time_label,
+                        "entry": c,
+                        "sl": sl_val,
+                        "target": tg_val,
+                        "delta": delta,
+                        "opt_entry": est_opt,
+                        "opt_sl": max(0.5, round(est_opt - (risk_pts * delta), 2)),
+                        "type": trade_type,
+                        "outcome": "TRIGGERED",
+                    }
+
+                    sim_trade = {
+                        "type": trade_type,
+                        "mode": mode,
+                        "entry": c,
+                        "init_sl": sl_val,
+                        "current_sl": sl_val,
+                        "target_p": tg_val,
+                        "bank_dist": bank_d,
+                        "bank_achieved": False,
+                        "peak": c,
+                        "atr": bar_atr,
+                        "delta": delta,
+                        "opt_entry": est_opt,
+                        "time_label": time_label,
+                    }
+
     def update_pretrade_contract_forecast(self):
-        """Builds pre-trade details for both CE and PE before trade triggers."""
         if not self.candles:
             return
 
@@ -422,12 +658,9 @@ class DedicatedTradingWorker:
         vwap_val = float(self.candles[-1].get("vwap", ref_spot))
         atr_val = self.current_atr14
 
-        # CE Contract forecast
         k_ce, sym_ce, tok_ce, d_ce, _, ltp_ce = self.find_budget_strike(ref_spot, is_ce=True)
-        # PE Contract forecast
         k_pe, sym_pe, tok_pe, d_pe, _, ltp_pe = self.find_budget_strike(ref_spot, is_ce=False)
 
-        # Expected Targets & SL
         if self.is_high_vol:
             ce_entry = orb_h + 1.0
             ce_sl = orb_l
@@ -475,7 +708,6 @@ class DedicatedTradingWorker:
         df_h = pd.DataFrame(self.candles)
         df_h["date_str"] = df_h["dt"].apply(lambda d: d.astimezone(IST).strftime("%Y-%m-%d"))
 
-        # Pure VWAP
         df_h["hlc3"] = (df_h["high"] + df_h["low"] + df_h["close"]) / 3.0
         candle_spread = (df_h["high"] - df_h["low"]) + (df_h["close"] - df_h["open"]).abs()
         df_h["calc_vol"] = candle_spread * 1250.0 + 500.0
@@ -484,7 +716,6 @@ class DedicatedTradingWorker:
         df_h["cum_pv"] = df_h.groupby("date_str")["pv"].cumsum()
         df_h["vwap"] = (df_h["cum_pv"] / df_h["cum_vol"]).round(2)
 
-        # 5m ATR-14
         tr1 = df_h["high"] - df_h["low"]
         tr2 = (df_h["high"] - df_h["close"].shift(1)).abs()
         tr3 = (df_h["low"] - df_h["close"].shift(1)).abs()
@@ -499,14 +730,12 @@ class DedicatedTradingWorker:
         unique_days = list(df_h["date_str"].unique())
         today_bars = df_h[df_h["date_str"] == unique_days[-1]].sort_values("time").reset_index(drop=True)
 
-        # 09:15 - 09:30 ORB (First 3 bars)
         orb_bars = today_bars.iloc[0:3] if len(today_bars) >= 3 else today_bars
         curr_orb_h = round(float(orb_bars["high"].max()), 2)
         curr_orb_l = round(float(orb_bars["low"].min()), 2)
         orb_range_val = max(15.0, round(curr_orb_h - curr_orb_l, 2))
         self.orb_levels = {"orb_h": curr_orb_h, "orb_l": curr_orb_l, "range": orb_range_val}
 
-        # Dynamic ORB Fibonacci Flipping
         orb_mid = round((curr_orb_h + curr_orb_l) / 2.0, 2)
         curr_price = float(today_bars.iloc[-1]["close"]) if len(today_bars) > 0 else curr_orb_h
         is_bullish_bias = (curr_price >= orb_mid)
@@ -564,7 +793,6 @@ class DedicatedTradingWorker:
         bar_dt = now.replace(minute=bucket_min, second=0, microsecond=0)
         t_sec = int(bar_dt.timestamp())
 
-        # 15:15 Mandatory EOD Square-Off
         if now.time() >= datetime.time(15, 15) and self.locked_trade and not self.locked_trade.get("closed"):
             self.execute_eod_exit(ltp)
             return
@@ -915,7 +1143,8 @@ class DedicatedTradingWorker:
                 }
 
         sorted_times = sorted(clean_map.keys())
-        recent_candles = [clean_map[t] for t in sorted_times][-120:]
+        # Provide enough historical candles to cover full previous day + today
+        recent_candles = [clean_map[t] for t in sorted_times][-200:]
 
         payload = {
             "ltp": float(live_ltp),
@@ -934,6 +1163,7 @@ class DedicatedTradingWorker:
             "markers": self.markers,
             "history_cards": self.history_cards,
             "contract_preview": self.contract_preview,
+            "prev_day_summary": self.prev_day_summary,
             "hud": self.hud_data if is_market_hours() else {},
             "updated_at": time.time(),
         }
@@ -963,6 +1193,7 @@ def run_worker():
                         engine.fetch_daily_atr_and_levels()
                         engine.init_historical_candles()
                         engine.run_full_strategy_pipeline()
+                        engine.simulate_previous_day_trades()
                         try:
                             sws.close_connection()
                         except Exception:
