@@ -169,7 +169,6 @@ class DedicatedTradingWorker:
         self.orb_levels = {}
         self.hud_data = {}
 
-        # Trade State Management (Max 2 Trades/Day)
         self.locked_trade = None
         self.trades_taken_today = 0
         self.trade_history_today = []
@@ -313,6 +312,63 @@ class DedicatedTradingWorker:
 
         return valid
 
+    def find_budget_strike(self, spot_ref, is_ce, budget_target=None):
+        if budget_target is None:
+            budget_target = get_dynamic_budget()
+
+        atm = int(round(spot_ref / 50.0) * 50)
+        opt_type = "CE" if is_ce else "PE"
+
+        if self.nfo_df.empty:
+            return atm, f"NIFTY {atm} {opt_type}", "", 0.50, 4
+
+        future_exp = self.nfo_df[self.nfo_df["exp_dt"].dt.date >= self.today].sort_values("exp_dt")
+        if future_exp.empty:
+            return atm, f"NIFTY {atm} {opt_type}", "", 0.50, 4
+
+        curr_exp = future_exp["expiry"].iloc[0]
+        exp_slice = future_exp[future_exp["expiry"] == curr_exp]
+        days_to_exp = max(1, (exp_slice.iloc[0]["exp_dt"].date() - self.today).days)
+
+        candidates = []
+        strike_offsets = range(0, 8) if is_ce else range(0, -8, -1)
+
+        for offset in strike_offsets:
+            k = atm + (offset * 50)
+            row = exp_slice[(exp_slice["strike_num"] == float(k)) & (exp_slice["symbol"].str.endswith(opt_type))]
+            if not row.empty:
+                sym = str(row.iloc[0]["symbol"])
+                tok = str(row.iloc[0]["token"])
+
+                real_ltp = 0.0
+                try:
+                    res = self.api.ltpData("NFO", sym, tok)
+                    if isinstance(res, dict) and res.get("status") and res.get("data"):
+                        real_ltp = float(res["data"].get("ltp", 0.0))
+                except Exception:
+                    pass
+
+                if real_ltp <= 0.0:
+                    otm_dist = (k - spot_ref) if is_ce else (spot_ref - k)
+                    real_ltp = max(5.0, 110.0 - (otm_dist * 0.45))
+
+                candidates.append((k, sym, tok, real_ltp))
+
+        valid = [c for c in candidates if c[3] <= budget_target]
+        if valid:
+            valid.sort(key=lambda x: x[3], reverse=True)
+            chosen_strike, chosen_sym, chosen_tok, chosen_ltp = valid[0]
+        elif candidates:
+            candidates.sort(key=lambda x: x[3])
+            chosen_strike, chosen_sym, chosen_tok, chosen_ltp = candidates[0]
+        else:
+            chosen_strike = atm
+            chosen_sym = f"NIFTY {atm} {opt_type}"
+            chosen_tok = ""
+
+        delta = compute_contract_delta(spot_ref, chosen_strike, days_to_exp, is_ce=is_ce)
+        return chosen_strike, chosen_sym, chosen_tok, delta, days_to_exp
+
     def run_full_strategy_pipeline(self):
         if not self.candles:
             return
@@ -421,19 +477,17 @@ class DedicatedTradingWorker:
                 t_sec = int(r["time"])
                 candle_close_time = (r["dt"].astimezone(IST) + datetime.timedelta(minutes=5)).strftime("%H:%M")
 
-                # 1. TRADE LIFECYCLE MANAGEMENT (ATR-Adaptive Trailing)
+                # 1. TRADE LIFECYCLE MANAGEMENT (Fib Pullback 0.382 / 0.50 + ATR Cushion)
                 if sim_active_trade is not None:
                     is_ce_sim = (sim_active_trade["type"] == "CE")
                     entry_price = sim_active_trade["entry"]
                     trade_atr = sim_active_trade.get("entry_atr", bar_atr)
 
-                    # Check Stop Loss breach
                     if is_ce_sim and l <= sim_active_trade["sl"]:
                         sim_active_trade = None
                     elif (not is_ce_sim) and h >= sim_active_trade["sl"]:
                         sim_active_trade = None
 
-                    # If still open, manage ATR-based trailing progression
                     if sim_active_trade is not None:
                         if is_ce_sim:
                             sim_active_trade["peak"] = max(sim_active_trade.get("peak", entry_price), h)
@@ -442,30 +496,35 @@ class DedicatedTradingWorker:
                             sim_active_trade["peak"] = min(sim_active_trade.get("peak", entry_price), l)
                             peak_gain = entry_price - sim_active_trade["peak"]
 
-                        # STAGE 1: Peak gain reaches 2.5x ATR -> Trail at (Peak - 1.5x ATR)
-                        # De-risks the trade while providing a 1.5 ATR buffer for natural pullbacks
-                        if peak_gain >= (2.5 * trade_atr):
+                        # STAGE 1: Peak Gain >= 2.5x ATR -> Trail at 0.500 Fib Pullback - 0.5x ATR
+                        if peak_gain >= (2.5 * trade_atr) and sim_active_trade["stage"] < 1:
+                            sim_active_trade["stage"] = 1
                             if is_ce_sim:
-                                candidate_sl = round(sim_active_trade["peak"] - (1.5 * trade_atr), 1)
+                                fib_50_level = sim_active_trade["peak"] - (0.500 * peak_gain)
+                                candidate_sl = round(fib_50_level - (0.5 * trade_atr), 1)
                                 if candidate_sl > sim_active_trade["sl"]:
                                     sim_active_trade["sl"] = candidate_sl
                             else:
-                                candidate_sl = round(sim_active_trade["peak"] + (1.5 * trade_atr), 1)
+                                fib_50_level = sim_active_trade["peak"] + (0.500 * peak_gain)
+                                candidate_sl = round(fib_50_level + (0.5 * trade_atr), 1)
                                 if candidate_sl < sim_active_trade["sl"]:
                                     sim_active_trade["sl"] = candidate_sl
 
-                        # STAGE 2: Peak gain reaches 4.5x ATR (Expansion zone) -> Tighten trail to (Peak - 1.0x ATR)
-                        if peak_gain >= (4.5 * trade_atr):
+                        # STAGE 2: Peak Gain >= 4.5x ATR -> Tighten to 0.382 Fib Pullback - 0.5x ATR
+                        if peak_gain >= (4.5 * trade_atr) and sim_active_trade["stage"] < 2:
+                            sim_active_trade["stage"] = 2
                             if is_ce_sim:
-                                candidate_sl = round(sim_active_trade["peak"] - (1.0 * trade_atr), 1)
+                                fib_382_level = sim_active_trade["peak"] - (0.382 * peak_gain)
+                                candidate_sl = round(fib_382_level - (0.5 * trade_atr), 1)
                                 if candidate_sl > sim_active_trade["sl"]:
                                     sim_active_trade["sl"] = candidate_sl
                             else:
-                                candidate_sl = round(sim_active_trade["peak"] + (1.0 * trade_atr), 1)
+                                fib_382_level = sim_active_trade["peak"] + (0.382 * peak_gain)
+                                candidate_sl = round(fib_382_level + (0.5 * trade_atr), 1)
                                 if candidate_sl < sim_active_trade["sl"]:
                                     sim_active_trade["sl"] = candidate_sl
 
-                        # STAGE 3: RUNNER BEYOND T1 -> PRIOR BAR LOW + 2.0 (CE) / PRIOR BAR HIGH - 2.0 (PE)
+                        # STAGE 3: RUNNER BEYOND TARGET 1 -> PRIOR BAR LOW + 2.0 (CE) / PRIOR BAR HIGH - 2.0 (PE)
                         targets = sim_active_trade["targets"]
                         t1_dist = abs(targets[0] - entry_price) if targets else 75.0
                         if peak_gain >= t1_dist:
@@ -652,52 +711,6 @@ class DedicatedTradingWorker:
                         self.last_polled_opt_ltp = float(res["data"].get("ltp", 0.0))
                 except Exception:
                     pass
-
-    def find_budget_strike(self, spot_ref, is_ce, budget_target=None):
-        if budget_target is None:
-            budget_target = get_dynamic_budget()
-
-        atm = int(round(spot_ref / 50.0) * 50)
-        opt_type = "CE" if is_ce else "PE"
-
-        if self.nfo_df.empty:
-            return atm, f"NIFTY {atm} {opt_type}", "", 0.50, 4
-
-        future_exp = self.nfo_df[self.nfo_df["exp_dt"].dt.date > self.today].sort_values("exp_dt")
-        if future_exp.empty:
-            future_exp = self.nfo_df[self.nfo_df["exp_dt"].dt.date >= self.today].sort_values("exp_dt")
-
-        if future_exp.empty:
-            return atm, f"NIFTY {atm} {opt_type}", "", 0.50, 4
-
-        curr_exp = future_exp["expiry"].iloc[0]
-        exp_slice = future_exp[future_exp["expiry"] == curr_exp]
-        days_to_exp = max(1, (exp_slice.iloc[0]["exp_dt"].date() - self.today).days)
-
-        candidates = []
-        for offset in range(-5, 6):
-            k = atm + (offset * 50)
-            row = exp_slice[(exp_slice["strike_num"] == float(k)) & (exp_slice["symbol"].str.endswith(opt_type))]
-            if not row.empty:
-                sym = str(row.iloc[0]["symbol"])
-                tok = str(row.iloc[0]["token"])
-                est_ltp = max(5.0, abs(spot_ref - k) * 0.5 + 40.0)
-                candidates.append((k, sym, tok, est_ltp))
-
-        chosen_strike = atm
-        chosen_sym = f"NIFTY {atm} {opt_type}"
-        chosen_tok = ""
-
-        valid = [c for c in candidates if c[3] <= budget_target + 8.0]
-        if valid:
-            valid.sort(key=lambda x: abs(x[3] - budget_target))
-            chosen_strike, chosen_sym, chosen_tok = valid[0][0], valid[0][1], valid[0][2]
-        elif candidates:
-            candidates.sort(key=lambda x: abs(x[3] - budget_target))
-            chosen_strike, chosen_sym, chosen_tok = candidates[0][0], candidates[0][1], candidates[0][2]
-
-        delta = compute_contract_delta(spot_ref, chosen_strike, days_to_exp, is_ce=is_ce)
-        return chosen_strike, chosen_sym, chosen_tok, delta, days_to_exp
 
     def on_tick(self, ltp):
         if not is_market_hours():
@@ -940,10 +953,10 @@ class DedicatedTradingWorker:
         opt_entry = tr.get("opt_entry_ltp", 75.0)
         targets = tr.get("targets", [])
         trade_atr = tr.get("entry_atr", self.current_atr5)
+
         t_now = datetime.datetime.now(IST).strftime("%H:%M:%S")
         date_readable = tr.get("date_readable", datetime.datetime.now(IST).strftime("%d-%b-%Y (%A)"))
 
-        # Check Stop Loss breach
         stop_hit = (live_spot <= tr["current_sl"]) if is_ce else (live_spot >= tr["current_sl"])
         if stop_hit:
             exit_spot = tr["current_sl"]
@@ -981,7 +994,6 @@ class DedicatedTradingWorker:
             )
             return
 
-        # Track Maximum Favorable Excursion (Peak)
         if is_ce:
             tr["peak"] = max(tr.get("peak", entry_p), live_spot)
             peak_gain = tr["peak"] - entry_p
@@ -992,37 +1004,43 @@ class DedicatedTradingWorker:
         sl_updated = False
         update_reason = ""
 
-        # STAGE 1: Peak reaches 2.5x ATR -> Trail at (Peak - 1.5x ATR)
-        if peak_gain >= (2.5 * trade_atr):
+        # STAGE 1: Peak Gain >= 2.5x ATR -> Trail at 0.500 Fib Pullback - 0.5x ATR
+        if peak_gain >= (2.5 * trade_atr) and tr.get("trail_stage", 0) < 1:
+            tr["trail_stage"] = 1
             if is_ce:
-                candidate_sl = round(tr["peak"] - (1.5 * trade_atr), 1)
+                fib_50 = tr["peak"] - (0.500 * peak_gain)
+                candidate_sl = round(fib_50 - (0.5 * trade_atr), 1)
                 if candidate_sl > tr["current_sl"]:
                     tr["current_sl"] = candidate_sl
-                    update_reason = f"STAGE 1 (2.5x ATR PEAK): TRAILED TO -1.5x ATR ({cur_sl:.1f})"
+                    update_reason = f"STAGE 1 (FIB 0.500 PULLBACK + ATR): LOCKED {candidate_sl:.1f}"
                     sl_updated = True
             else:
-                candidate_sl = round(tr["peak"] + (1.5 * trade_atr), 1)
+                fib_50 = tr["peak"] + (0.500 * peak_gain)
+                candidate_sl = round(fib_50 + (0.5 * trade_atr), 1)
                 if candidate_sl < tr["current_sl"]:
                     tr["current_sl"] = candidate_sl
-                    update_reason = f"STAGE 1 (2.5x ATR PEAK): TRAILED TO +1.5x ATR ({cur_sl:.1f})"
+                    update_reason = f"STAGE 1 (FIB 0.500 PULLBACK + ATR): LOCKED {candidate_sl:.1f}"
                     sl_updated = True
 
-        # STAGE 2: Peak reaches 4.5x ATR -> Tighten trail to (Peak - 1.0x ATR)
-        if peak_gain >= (4.5 * trade_atr):
+        # STAGE 2: Peak Gain >= 4.5x ATR -> Tighten to 0.382 Fib Pullback - 0.5x ATR
+        if peak_gain >= (4.5 * trade_atr) and tr.get("trail_stage", 0) < 2:
+            tr["trail_stage"] = 2
             if is_ce:
-                candidate_sl = round(tr["peak"] - (1.0 * trade_atr), 1)
+                fib_382 = tr["peak"] - (0.382 * peak_gain)
+                candidate_sl = round(fib_382 - (0.5 * trade_atr), 1)
                 if candidate_sl > tr["current_sl"]:
                     tr["current_sl"] = candidate_sl
-                    update_reason = f"STAGE 2 (4.5x ATR EXPANSION): TIGHTENED TO -1.0x ATR ({cur_sl:.1f})"
+                    update_reason = f"STAGE 2 (FIB 0.382 PULLBACK + ATR): TIGHTENED {candidate_sl:.1f}"
                     sl_updated = True
             else:
-                candidate_sl = round(tr["peak"] + (1.0 * trade_atr), 1)
+                fib_382 = tr["peak"] + (0.382 * peak_gain)
+                candidate_sl = round(fib_382 + (0.5 * trade_atr), 1)
                 if candidate_sl < tr["current_sl"]:
                     tr["current_sl"] = candidate_sl
-                    update_reason = f"STAGE 2 (4.5x ATR EXPANSION): TIGHTENED TO +1.0x ATR ({cur_sl:.1f})"
+                    update_reason = f"STAGE 2 (FIB 0.382 PULLBACK + ATR): TIGHTENED {candidate_sl:.1f}"
                     sl_updated = True
 
-        # STAGE 3: RUNNER BEYOND T1 -> PRIOR BAR LOW + 2.0 (CE) / PRIOR BAR HIGH - 2.0 (PE)
+        # STAGE 3: RUNNER BEYOND TARGET 1 -> PRIOR BAR LOW + 2.0 (CE) / PRIOR BAR HIGH - 2.0 (PE)
         t1_dist = abs(targets[0] - entry_p) if targets else 75.0
         if peak_gain >= t1_dist and len(self.candles) >= 2:
             prev_closed = self.candles[-1]
@@ -1030,13 +1048,13 @@ class DedicatedTradingWorker:
                 candidate_sl = round(float(prev_closed["low"]) + 2.0, 1)
                 if candidate_sl > tr["current_sl"]:
                     tr["current_sl"] = candidate_sl
-                    update_reason = "STAGE 3 (RUNNER): PRIOR BAR LOW + 2.0 LOCKED"
+                    update_reason = f"STAGE 3 (RUNNER): PRIOR BAR LOW + 2.0 LOCKED ({candidate_sl:.1f})"
                     sl_updated = True
             else:
                 candidate_sl = round(float(prev_closed["high"]) - 2.0, 1)
                 if candidate_sl < tr["current_sl"]:
                     tr["current_sl"] = candidate_sl
-                    update_reason = "STAGE 3 (RUNNER): PRIOR BAR HIGH - 2.0 LOCKED"
+                    update_reason = f"STAGE 3 (RUNNER): PRIOR BAR HIGH - 2.0 LOCKED ({candidate_sl:.1f})"
                     sl_updated = True
 
         last_alerted = tr.get("last_alerted_sl", tr["init_sl"])
@@ -1060,7 +1078,7 @@ class DedicatedTradingWorker:
                 f"• <b>OPTION (GTT ₹):</b> ₹{gtt_opt:.2f}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"🔒 <b>LOCKED PROFIT:</b> {sign}{locked_pts:.1f} pts (₹{sign}{locked_inr})\n"
-                f"📍 <b>Status:</b> RUNNER TRAILED\n"
+                f"📍 <b>Status:</b> FIB PULLBACK + ATR TRAILED\n"
                 f"📅 <b>Date:</b> {date_readable} | ⏰ <b>Time:</b> {t_now}"
             )
 
