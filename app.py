@@ -102,7 +102,7 @@ with col_refresh:
         st.rerun()
 
 # -------------------------------------------------------------
-# Active Trade HUD Card or Standby Monitor
+# Comprehensive Execution Tables (Active HUD vs Standby Monitor)
 # -------------------------------------------------------------
 if hud and hud.get("entry_spot"):
     trade_type = hud.get("type", "CE")
@@ -111,37 +111,49 @@ if hud and hud.get("entry_spot"):
     symbol = hud.get("symbol", f"NIFTY {trade_type}")
     entry_spot = float(hud.get("entry_spot", 0.0))
     entry_opt = float(hud.get("entry_opt", 0.0))
+    sl_spot = float(hud.get("sl_spot", 0.0))
+    sl_opt = float(hud.get("sl_opt", 0.0))
     trail_spot = float(hud.get("trail_spot", 0.0))
+    trail_opt = float(hud.get("trail_opt", 0.0))
     target_p = float(hud.get("target_p", 0.0))
+    opt_target = float(hud.get("opt_target", 0.0))
+    delta = float(hud.get("delta", 0.50))
+    secured_pts = float(hud.get("secured_pts", 0.0))
 
     st.markdown(
         f"""
         <div style="background:#131722; border:1px solid #2a2e39; border-radius:8px; padding:12px 16px; margin-bottom:12px;">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; flex-wrap:wrap; gap:8px;">
                 <div style="display:flex; align-items:center; gap:8px;">
                     <span style="background:{badge_bg}; color:#fff; font-size:12px; font-weight:bold; padding:3px 8px; border-radius:4px;">{trade_type}</span>
                     <span style="background:#2a2e39; color:#ffb74d; font-size:11px; font-weight:bold; padding:3px 6px; border-radius:4px;">{mode}</span>
                     <span style="color:#ffffff; font-size:15px; font-weight:bold;">{symbol}</span>
+                    <span style="color:#787b86; font-size:12px;">(Delta: {delta:.2f})</span>
                 </div>
                 <div style="font-size:12px; color:#00e676; font-weight:bold;">
-                    ● ACTIVE POSITION [1/1 DAY LIMIT]
+                    ● ACTIVE RUNNER [1/1 DAILY TRADE COMPLETED]
                 </div>
             </div>
             <div style="display:flex; gap:12px; align-items:stretch; flex-wrap:wrap;">
                 <div style="background:#1f2430; padding:6px 12px; border-radius:4px; min-width:130px;">
-                    <div style="font-size:11px; color:#90a4ae;">ENTRY</div>
+                    <div style="font-size:11px; color:#90a4ae;">ENTRY (INDEX / OPTION)</div>
                     <div style="font-size:14px; font-weight:bold; color:#fff;">{entry_spot:.1f}</div>
                     <div style="font-size:11px; color:#4fc3f7;">LTP: ₹{entry_opt:.2f}</div>
                 </div>
                 <div style="background:#1f2430; padding:6px 12px; border-radius:4px; min-width:130px;">
+                    <div style="font-size:11px; color:#90a4ae;">INITIAL STOP LOSS</div>
+                    <div style="font-size:14px; font-weight:bold; color:#ef5350;">{sl_spot:.1f}</div>
+                    <div style="font-size:11px; color:#ef5350;">GTT: ₹{sl_opt:.2f} (-{abs(entry_spot-sl_spot):.1f}p)</div>
+                </div>
+                <div style="background:#1f2430; padding:6px 12px; border-radius:4px; min-width:130px;">
                     <div style="font-size:11px; color:#90a4ae;">CURRENT TRAIL SL</div>
-                    <div style="font-size:14px; font-weight:bold; color:#ef5350;">{trail_spot:.1f}</div>
-                    <div style="font-size:11px; color:#ef5350;">Diff: {abs(trail_spot-entry_spot):.1f} pts</div>
+                    <div style="font-size:14px; font-weight:bold; color:#00e676;">{trail_spot:.1f}</div>
+                    <div style="font-size:11px; color:#00e676;">GTT: ₹{trail_opt:.2f} ({'+' if secured_pts>=0 else ''}{secured_pts:.1f}p)</div>
                 </div>
                 <div style="background:#1f2430; padding:6px 12px; border-radius:4px; min-width:130px;">
                     <div style="font-size:11px; color:#90a4ae;">{'3x ATR TARGET' if mode == 'BREAKOUT' else 'VWAP TARGET'}</div>
-                    <div style="font-size:14px; font-weight:bold; color:#00e676;">{target_p:.1f}</div>
-                    <div style="font-size:11px; color:#00e676;">Runway: +{abs(target_p-entry_spot):.1f} pts</div>
+                    <div style="font-size:14px; font-weight:bold; color:#ffb74d;">{target_p:.1f}</div>
+                    <div style="font-size:11px; color:#ffb74d;">Target: ₹{opt_target:.2f} (+{abs(target_p-entry_spot):.1f}p)</div>
                 </div>
             </div>
         </div>
@@ -154,6 +166,9 @@ else:
     pivot_p_display = pivots.get("P", "—")
     pdh_display = pivots.get("PDH", "—")
     pdl_display = pivots.get("PDL", "—")
+    fib_dir = fib_lines.get("direction", "NEUTRAL")
+    fib_50 = fib_lines.get("fib_50", "—")
+    fib_100 = fib_lines.get("fib_100", "—")
     regime_mode_desc = f"BREAKOUT (≥{vol_threshold:.0f} ATR: 3x ATR Runner)" if is_high_vol else f"FADE (<{vol_threshold:.0f} ATR: 0.5 ATR Sweep to VWAP)"
     status_label = "Awaiting 09:30-10:00 Window Trigger" if trades_taken == 0 else "Daily Trade Completed (1/1 Limit Reached)"
 
@@ -161,37 +176,37 @@ else:
         f"""
         <div style="background:#131722; border:1px solid #2a2e39; border-radius:8px; padding:12px 16px; margin-bottom:12px;">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                <span style="color:#90a4ae; font-size:13px; font-weight:bold;">STANDBY MONITOR • DUAL REGIME (09:30-10:00)</span>
+                <span style="color:#90a4ae; font-size:13px; font-weight:bold;">STANDBY MONITOR • DUAL REGIME SESSION LEVELS</span>
                 <span style="color:#787b86; font-size:12px;">{status_label}</span>
             </div>
-            <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
-                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
+            <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                <div style="background:#1f2430; padding:6px 12px; border-radius:4px;">
                     <div style="font-size:11px; color:#90a4ae;">DAILY 10-ATR</div>
-                    <div style="font-size:14px; font-weight:bold; color:#ffb74d;">{daily_atr10:.1f} / {vol_threshold:.0f}</div>
+                    <div style="font-size:13px; font-weight:bold; color:#ffb74d;">{daily_atr10:.1f} / {vol_threshold:.0f}</div>
                 </div>
-                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">REGIME MODE</div>
-                    <div style="font-size:14px; font-weight:bold; color:#42a5f5;">{regime_mode_desc}</div>
+                <div style="background:#1f2430; padding:6px 12px; border-radius:4px;">
+                    <div style="font-size:11px; color:#90a4ae;">ACTIVE STRATEGY</div>
+                    <div style="font-size:13px; font-weight:bold; color:#42a5f5;">{regime_mode_desc}</div>
                 </div>
-                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
+                <div style="background:#1f2430; padding:6px 12px; border-radius:4px;">
                     <div style="font-size:11px; color:#90a4ae;">ORB HIGH</div>
-                    <div style="font-size:14px; font-weight:bold; color:#00e676;">{orb_h_display}</div>
+                    <div style="font-size:13px; font-weight:bold; color:#00e676;">{orb_h_display}</div>
                 </div>
-                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
+                <div style="background:#1f2430; padding:6px 12px; border-radius:4px;">
                     <div style="font-size:11px; color:#90a4ae;">ORB LOW</div>
-                    <div style="font-size:14px; font-weight:bold; color:#ff5252;">{orb_l_display}</div>
+                    <div style="font-size:13px; font-weight:bold; color:#ff5252;">{orb_l_display}</div>
                 </div>
-                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
+                <div style="background:#1f2430; padding:6px 12px; border-radius:4px;">
                     <div style="font-size:11px; color:#90a4ae;">PIVOT P</div>
-                    <div style="font-size:14px; font-weight:bold; color:#ffeb3b;">{pivot_p_display}</div>
+                    <div style="font-size:13px; font-weight:bold; color:#ffeb3b;">{pivot_p_display}</div>
                 </div>
-                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">PREV DAY HIGH</div>
-                    <div style="font-size:14px; font-weight:bold; color:#42a5f5;">{pdh_display}</div>
+                <div style="background:#1f2430; padding:6px 12px; border-radius:4px;">
+                    <div style="font-size:11px; color:#90a4ae;">PREV HIGH / LOW</div>
+                    <div style="font-size:13px; font-weight:bold; color:#42a5f5;">{pdh_display} / {pdl_display}</div>
                 </div>
-                <div style="background:#1f2430; padding:6px 14px; border-radius:4px;">
-                    <div style="font-size:11px; color:#90a4ae;">PREV DAY LOW</div>
-                    <div style="font-size:14px; font-weight:bold; color:#ab47bc;">{pdl_display}</div>
+                <div style="background:#1f2430; padding:6px 12px; border-radius:4px;">
+                    <div style="font-size:11px; color:#90a4ae;">FIB 50% / 100% ({fib_dir})</div>
+                    <div style="font-size:13px; font-weight:bold; color:#b388ff;">{fib_50} / {fib_100}</div>
                 </div>
             </div>
         </div>
@@ -263,7 +278,7 @@ html_code = f"""
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
       z-index: 1000;
       pointer-events: none;
-      min-width: 200px;
+      min-width: 220px;
     }}
   </style>
 </head>
@@ -345,7 +360,7 @@ html_code = f"""
       candleSeries.setMarkers(formattedMarkers);
     }}
 
-    // Pivots P, R1-R5, S1-S5, PDH, PDL
+    // Pivots P, R1-R5, S1-S5, PDH, PDL[cite: 3]
     const visiblePivots = {{
       'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
       'R1':  {{ color: '#ef5350', title: 'R1' }},
@@ -375,7 +390,7 @@ html_code = f"""
       }}
     }});
 
-    // ORB High & Low
+    // ORB High & Low[cite: 3]
     if (orbLevels && orbLevels.orb_h) {{
       candleSeries.createPriceLine({{
         price: parseFloat(orbLevels.orb_h),
@@ -397,7 +412,7 @@ html_code = f"""
       }});
     }}
 
-    // Dynamic ORB Fibonacci Lines
+    // Dynamic ORB Fibonacci Lines[cite: 3]
     if (fibLines) {{
       const fibTitles = {{
         'ORB_MID': 'ORB MID',
@@ -436,13 +451,15 @@ html_code = f"""
         hoverCard.innerHTML = `
           <div style="font-weight:bold; color:${{color}}; margin-bottom:4px;">${{cardData.title}}</div>
           <div><b>Time:</b> ${{cardData.time_str}}</div>
-          <div><b>Entry:</b> ${{cardData.entry}} | <b>SL:</b> ${{cardData.sl}}</div>
-          <div><b>Target:</b> ${{cardData.target}}</div>
+          <div><b>Contract:</b> ${{cardData.symbol || ''}} (Δ: ${{cardData.delta || 0.5}})</div>
+          <div><b>Index Entry:</b> ${{cardData.entry}} | <b>Opt:</b> ₹${{cardData.opt_entry || '—'}}</div>
+          <div><b>Index SL:</b> ${{cardData.sl}} | <b>GTT:</b> ₹${{cardData.opt_sl || '—'}}</div>
+          <div><b>Target:</b> ${{cardData.target}} | <b>Opt Target:</b> ₹${{cardData.opt_target || '—'}}</div>
           <div><b>Status:</b> ${{cardData.outcome || 'ACTIVE'}}</div>
         `;
         hoverCard.style.display = 'block';
-        hoverCard.style.left = Math.min(param.point.x + 15, container.clientWidth - 220) + 'px';
-        hoverCard.style.top = Math.max(param.point.y - 70, 10) + 'px';
+        hoverCard.style.left = Math.min(param.point.x + 15, container.clientWidth - 240) + 'px';
+        hoverCard.style.top = Math.max(param.point.y - 80, 10) + 'px';
       }} else {{
         hoverCard.style.display = 'none';
       }}
