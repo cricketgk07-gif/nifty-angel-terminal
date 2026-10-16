@@ -197,14 +197,16 @@ class DedicatedTradingWorker:
         today_str = self.today.strftime("%Y-%m-%d")
         saved_state = read_from_redis("nifty_live_state") or {}
 
-        if is_market_hours() and saved_state.get("trade_date") == today_str and saved_state.get("locked_trade"):
-            if not saved_state.get("locked_trade", {}).get("closed", False):
+        if is_market_hours() and saved_state.get("trade_date") == today_str:
+            self.trades_taken_today = saved_state.get("trades_taken_today", 0)
+            self.trade_history_today = saved_state.get("trade_history_today", [])
+            self.hud_data = saved_state.get("hud", {})
+            if saved_state.get("locked_trade") and not saved_state.get("locked_trade", {}).get("closed", False):
                 self.locked_trade = saved_state.get("locked_trade")
-                self.trades_taken_today = saved_state.get("trades_taken_today", 1)
-                self.trade_history_today = saved_state.get("trade_history_today", [])
         else:
             self.trades_taken_today = 0
             self.trade_history_today = []
+            self.hud_data = {}
 
         self.nfo_df = self.load_scrip_master()
         self.fetch_daily_atr_and_levels()
@@ -403,7 +405,6 @@ class DedicatedTradingWorker:
         return chosen_strike, chosen_sym, chosen_tok, delta, days_to_exp, chosen_ltp
 
     def simulate_previous_day_trades(self):
-        """Simulates yesterday's complete session: Entry, Initial SL, Trailing SL steps, Target & Exit."""
         if not self.candles:
             return
 
@@ -456,23 +457,18 @@ class DedicatedTradingWorker:
                 exit_price = 0.0
                 exit_reason = ""
 
-                # Target Exit
                 if mode == "FADE":
                     if (is_ce and h >= target_p) or ((not is_ce) and l <= target_p):
                         exit_triggered = True
                         exit_price = target_p
                         exit_reason = "TARGET HIT (VWAP)"
-                elif mode == "BREAKOUT":
-                    pass
 
-                # Stop Loss Exit
                 if not exit_triggered:
                     if (is_ce and l <= cur_sl) or ((not is_ce) and h >= cur_sl):
                         exit_triggered = True
                         exit_price = cur_sl
                         exit_reason = "STOP LOSS HIT"
 
-                # Mandatory 15:15 IST Square-off
                 if not exit_triggered and b_time >= datetime.time(15, 15):
                     exit_triggered = True
                     exit_price = c
@@ -483,7 +479,6 @@ class DedicatedTradingWorker:
                     final_inr = int(round(final_pts * sim_trade["delta"] * LOT_SIZE_QTY))
                     sign = "+" if final_pts >= 0 else ""
 
-                    # Add Exit Marker on Chart
                     self.markers.append({
                         "time": t_sec,
                         "position": "aboveBar" if is_ce else "belowBar",
@@ -522,7 +517,6 @@ class DedicatedTradingWorker:
                     sim_trade = None
                     break
 
-                # Trailing logic for Breakout Mode
                 if mode == "BREAKOUT":
                     old_sl = sim_trade["current_sl"]
                     if is_ce:
@@ -546,7 +540,6 @@ class DedicatedTradingWorker:
                             prev_bar_sl = float(prev_bars.iloc[idx - 1]["high"]) - 2.0
                             sim_trade["current_sl"] = min(sim_trade["current_sl"], min(fib_tight_sl, min(min_guar_sl, prev_bar_sl)))
 
-                    # Add marker if Trailing SL tightened
                     if abs(sim_trade["current_sl"] - old_sl) >= 4.0:
                         locked_pts = round((sim_trade["current_sl"] - entry_p) if is_ce else (entry_p - sim_trade["current_sl"]), 1)
                         self.markers.append({
@@ -558,7 +551,6 @@ class DedicatedTradingWorker:
                         })
                 continue
 
-            # Check for Signal strictly within 09:30 - 10:00 AM
             if not trade_fired and datetime.time(9, 30) <= b_time < datetime.time(10, 0):
                 if h > p_orb_h:
                     p_pierced_h = True
@@ -936,6 +928,26 @@ class DedicatedTradingWorker:
                 "date_readable": date_readable,
             }
 
+            # Immediately update HUD so Streamlit reflects it
+            self.hud_data = {
+                "type": trade_type,
+                "mode": current_mode,
+                "symbol": sym,
+                "entry_spot": close_p,
+                "entry_opt": opt_ltp,
+                "sl_spot": sl_val,
+                "sl_opt": opt_sl,
+                "trail_spot": sl_val,
+                "trail_opt": opt_sl,
+                "target_p": target_val,
+                "opt_target": opt_target,
+                "delta": delta,
+                "secured_pts": 0.0,
+                "trade_closed": False,
+                "exit_spot": None,
+                "exit_reason": None,
+            }
+
             regime_type_str = f"BREAKOUT DAY (10-ATR: {self.daily_atr10:.0f} ≥ {VOL_THRESHOLD:.0f})" if self.is_high_vol else f"FADE DAY (10-ATR: {self.daily_atr10:.0f} < {VOL_THRESHOLD:.0f})"
             tg_target_label = "3x ATR Runner Target" if current_mode == "BREAKOUT" else "Session VWAP Target"
             total_risk_inr = int(round(risk_pts * delta * LOT_SIZE_QTY))
@@ -1082,9 +1094,16 @@ class DedicatedTradingWorker:
             "pnl_inr": final_inr,
         })
 
+        # Keep HUD data populated with closed details so Streamlit doesn't reset to both Call & Put
+        if self.hud_data:
+            self.hud_data["trade_closed"] = True
+            self.hud_data["exit_spot"] = exit_spot
+            self.hud_data["exit_reason"] = reason
+            self.hud_data["final_pts"] = final_pts
+            self.hud_data["final_inr"] = final_inr
+
         tr["closed"] = True
         self.locked_trade = None
-        self.hud_data = {}
 
         t_now = datetime.datetime.now(IST).strftime("%H:%M:%S")
         send_telegram_alert(
@@ -1134,6 +1153,8 @@ class DedicatedTradingWorker:
                 "delta": delta_val,
                 "secured_pts": trail_pts,
                 "trade_closed": False,
+                "exit_spot": None,
+                "exit_reason": None,
             }
 
         raw_list = list(self.candles)
@@ -1199,6 +1220,7 @@ def run_worker():
                         engine.locked_trade = None
                         engine.trades_taken_today = 0
                         engine.trade_history_today = []
+                        engine.hud_data = {}
                         engine.nfo_df = engine.load_scrip_master()
                         engine.fetch_daily_atr_and_levels()
                         engine.init_historical_candles()
