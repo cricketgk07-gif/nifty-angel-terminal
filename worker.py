@@ -30,16 +30,12 @@ UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 BUDGET_CEILING = float(os.getenv("BUDGET_CEILING", "80.0"))
 PORT = int(os.getenv("PORT", 10000))
 
-# Dual-Regime Constants Matching Pine Script
 VOL_THRESHOLD = 229.0
 MAX_BREACH_MULT = 0.5
 ATR_TARGET_MULT = 3.0
 SL_BUFFER = 5.0
 
 
-# ==========================================
-# 1. Health Server & Keepalive
-# ==========================================
 class HealthHandler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.send_response(200)
@@ -76,9 +72,6 @@ def self_ping_keepalive():
 threading.Thread(target=self_ping_keepalive, daemon=True).start()
 
 
-# ==========================================
-# 2. Math & Redis Helpers
-# ==========================================
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
@@ -157,9 +150,6 @@ def get_dynamic_budget():
     return BUDGET_CEILING
 
 
-# ==========================================
-# 3. Strategy Core Engine
-# ==========================================
 class DedicatedTradingWorker:
     def __init__(self):
         self.candles = []
@@ -170,11 +160,11 @@ class DedicatedTradingWorker:
         self.pivot_lines = {}
         self.fib_lines = {}
         self.orb_levels = {}
-        self.hud_data = {}
         self.contract_preview = {}
         self.prev_day_summary = {}
 
         self.locked_trade = None
+        self.today_trade_record = None  # Permanent container for today's trade
         self.trades_taken_today = 0
         self.trade_history_today = []
 
@@ -197,16 +187,15 @@ class DedicatedTradingWorker:
         today_str = self.today.strftime("%Y-%m-%d")
         saved_state = read_from_redis("nifty_live_state") or {}
 
-        if is_market_hours() and saved_state.get("trade_date") == today_str:
+        # Restore today's state if re-starting mid-day
+        if saved_state.get("trade_date") == today_str:
             self.trades_taken_today = saved_state.get("trades_taken_today", 0)
-            self.trade_history_today = saved_state.get("trade_history_today", [])
-            self.hud_data = saved_state.get("hud", {})
+            self.today_trade_record = saved_state.get("today_trade_record")
             if saved_state.get("locked_trade") and not saved_state.get("locked_trade", {}).get("closed", False):
                 self.locked_trade = saved_state.get("locked_trade")
         else:
             self.trades_taken_today = 0
-            self.trade_history_today = []
-            self.hud_data = {}
+            self.today_trade_record = None
 
         self.nfo_df = self.load_scrip_master()
         self.fetch_daily_atr_and_levels()
@@ -309,7 +298,7 @@ class DedicatedTradingWorker:
                 print(f"[Daily ATR Loaded]: 10-ATR={self.daily_atr10} | Mode={'BO' if self.is_high_vol else 'FADE'}")
                 return
         except Exception as e:
-            print(f"[Daily ATR/Pivot Error]: {e}")
+            print(f"[Daily ATR Error]: {e}")
             self.daily_atr10 = 160.0
             self.is_high_vol = False
 
@@ -487,17 +476,6 @@ class DedicatedTradingWorker:
                         "text": f"EXIT {sim_trade['type']}: {sign}{final_pts}p",
                     })
 
-                    self.history_cards[str(t_sec)] = {
-                        "title": f"PREV DAY EXIT • {sim_trade['type']} ({exit_reason})",
-                        "time_str": time_label,
-                        "entry": entry_p,
-                        "sl": cur_sl,
-                        "target": target_p,
-                        "exit_price": exit_price,
-                        "outcome": f"{sign}{final_pts} pts (₹{sign}{final_inr})",
-                        "type": sim_trade["type"],
-                    }
-
                     self.prev_day_summary = {
                         "date": prev_day_str,
                         "regime": "BREAKOUT" if self.is_high_vol else "FADE",
@@ -612,7 +590,6 @@ class DedicatedTradingWorker:
                     is_ce = (trade_type == "CE")
                     delta = 0.50
                     est_opt = 75.0
-                    risk_pts = round(abs(c - sl_val), 1)
 
                     self.markers.append({
                         "time": t_sec,
@@ -621,19 +598,6 @@ class DedicatedTradingWorker:
                         "shape": "arrowUp" if is_ce else "arrowDown",
                         "text": f"PREV DAY {mode} {trade_type} @ {c:.1f}",
                     })
-
-                    self.history_cards[str(t_sec)] = {
-                        "title": f"PREV DAY • {mode} {trade_type}",
-                        "time_str": time_label,
-                        "entry": c,
-                        "sl": sl_val,
-                        "target": tg_val,
-                        "delta": delta,
-                        "opt_entry": est_opt,
-                        "opt_sl": max(0.5, round(est_opt - (risk_pts * delta), 2)),
-                        "type": trade_type,
-                        "outcome": "TRIGGERED",
-                    }
 
                     sim_trade = {
                         "type": trade_type,
@@ -779,9 +743,19 @@ class DedicatedTradingWorker:
     def background_option_poller(self):
         while True:
             time.sleep(15)
-            if is_market_hours() and self.locked_trade and not self.locked_trade.get("closed") and self.locked_trade.get("token"):
+            # Poll if today's trade exists (active or completed)
+            contract_sym = None
+            contract_tok = None
+            if self.locked_trade and self.locked_trade.get("token"):
+                contract_sym = self.locked_trade["symbol"]
+                contract_tok = self.locked_trade["token"]
+            elif self.today_trade_record and self.today_trade_record.get("token"):
+                contract_sym = self.today_trade_record["symbol"]
+                contract_tok = self.today_trade_record["token"]
+
+            if is_market_hours() and contract_tok:
                 try:
-                    res = self.api.ltpData("NFO", self.locked_trade["symbol"], self.locked_trade["token"])
+                    res = self.api.ltpData("NFO", contract_sym, contract_tok)
                     if isinstance(res, dict) and res.get("status") and res.get("data"):
                         self.last_polled_opt_ltp = float(res["data"].get("ltp", 0.0))
                 except Exception:
@@ -796,6 +770,7 @@ class DedicatedTradingWorker:
         bar_dt = now.replace(minute=bucket_min, second=0, microsecond=0)
         t_sec = int(bar_dt.timestamp())
 
+        # 15:15 IST Mandatory EOD Square-Off
         if now.time() >= datetime.time(15, 15) and self.locked_trade and not self.locked_trade.get("closed"):
             self.execute_eod_exit(ltp)
             return
@@ -825,6 +800,7 @@ class DedicatedTradingWorker:
         self.sync_state(ltp)
 
     def evaluate_dual_regime_entry(self):
+        # Strictly enforce 1 trade per day, entry window strictly 09:30 - 10:00 AM IST
         if not is_market_hours() or self.locked_trade or self.trades_taken_today >= 1 or len(self.candles) < 4:
             return
 
@@ -905,7 +881,7 @@ class DedicatedTradingWorker:
             date_readable = last_c["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)")
             close_time_str = (last_c["dt"].astimezone(IST) + datetime.timedelta(minutes=5)).strftime("%H:%M:%S")
 
-            self.locked_trade = {
+            trade_dict = {
                 "type": trade_type,
                 "mode": current_mode,
                 "entry": close_p,
@@ -925,28 +901,16 @@ class DedicatedTradingWorker:
                 "opt_entry_ltp": opt_ltp,
                 "opt_sl": opt_sl,
                 "time": last_c["time"],
+                "trigger_time": close_time_str,
                 "date_readable": date_readable,
-            }
-
-            # Immediately update HUD so Streamlit reflects it
-            self.hud_data = {
-                "type": trade_type,
-                "mode": current_mode,
-                "symbol": sym,
-                "entry_spot": close_p,
-                "entry_opt": opt_ltp,
-                "sl_spot": sl_val,
-                "sl_opt": opt_sl,
-                "trail_spot": sl_val,
-                "trail_opt": opt_sl,
-                "target_p": target_val,
-                "opt_target": opt_target,
-                "delta": delta,
-                "secured_pts": 0.0,
-                "trade_closed": False,
                 "exit_spot": None,
                 "exit_reason": None,
+                "final_pts": 0.0,
+                "final_inr": 0,
             }
+
+            self.locked_trade = trade_dict
+            self.today_trade_record = trade_dict.copy()
 
             regime_type_str = f"BREAKOUT DAY (10-ATR: {self.daily_atr10:.0f} ≥ {VOL_THRESHOLD:.0f})" if self.is_high_vol else f"FADE DAY (10-ATR: {self.daily_atr10:.0f} < {VOL_THRESHOLD:.0f})"
             tg_target_label = "3x ATR Runner Target" if current_mode == "BREAKOUT" else "Session VWAP Target"
@@ -959,21 +923,6 @@ class DedicatedTradingWorker:
                 "shape": "arrowUp" if is_ce else "arrowDown",
                 "text": f"{current_mode} {trade_type} @ {close_p:.1f}",
             })
-
-            self.history_cards[str(last_c["time"])] = {
-                "title": f"{current_mode} {trade_type}",
-                "entry": round(close_p, 1),
-                "sl": sl_val,
-                "target": target_val,
-                "opt_entry": opt_ltp,
-                "opt_sl": opt_sl,
-                "opt_target": opt_target,
-                "symbol": sym,
-                "delta": delta,
-                "type": trade_type,
-                "time_str": close_time_str,
-                "outcome": "ACTIVE",
-            }
 
             send_telegram_alert(
                 f"⚡ <b>NIFTY DUAL-REGIME: BUY {trade_type} ({current_mode})</b>\n"
@@ -1027,6 +976,8 @@ class DedicatedTradingWorker:
                     target_banked_sl = max(fib_tight_sl, max(min_guaranteed_sl, bar_trail_sl))
                     if target_banked_sl > tr["current_sl"]:
                         tr["current_sl"] = round(target_banked_sl, 1)
+                        if self.today_trade_record:
+                            self.today_trade_record["current_sl"] = tr["current_sl"]
                         self.alert_sl_update(tr, "BREAKOUT RUNNER TIGHTENED")
 
             else:
@@ -1045,6 +996,8 @@ class DedicatedTradingWorker:
                     target_banked_sl = min(fib_tight_sl, min(min_guaranteed_sl, bar_trail_sl))
                     if target_banked_sl < tr["current_sl"]:
                         tr["current_sl"] = round(target_banked_sl, 1)
+                        if self.today_trade_record:
+                            self.today_trade_record["current_sl"] = tr["current_sl"]
                         self.alert_sl_update(tr, "BREAKOUT RUNNER TIGHTENED")
 
     def alert_sl_update(self, tr, reason):
@@ -1085,27 +1038,20 @@ class DedicatedTradingWorker:
         sign = "+" if final_pts >= 0 else ""
         outcome_str = "PROFIT" if final_pts > 0 else "LOSS"
 
-        self.trade_history_today.append({
-            "trade_num": 1,
-            "type": tr["type"],
-            "mode": tr.get("mode"),
-            "outcome": outcome_str,
-            "pnl_pts": final_pts,
-            "pnl_inr": final_inr,
-        })
-
-        # Keep HUD data populated with closed details so Streamlit doesn't reset to both Call & Put
-        if self.hud_data:
-            self.hud_data["trade_closed"] = True
-            self.hud_data["exit_spot"] = exit_spot
-            self.hud_data["exit_reason"] = reason
-            self.hud_data["final_pts"] = final_pts
-            self.hud_data["final_inr"] = final_inr
+        t_now = datetime.datetime.now(IST).strftime("%H:%M:%S")
 
         tr["closed"] = True
+        tr["exit_spot"] = exit_spot
+        tr["exit_reason"] = reason
+        tr["exit_time"] = t_now
+        tr["final_pts"] = final_pts
+        tr["final_inr"] = final_inr
+        tr["outcome"] = outcome_str
+
+        # Lock permanently into today's record so Streamlit displays it all day
+        self.today_trade_record = tr.copy()
         self.locked_trade = None
 
-        t_now = datetime.datetime.now(IST).strftime("%H:%M:%S")
         send_telegram_alert(
             f"🏁 <b>TRADE CLOSED ({reason})</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1124,37 +1070,51 @@ class DedicatedTradingWorker:
             return
         self.last_push_time = now_ts
 
+        # Active or retained trade record
+        tr_source = self.locked_trade or self.today_trade_record
+
         opt_ltp = 0.0
-        if is_market_hours() and self.locked_trade and not self.locked_trade.get("closed"):
-            pts_gain = (live_ltp - self.locked_trade["entry"]) if self.locked_trade["type"] == "CE" else (self.locked_trade["entry"] - live_ltp)
-            opt_ltp = max(0.5, round(self.locked_trade.get("opt_entry_ltp", 75.0) + (pts_gain * self.locked_trade.get("delta", 0.50)), 2))
+        hud_payload = {}
 
-            cur_trail = float(self.locked_trade["current_sl"])
-            entry_p = float(self.locked_trade["entry"])
-            is_ce = (self.locked_trade["type"] == "CE")
-            delta_val = float(self.locked_trade.get("delta", 0.50))
-            opt_entry = float(self.locked_trade.get("opt_entry_ltp", 75.0))
+        if tr_source:
+            is_ce = (tr_source["type"] == "CE")
+            delta_val = float(tr_source.get("delta", 0.50))
+            entry_p = float(tr_source["entry"])
+            opt_entry = float(tr_source.get("opt_entry_ltp", 75.0))
+            cur_trail = float(tr_source.get("current_sl", tr_source["init_sl"]))
 
-            trail_pts = round((cur_trail - entry_p) if is_ce else (entry_p - cur_trail), 1)
-            trail_opt_price = max(0.5, round(opt_entry + (trail_pts * delta_val), 2))
+            if self.locked_trade:
+                pts_gain = (live_ltp - entry_p) if is_ce else (entry_p - live_ltp)
+                opt_ltp = max(0.5, round(opt_entry + (pts_gain * delta_val), 2))
+                trail_pts = round((cur_trail - entry_p) if is_ce else (entry_p - cur_trail), 1)
+                trail_opt = max(0.5, round(opt_entry + (trail_pts * delta_val), 2))
+                is_closed = False
+            else:
+                opt_ltp = self.last_polled_opt_ltp if self.last_polled_opt_ltp > 0 else opt_entry
+                trail_pts = float(tr_source.get("final_pts", 0.0))
+                trail_opt = float(tr_source.get("opt_sl", 0.0))
+                is_closed = True
 
-            self.hud_data = {
-                "type": self.locked_trade["type"],
-                "mode": self.locked_trade.get("mode"),
-                "symbol": self.locked_trade["symbol"],
+            hud_payload = {
+                "type": tr_source["type"],
+                "mode": tr_source.get("mode"),
+                "symbol": tr_source["symbol"],
                 "entry_spot": entry_p,
                 "entry_opt": opt_entry,
-                "sl_spot": float(self.locked_trade["init_sl"]),
-                "sl_opt": float(self.locked_trade.get("opt_sl", 0.0)),
+                "sl_spot": float(tr_source["init_sl"]),
+                "sl_opt": float(tr_source.get("opt_sl", 0.0)),
                 "trail_spot": cur_trail,
-                "trail_opt": trail_opt_price,
-                "target_p": float(self.locked_trade.get("target_p", 0.0)),
-                "opt_target": float(self.locked_trade.get("opt_target", 0.0)),
+                "trail_opt": trail_opt,
+                "target_p": float(tr_source.get("target_p", 0.0)),
+                "opt_target": float(tr_source.get("opt_target", 0.0)),
                 "delta": delta_val,
                 "secured_pts": trail_pts,
-                "trade_closed": False,
-                "exit_spot": None,
-                "exit_reason": None,
+                "trade_closed": is_closed,
+                "exit_spot": tr_source.get("exit_spot"),
+                "exit_reason": tr_source.get("exit_reason"),
+                "exit_time": tr_source.get("exit_time"),
+                "final_pts": tr_source.get("final_pts", 0.0),
+                "final_inr": tr_source.get("final_inr", 0),
             }
 
         raw_list = list(self.candles)
@@ -1181,9 +1141,9 @@ class DedicatedTradingWorker:
             "ltp": float(live_ltp),
             "opt_ltp": float(opt_ltp),
             "candles": recent_candles,
-            "locked_trade": self.locked_trade if (is_market_hours() and self.locked_trade and not self.locked_trade.get("closed")) else None,
+            "locked_trade": self.locked_trade,
+            "today_trade_record": self.today_trade_record,
             "trades_taken_today": self.trades_taken_today,
-            "trade_history_today": self.trade_history_today,
             "trade_date": self.today.strftime("%Y-%m-%d"),
             "daily_atr10": self.daily_atr10,
             "is_high_vol": self.is_high_vol,
@@ -1195,15 +1155,12 @@ class DedicatedTradingWorker:
             "history_cards": self.history_cards,
             "contract_preview": self.contract_preview,
             "prev_day_summary": self.prev_day_summary,
-            "hud": self.hud_data if is_market_hours() else {},
+            "hud": hud_payload,
             "updated_at": time.time(),
         }
         push_to_redis("nifty_live_state", payload)
 
 
-# ==========================================
-# 4. Supervisor Loop
-# ==========================================
 def run_worker():
     while True:
         try:
@@ -1218,9 +1175,8 @@ def run_worker():
                         engine.today = now.date()
                         engine.authenticate_angel_one()
                         engine.locked_trade = None
+                        engine.today_trade_record = None
                         engine.trades_taken_today = 0
-                        engine.trade_history_today = []
-                        engine.hud_data = {}
                         engine.nfo_df = engine.load_scrip_master()
                         engine.fetch_daily_atr_and_levels()
                         engine.init_historical_candles()
