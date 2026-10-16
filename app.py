@@ -131,7 +131,7 @@ if prev_day_summary and prev_day_summary.get("type"):
     )
 
 # -------------------------------------------------------------
-# 3. Dynamic Execution & Strike Monitor Table
+# 3. Dynamic Live Execution HUD (Permanent throughout Session)
 # -------------------------------------------------------------
 orb_h_display = orb_levels.get("orb_h", "—")
 orb_l_display = orb_levels.get("orb_l", "—")
@@ -150,7 +150,6 @@ regime_mode_desc = f"BREAKOUT (≥{vol_threshold:.0f} ATR: 3x ATR Runner)" if is
 active_trade_type = hud.get("type") if (hud and hud.get("entry_spot")) else None
 is_trade_closed = hud.get("trade_closed", False) if hud else False
 
-# Large Dedicated HUD Card (Active Trailing Stop & Target Metrics)
 trade_hud_html = ""
 if active_trade_type:
     entry_spot = float(hud.get("entry_spot", 0.0))
@@ -162,8 +161,14 @@ if active_trade_type:
     target_p = float(hud.get("target_p", 0.0))
     opt_target = float(hud.get("opt_target", 0.0))
     secured_pts = float(hud.get("secured_pts", 0.0))
-    status_label_color = "#ff5252" if is_trade_closed else "#00e676"
-    status_label_text = f"CLOSED ({hud.get('exit_reason', 'STOP HIT')})" if is_trade_closed else "ACTIVE RUNNER [TRADE #1/1]"
+    final_pts = float(hud.get("final_pts", 0.0))
+    final_inr = int(hud.get("final_inr", 0))
+
+    if is_trade_closed:
+        sign = "+" if final_pts >= 0 else ""
+        status_badge = f'<span style="background:{"#00e676" if final_pts>=0 else "#ff5252"}; color:#000; font-size:12px; font-weight:bold; padding:3px 8px; border-radius:4px;">CLOSED: {sign}{final_pts:.1f} pts (₹{sign}{final_inr}) [{hud.get("exit_reason","EXIT")}]</span>'
+    else:
+        status_badge = '<span style="background:#00e676; color:#000; font-size:12px; font-weight:bold; padding:3px 8px; border-radius:4px;">● LIVE ACTIVE RUNNER (TILL 15:15 IST)</span>'
 
     trade_hud_html = (
         '<div style="background:#131722; border:1px solid #2a2e39; border-radius:8px; padding:12px 16px; margin-bottom:12px;">'
@@ -173,7 +178,7 @@ if active_trade_type:
         f'<span style="color:#ffffff; font-size:15px; font-weight:bold;">{hud.get("symbol")}</span>'
         f'<span style="color:#787b86; font-size:12px;">(Delta: {hud.get("delta", 0.50):.2f})</span>'
         '</div>'
-        f'<div style="font-size:12px; color:{status_label_color}; font-weight:bold;">● {status_label_text}</div>'
+        f'<div>{status_badge}</div>'
         '</div>'
         '<div style="display:flex; gap:12px; align-items:stretch; flex-wrap:wrap;">'
         '<div style="background:#1f2430; padding:6px 12px; border-radius:4px; min-width:130px;">'
@@ -200,57 +205,49 @@ if active_trade_type:
         '</div>'
     )
 
-# Selective Box Rendering (Empties & Disables Opposite Option)
+# Execution Bottom Section (Never shows both when a trade exists)
 if active_trade_type == "CE":
-    ce_box_html = (
+    contract_section_html = (
+        '<div style="display:flex; gap:12px; flex-wrap:wrap;">'
         '<div style="background:#1f2430; padding:10px 14px; border-radius:6px; flex:1; min-width:280px; border-left:4px solid #00e676;">'
-        f'<div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#00e676; font-weight:bold;">CALL OPTION (CE) • {hud.get("symbol")}</span><span style="font-size:11px; color:#00e676; font-weight:bold;">● {"TRIGGERED / ACTIVE" if not is_trade_closed else "COMPLETED"}</span></div>'
+        f'<div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#00e676; font-weight:bold;">CALL OPTION (CE) • {hud.get("symbol")}</span><span style="font-size:11px; color:#00e676; font-weight:bold;">● {"ACTIVE POSITION" if not is_trade_closed else "TRADE COMPLETED"}</span></div>'
         f'<div style="font-size:13px; color:#ffffff; margin-top:4px;">Index Entry: <b>{entry_spot:.1f}</b> | Opt: <b>₹{entry_opt:.2f}</b> (LTP: ₹{opt_ltp:.2f})</div>'
         f'<div style="font-size:12px; color:#ef5350; margin-top:2px;">Initial SL: <b>{sl_spot:.1f}</b> | Trail SL: <b style="color:#00e676;">{trail_spot:.1f} (₹{trail_opt:.2f})</b></div>'
         f'<div style="font-size:12px; color:#ffb74d; margin-top:2px;">Target: <b>{target_p:.1f} (₹{opt_target:.2f})</b> | Locked: <b style="color:#00e676;">{"+" if secured_pts>=0 else ""}{secured_pts:.1f} pts</b></div>'
         '</div>'
-    )
-    pe_box_html = (
-        '<div style="background:#15181f; padding:10px 14px; border-radius:6px; flex:1; min-width:280px; border-left:4px solid #424242; opacity:0.25;">'
-        '<div style="font-size:12px; color:#787b86; font-weight:bold;">PUT OPTION (PE) • DISABLED</div>'
-        '<div style="font-size:12px; color:#616161; margin-top:6px;">Call signal triggered. Put setup is emptied & disabled for today.</div>'
         '</div>'
     )
 
 elif active_trade_type == "PE":
-    ce_box_html = (
-        '<div style="background:#15181f; padding:10px 14px; border-radius:6px; flex:1; min-width:280px; border-left:4px solid #424242; opacity:0.25;">'
-        '<div style="font-size:12px; color:#787b86; font-weight:bold;">CALL OPTION (CE) • DISABLED</div>'
-        '<div style="font-size:12px; color:#616161; margin-top:6px;">Put signal triggered. Call setup is emptied & disabled for today.</div>'
-        '</div>'
-    )
-    pe_box_html = (
+    contract_section_html = (
+        '<div style="display:flex; gap:12px; flex-wrap:wrap;">'
         '<div style="background:#1f2430; padding:10px 14px; border-radius:6px; flex:1; min-width:280px; border-left:4px solid #ff5252;">'
-        f'<div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#ff5252; font-weight:bold;">PUT OPTION (PE) • {hud.get("symbol")}</span><span style="font-size:11px; color:#ff5252; font-weight:bold;">● {"TRIGGERED / ACTIVE" if not is_trade_closed else "COMPLETED"}</span></div>'
+        f'<div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#ff5252; font-weight:bold;">PUT OPTION (PE) • {hud.get("symbol")}</span><span style="font-size:11px; color:#ff5252; font-weight:bold;">● {"ACTIVE POSITION" if not is_trade_closed else "TRADE COMPLETED"}</span></div>'
         f'<div style="font-size:13px; color:#ffffff; margin-top:4px;">Index Entry: <b>{entry_spot:.1f}</b> | Opt: <b>₹{entry_opt:.2f}</b> (LTP: ₹{opt_ltp:.2f})</div>'
         f'<div style="font-size:12px; color:#ef5350; margin-top:2px;">Initial SL: <b>{sl_spot:.1f}</b> | Trail SL: <b style="color:#00e676;">{trail_spot:.1f} (₹{trail_opt:.2f})</b></div>'
         f'<div style="font-size:12px; color:#ffb74d; margin-top:2px;">Target: <b>{target_p:.1f} (₹{opt_target:.2f})</b> | Locked: <b style="color:#00e676;">{"+" if secured_pts>=0 else ""}{secured_pts:.1f} pts</b></div>'
         '</div>'
+        '</div>'
     )
 
 else:
-    # Standby Preview Mode before any trade triggers
-    ce_box_html = (
+    # Before 09:30 or before trade triggers: Show Strike Forecast Preview
+    contract_section_html = (
+        '<div style="display:flex; gap:12px; flex-wrap:wrap;">'
         '<div style="background:#1f2430; padding:10px 14px; border-radius:6px; flex:1; min-width:280px; border-left:4px solid #00e676;">'
-        f'<div style="font-size:12px; color:#00e676; font-weight:bold;">CALL OPTION (CE) • {ce_f.get("symbol", "NIFTY CE")} (Δ: {ce_f.get("delta", 0.5):.2f})</div>'
+        f'<div style="font-size:12px; color:#00e676; font-weight:bold;">CALL OPTION (CE) PREVIEW • {ce_f.get("symbol", "NIFTY CE")} (Δ: {ce_f.get("delta", 0.5):.2f})</div>'
         f'<div style="font-size:12px; color:#d1d4dc; margin-top:4px;">LTP: <b>₹{ce_f.get("opt_ltp", 0.0):.2f}</b> | Trig: <b>{ce_f.get("exp_entry_spot", 0.0):.1f}</b></div>'
         f'<div style="font-size:11px; color:#90a4ae; margin-top:2px;">SL: {ce_f.get("exp_sl_spot", 0.0):.1f} (₹{ce_f.get("exp_sl_opt", 0.0):.2f}) | Target: {ce_f.get("exp_target_spot", 0.0):.1f} (₹{ce_f.get("exp_target_opt", 0.0):.2f})</div>'
         '</div>'
-    )
-    pe_box_html = (
         '<div style="background:#1f2430; padding:10px 14px; border-radius:6px; flex:1; min-width:280px; border-left:4px solid #ff5252;">'
-        f'<div style="font-size:12px; color:#ff5252; font-weight:bold;">PUT OPTION (PE) • {pe_f.get("symbol", "NIFTY PE")} (Δ: {pe_f.get("delta", 0.5):.2f})</div>'
+        f'<div style="font-size:12px; color:#ff5252; font-weight:bold;">PUT OPTION (PE) PREVIEW • {pe_f.get("symbol", "NIFTY PE")} (Δ: {pe_f.get("delta", 0.5):.2f})</div>'
         f'<div style="font-size:12px; color:#d1d4dc; margin-top:4px;">LTP: <b>₹{pe_f.get("opt_ltp", 0.0):.2f}</b> | Trig: <b>{pe_f.get("exp_entry_spot", 0.0):.1f}</b></div>'
         f'<div style="font-size:11px; color:#90a4ae; margin-top:2px;">SL: {pe_f.get("exp_sl_spot", 0.0):.1f} (₹{pe_f.get("exp_sl_opt", 0.0):.2f}) | Target: {pe_f.get("exp_target_spot", 0.0):.1f} (₹{pe_f.get("exp_target_opt", 0.0):.2f})</div>'
         '</div>'
+        '</div>'
     )
 
-status_label = "Awaiting 09:30-10:00 Window Trigger" if trades_taken == 0 else "Daily Trade Triggered (1/1 Limit Reached)"
+status_label = "Awaiting 09:30-10:00 Window Trigger" if trades_taken == 0 else "1/1 Daily Trade Locked (Execution Active)"
 
 complete_banner_html = (
     '<div style="background:#131722; border:1px solid #2a2e39; border-radius:8px; padding:12px 16px; margin-bottom:12px;">'
@@ -292,9 +289,7 @@ complete_banner_html = (
     + trade_hud_html +
     '<div style="border-top:1px solid #2a2e39; padding-top:8px;">'
     f'<div style="font-size:11px; color:#787b86; margin-bottom:6px; font-weight:bold;">EXECUTION & STRIKE MONITOR (BUDGET: ≤ ₹{current_budget:.0f})</div>'
-    '<div style="display:flex; gap:12px; flex-wrap:wrap;">'
-    + ce_box_html + pe_box_html +
-    '</div>'
+    + contract_section_html +
     '</div>'
     '</div>'
 )
@@ -456,7 +451,7 @@ html_code = f"""
       candleSeries.setMarkers(formattedMarkers);
     }}
 
-    // Classical Floor Pivots
+    // 1. Classical Floor Pivots (P, R1-R5, S1-S5, PDH, PDL)
     const visiblePivots = {{
       'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
       'R1':  {{ color: '#ef5350', title: 'R1' }},
@@ -487,7 +482,7 @@ html_code = f"""
       }}
     }});
 
-    // ORB High & Low Bands
+    // 2. ORB High & Low Bands
     if (orbLevels && orbLevels.orb_h) {{
       candleSeries.createPriceLine({{
         price: parseFloat(orbLevels.orb_h),
@@ -509,7 +504,7 @@ html_code = f"""
       }});
     }}
 
-    // Dynamic ORB Fibonacci Lines
+    // 3. Dynamic ORB Fibonacci Lines
     if (fibLines) {{
       const fibTitles = {{
         'ORB_MID': 'ORB MID',
