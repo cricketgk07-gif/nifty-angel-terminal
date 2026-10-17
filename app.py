@@ -163,7 +163,6 @@ orb_l_val = float(orb_levels.get("orb_l", 0.0))
 if is_high_vol:
     is_strat_call = (ltp >= orb_mid)
 else:
-    # On Fade days: Piercing above High triggers PE; below Low triggers CE
     if ltp >= orb_h_val:
         is_strat_call = False
     elif ltp <= orb_l_val:
@@ -533,7 +532,7 @@ html_code = f"""
       chart.timeScale().fitContent();
     }}
 
-    // Tooltip Card displayed when hovering over Buy/Sell signals
+    // Crosshair Hover Handler: Shows Tooltip on Buy Signals
     chart.subscribeCrosshairMove(param => {{
       if (!param || !param.time || !param.point) {{
         hoverCard.style.display = 'none';
