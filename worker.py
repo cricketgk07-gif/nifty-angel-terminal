@@ -443,6 +443,7 @@ class DedicatedTradingWorker:
 
         df_h = pd.DataFrame(self.candles)
         df_h["date_str"] = df_h["dt"].apply(lambda d: d.astimezone(IST).strftime("%Y-%m-%d"))
+        df_h["time_only"] = df_h["dt"].apply(lambda d: d.astimezone(IST).time())
         unique_days = list(df_h["date_str"].unique())
 
         today_str = self.today.strftime("%Y-%m-%d")
@@ -453,7 +454,11 @@ class DedicatedTradingWorker:
             if len(day_bars) < 4:
                 continue
 
-            ow = day_bars.iloc[0:3]
+            # Identify the exact 09:15 - 09:30 range bars
+            ow = day_bars[(day_bars["time_only"] >= datetime.time(9, 15)) & (day_bars["time_only"] < datetime.time(9, 30))]
+            if len(ow) == 0:
+                ow = day_bars.iloc[0:3]
+
             p_orb_h = round(float(ow["high"].max()), 2)
             p_orb_l = round(float(ow["low"].min()), 2)
 
@@ -465,9 +470,12 @@ class DedicatedTradingWorker:
             sim_trade = None
             trade_fired = False
 
-            for idx in range(3, len(day_bars)):
+            for idx in range(len(day_bars)):
                 r = day_bars.iloc[idx]
-                b_time = r["dt"].astimezone(IST).time()
+                b_time = r["time_only"]
+                if b_time < datetime.time(9, 30):
+                    continue
+
                 c = float(r["close"])
                 o = float(r["open"])
                 h = float(r["high"])
@@ -1057,7 +1065,6 @@ class DedicatedTradingWorker:
                         tr["current_sl"] = round(target_banked_sl, 1)
                         if self.today_trade_record:
                             self.today_trade_record["current_sl"] = tr["current_sl"]
-                        # Update the tooltip card dynamically
                         e_key = str(tr["time"])
                         if e_key in self.history_cards:
                             self.history_cards[e_key]["max_trail_sl"] = tr["current_sl"]
@@ -1134,7 +1141,7 @@ class DedicatedTradingWorker:
         tr["final_inr"] = final_inr
         tr["outcome"] = outcome_str
 
-        # Place Clean Exit Arrow on Chart
+        # Clean Exit Arrow
         now_ts = int(time.time())
         self.markers.append({
             "time": now_ts,
@@ -1144,7 +1151,6 @@ class DedicatedTradingWorker:
             "text": f"EXIT {tr['type']}",
         })
 
-        # Update Tooltip Card with final outcome
         e_key = str(tr["time"])
         if e_key in self.history_cards:
             self.history_cards[e_key]["outcome"] = f"CLOSED: {sign}{final_pts}p (₹{sign}{final_inr})"
