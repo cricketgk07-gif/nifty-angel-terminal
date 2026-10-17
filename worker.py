@@ -30,12 +30,16 @@ UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 BUDGET_CEILING = float(os.getenv("BUDGET_CEILING", "80.0"))
 PORT = int(os.getenv("PORT", 10000))
 
+# Dual-Regime Constants Matching Pine Script
 VOL_THRESHOLD = 229.0
 MAX_BREACH_MULT = 0.5
 ATR_TARGET_MULT = 3.0
 SL_BUFFER = 5.0
 
 
+# ==========================================
+# 1. Health Server & Keepalive
+# ==========================================
 class HealthHandler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.send_response(200)
@@ -72,6 +76,9 @@ def self_ping_keepalive():
 threading.Thread(target=self_ping_keepalive, daemon=True).start()
 
 
+# ==========================================
+# 2. Math & Redis Helpers
+# ==========================================
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
@@ -150,6 +157,9 @@ def get_dynamic_budget():
     return BUDGET_CEILING
 
 
+# ==========================================
+# 3. Strategy Core Engine
+# ==========================================
 class DedicatedTradingWorker:
     def __init__(self):
         self.candles = []
@@ -164,7 +174,7 @@ class DedicatedTradingWorker:
         self.prev_day_summary = {}
 
         self.locked_trade = None
-        self.today_trade_record = None  # Permanent container for today's trade
+        self.today_trade_record = None
         self.trades_taken_today = 0
         self.trade_history_today = []
 
@@ -187,7 +197,6 @@ class DedicatedTradingWorker:
         today_str = self.today.strftime("%Y-%m-%d")
         saved_state = read_from_redis("nifty_live_state") or {}
 
-        # Restore today's state if re-starting mid-day
         if saved_state.get("trade_date") == today_str:
             self.trades_taken_today = saved_state.get("trades_taken_today", 0)
             self.today_trade_record = saved_state.get("today_trade_record")
@@ -392,6 +401,42 @@ class DedicatedTradingWorker:
 
         delta = compute_contract_delta(spot_ref, chosen_strike, days_to_exp, is_ce=is_ce)
         return chosen_strike, chosen_sym, chosen_tok, delta, days_to_exp, chosen_ltp
+
+    def compute_n_targets(self, entry_p, is_ce, primary_t1):
+        """Generates sequential N confluence targets using Pivots, PDH/PDL, and Fibs."""
+        t_candidates = [primary_t1]
+        p = self.pivot_lines or {}
+        f = self.fib_lines or {}
+
+        if is_ce:
+            for k in ["R1", "R2", "R3", "R4", "R5", "PDH"]:
+                val = float(p.get(k, 0.0))
+                if val > entry_p + 15.0:
+                    t_candidates.append(val)
+            for k in ["fib_50", "fib_100", "fib_161"]:
+                val = float(f.get(k, 0.0))
+                if val > entry_p + 15.0:
+                    t_candidates.append(val)
+            clean_targets = sorted(list(set([round(x, 1) for x in t_candidates if x > entry_p])))
+        else:
+            for k in ["S1", "S2", "S3", "S4", "S5", "PDL"]:
+                val = float(p.get(k, 0.0))
+                if val < entry_p - 15.0:
+                    t_candidates.append(val)
+            for k in ["fib_50", "fib_100", "fib_161"]:
+                val = float(f.get(k, 0.0))
+                if val < entry_p - 15.0:
+                    t_candidates.append(val)
+            clean_targets = sorted(list(set([round(x, 1) for x in t_candidates if x < entry_p])), reverse=True)
+
+        # Fallback if fewer than 4 targets exist
+        step = (self.current_atr14 * 1.5) if self.current_atr14 > 5 else 30.0
+        while len(clean_targets) < 5:
+            last_t = clean_targets[-1] if clean_targets else entry_p
+            new_t = round(last_t + step if is_ce else last_t - step, 1)
+            clean_targets.append(new_t)
+
+        return clean_targets[:6]
 
     def simulate_previous_day_trades(self):
         if not self.candles:
@@ -631,19 +676,22 @@ class DedicatedTradingWorker:
         if self.is_high_vol:
             ce_entry = orb_h + 1.0
             ce_sl = orb_l
-            ce_tg = ce_entry + (atr_val * ATR_TARGET_MULT)
+            ce_t1 = ce_entry + (atr_val * ATR_TARGET_MULT)
 
             pe_entry = orb_l - 1.0
             pe_sl = orb_h
-            pe_tg = pe_entry - (atr_val * ATR_TARGET_MULT)
+            pe_t1 = pe_entry - (atr_val * ATR_TARGET_MULT)
         else:
             ce_entry = orb_l + 3.0
             ce_sl = orb_l - (0.5 * atr_val) - SL_BUFFER
-            ce_tg = vwap_val
+            ce_t1 = vwap_val
 
             pe_entry = orb_h - 3.0
             pe_sl = orb_h + (0.5 * atr_val) + SL_BUFFER
-            pe_tg = vwap_val
+            pe_t1 = vwap_val
+
+        ce_targets = self.compute_n_targets(ce_entry, is_ce=True, primary_t1=ce_t1)
+        pe_targets = self.compute_n_targets(pe_entry, is_ce=False, primary_t1=pe_t1)
 
         self.contract_preview = {
             "CE": {
@@ -653,8 +701,7 @@ class DedicatedTradingWorker:
                 "exp_entry_spot": round(ce_entry, 1),
                 "exp_sl_spot": round(ce_sl, 1),
                 "exp_sl_opt": max(0.5, round(ltp_ce - (abs(ce_entry - ce_sl) * d_ce), 2)),
-                "exp_target_spot": round(ce_tg, 1),
-                "exp_target_opt": max(0.5, round(ltp_ce + (abs(ce_tg - ce_entry) * d_ce), 2)),
+                "targets": ce_targets,
             },
             "PE": {
                 "symbol": sym_pe,
@@ -663,8 +710,7 @@ class DedicatedTradingWorker:
                 "exp_entry_spot": round(pe_entry, 1),
                 "exp_sl_spot": round(pe_sl, 1),
                 "exp_sl_opt": max(0.5, round(ltp_pe - (abs(pe_sl - pe_entry) * d_pe), 2)),
-                "exp_target_spot": round(pe_tg, 1),
-                "exp_target_opt": max(0.5, round(ltp_pe + (abs(pe_entry - pe_tg) * d_pe), 2)),
+                "targets": pe_targets,
             },
         }
 
@@ -743,7 +789,6 @@ class DedicatedTradingWorker:
     def background_option_poller(self):
         while True:
             time.sleep(15)
-            # Poll if today's trade exists (active or completed)
             contract_sym = None
             contract_tok = None
             if self.locked_trade and self.locked_trade.get("token"):
@@ -770,7 +815,6 @@ class DedicatedTradingWorker:
         bar_dt = now.replace(minute=bucket_min, second=0, microsecond=0)
         t_sec = int(bar_dt.timestamp())
 
-        # 15:15 IST Mandatory EOD Square-Off
         if now.time() >= datetime.time(15, 15) and self.locked_trade and not self.locked_trade.get("closed"):
             self.execute_eod_exit(ltp)
             return
@@ -800,7 +844,6 @@ class DedicatedTradingWorker:
         self.sync_state(ltp)
 
     def evaluate_dual_regime_entry(self):
-        # Strictly enforce 1 trade per day, entry window strictly 09:30 - 10:00 AM IST
         if not is_market_hours() or self.locked_trade or self.trades_taken_today >= 1 or len(self.candles) < 4:
             return
 
@@ -876,7 +919,9 @@ class DedicatedTradingWorker:
             opt_ltp = self.last_polled_opt_ltp if self.last_polled_opt_ltp > 0 else chosen_ltp
             risk_pts = round(abs(close_p - sl_val), 1)
             opt_sl = max(0.5, round(opt_ltp - (risk_pts * delta), 2))
-            opt_target = max(0.5, round(opt_ltp + (abs(target_val - close_p) * delta), 2))
+
+            targets = self.compute_n_targets(close_p, is_ce=is_ce, primary_t1=target_val)
+            opt_t1 = max(0.5, round(opt_ltp + (abs(targets[0] - close_p) * delta), 2))
 
             date_readable = last_c["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)")
             close_time_str = (last_c["dt"].astimezone(IST) + datetime.timedelta(minutes=5)).strftime("%H:%M:%S")
@@ -888,8 +933,9 @@ class DedicatedTradingWorker:
                 "init_sl": sl_val,
                 "current_sl": sl_val,
                 "last_alerted_sl": sl_val,
-                "target_p": target_val,
-                "opt_target": opt_target,
+                "target_p": targets[0],
+                "opt_target": opt_t1,
+                "targets": targets,
                 "bank_dist": bank_dist,
                 "bank_achieved": False,
                 "peak": close_p,
@@ -932,7 +978,7 @@ class DedicatedTradingWorker:
                 f"📦 <b>CONTRACT:</b> {sym} (Qty: {LOT_SIZE_QTY}, Δ: {delta:.2f})\n"
                 f"• <b>ENTRY (SPOT):</b> {close_p:.1f} | <b>₹{opt_ltp:.2f}</b>\n"
                 f"• <b>INITIAL SL:</b> {sl_val:.1f} (-{risk_pts:.1f} pts) | <b>₹{opt_sl:.2f}</b> (-₹{total_risk_inr})\n"
-                f"• <b>TARGET ({tg_target_label}):</b> {target_val:.1f} (+{abs(target_val-close_p):.1f} pts) | <b>₹{opt_target:.2f}</b>\n"
+                f"• <b>TARGET 1 ({tg_target_label}):</b> {targets[0]:.1f} (+{abs(targets[0]-close_p):.1f} pts) | <b>₹{opt_t1:.2f}</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"⏰ <b>Trigger Time:</b> {close_time_str}"
             )
@@ -1048,7 +1094,6 @@ class DedicatedTradingWorker:
         tr["final_inr"] = final_inr
         tr["outcome"] = outcome_str
 
-        # Lock permanently into today's record so Streamlit displays it all day
         self.today_trade_record = tr.copy()
         self.locked_trade = None
 
@@ -1070,7 +1115,6 @@ class DedicatedTradingWorker:
             return
         self.last_push_time = now_ts
 
-        # Active or retained trade record
         tr_source = self.locked_trade or self.today_trade_record
 
         opt_ltp = 0.0
@@ -1107,6 +1151,7 @@ class DedicatedTradingWorker:
                 "trail_opt": trail_opt,
                 "target_p": float(tr_source.get("target_p", 0.0)),
                 "opt_target": float(tr_source.get("opt_target", 0.0)),
+                "targets": tr_source.get("targets", []),
                 "delta": delta_val,
                 "secured_pts": trail_pts,
                 "trade_closed": is_closed,
