@@ -156,7 +156,20 @@ status_label = "Awaiting 09:30-10:00 Window Trigger" if trades_taken == 0 else (
 # 4. Streamlined Strip Panel with Dynamic Trailing SL & N-Targets
 # -------------------------------------------------------------
 orb_mid = float(fib_lines.get("ORB_MID", ltp))
-is_bias_call = (ltp >= orb_mid) if orb_mid > 0 else True
+orb_h_val = float(orb_levels.get("orb_h", 999999.0))
+orb_l_val = float(orb_levels.get("orb_l", 0.0))
+
+# Strategic Selection: Breakout vs Fade logic
+if is_high_vol:
+    is_strat_call = (ltp >= orb_mid)
+else:
+    # On Fade days: Piercing above High triggers PE; below Low triggers CE
+    if ltp >= orb_h_val:
+        is_strat_call = False
+    elif ltp <= orb_l_val:
+        is_strat_call = True
+    else:
+        is_strat_call = (ltp <= orb_mid)
 
 if active_trade_type:
     is_call = (active_trade_type == "CE")
@@ -176,11 +189,9 @@ if active_trade_type:
     entry_val = f"{entry_spot:.1f} (₹{entry_opt:.2f})"
     init_sl_val = f"{sl_spot:.1f} (₹{sl_opt:.2f})"
     
-    # Real-Time Dynamic Trailing SL Cell with Locked Points
     trail_sign = "+" if secured_pts >= 0 else ""
     cur_sl_val = f"{cur_trail_spot:.1f} (₹{cur_trail_opt:.2f}) [{trail_sign}{secured_pts:.1f}p]"
 
-    # Extract N-Targets
     raw_targets = hud.get("targets", [])
     if not raw_targets:
         raw_targets = [float(hud.get("target_p", entry_spot))]
@@ -198,12 +209,12 @@ if active_trade_type:
         )
 
 else:
-    # Standby Preview Mode aligned to directional bias
-    chosen_f = ce_f if is_bias_call else pe_f
-    contract_title = f"{'CALL OPTION (CE)' if is_bias_call else 'PUT OPTION (PE)'} PREVIEW"
+    # Standby Preview Mode dynamically follows strategy setup
+    chosen_f = ce_f if is_strat_call else pe_f
+    contract_title = f"{'CALL OPTION (CE)' if is_strat_call else 'PUT OPTION (PE)'} PREVIEW"
     contract_symbol = chosen_f.get("symbol", "NIFTY OPT")
     contract_delta = float(chosen_f.get("delta", 0.45))
-    header_color = "#42a5f5"
+    header_color = "#00e676" if is_strat_call else "#ff5252"
 
     entry_spot = float(chosen_f.get("exp_entry_spot", 0.0))
     opt_ltp_f = float(chosen_f.get("opt_ltp", 75.0))
@@ -442,7 +453,7 @@ html_code = f"""
       candleSeries.setMarkers(formattedMarkers);
     }}
 
-    // 1. Classical Floor Pivots (P, R1-R5, S1-S5, PDH, PDL)
+    // Classical Floor Pivots
     const visiblePivots = {{
       'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
       'R1':  {{ color: '#ef5350', title: 'R1' }},
@@ -473,7 +484,7 @@ html_code = f"""
       }}
     }});
 
-    // 2. ORB High & Low Bands
+    // ORB High & Low Bands
     if (orbLevels && orbLevels.orb_h) {{
       candleSeries.createPriceLine({{
         price: parseFloat(orbLevels.orb_h),
@@ -495,7 +506,7 @@ html_code = f"""
       }});
     }}
 
-    // 3. Dynamic ORB Fibonacci Lines
+    // Dynamic ORB Fibonacci Lines
     if (fibLines) {{
       const fibTitles = {{
         'ORB_MID': 'ORB MID',
@@ -522,6 +533,7 @@ html_code = f"""
       chart.timeScale().fitContent();
     }}
 
+    // Tooltip Card displayed when hovering over Buy/Sell signals
     chart.subscribeCrosshairMove(param => {{
       if (!param || !param.time || !param.point) {{
         hoverCard.style.display = 'none';
@@ -535,9 +547,11 @@ html_code = f"""
         hoverCard.innerHTML = `
           <div style="font-weight:bold; color:${{color}}; margin-bottom:4px;">${{cardData.title}}</div>
           <div><b>Time:</b> ${{cardData.time_str}}</div>
-          <div><b>Index Entry:</b> ${{cardData.entry}} | <b>SL:</b> ${{cardData.sl}}</div>
+          <div><b>Index Entry:</b> ${{cardData.entry}} | <b>Opt:</b> ₹${{cardData.opt_entry || '—'}}</div>
+          <div><b>Initial SL:</b> ${{cardData.sl}} | <b>Opt SL:</b> ₹${{cardData.opt_sl || '—'}}</div>
+          <div><b>Max Trailed SL:</b> ${{cardData.max_trail_sl || cardData.sl}}</div>
           <div><b>Target:</b> ${{cardData.target || '—'}}</div>
-          <div><b>Outcome:</b> ${{cardData.outcome}}</div>
+          <div style="margin-top:4px; font-weight:bold; color:#ffb74d;">Status: ${{cardData.outcome}}</div>
         `;
         hoverCard.style.display = 'block';
         hoverCard.style.left = Math.min(param.point.x + 15, container.clientWidth - 240) + 'px';
