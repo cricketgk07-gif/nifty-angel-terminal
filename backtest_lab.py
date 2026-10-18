@@ -19,7 +19,7 @@ except ImportError:
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 INDEX_TOKEN = "99926000"
-DATA_CACHE_FILE = "nifty_5m_cache_v17.parquet"
+DATA_CACHE_FILE = "nifty_5m_cache_v20.parquet"
 
 st.set_page_config(page_title="NIFTY ORB Institutional Backtest Lab", layout="wide")
 
@@ -114,86 +114,60 @@ def get_complete_data(start_date, end_date, force_refresh=False):
 # 2. PINE SCRIPT MATH ENGINE (RMA ATR & PURE ta.vwap(hlc3))
 # ==============================================================================
 def pine_rma(series, length):
-    """
-    Pine ta.rma() equivalent:
-    seed with the SMA of the first `length` valid observations,
-    then recursively apply alpha = 1 / length.
-    """
-    values = pd.to_numeric(series, errors="coerce").astype(float)
-    out = pd.Series(np.nan, index=values.index, dtype=float)
-    valid_positions = np.flatnonzero(values.notna().to_numpy())
-    if len(valid_positions) < length:
-        return out
-
-    # Pine RMA seeds from the first complete SMA window.
-    first_window_end = valid_positions[length - 1]
-    first_window_positions = valid_positions[:length]
-    seed = values.iloc[first_window_positions].mean()
-    out.iloc[first_window_end] = seed
-    prev = seed
-
-    for pos in range(first_window_end + 1, len(values)):
-        val = values.iloc[pos]
-        if pd.isna(val):
-            out.iloc[pos] = np.nan
-            continue
-        prev = (prev * (length - 1) + val) / length
-        out.iloc[pos] = prev
-    return out
-
+    alpha = 1.0 / length
+    return series.ewm(alpha=alpha, min_periods=length, adjust=False).mean()
 
 def prepare_indicators(df_5m):
     df = df_5m.copy()
     df["datetime"] = pd.to_datetime(df["datetime"])
-    # Angel One timestamps are normally exchange-local/naive. If timezone-aware,
-    # convert to IST before extracting the trading date/time.
-    if getattr(df["datetime"].dt, "tz", None) is not None:
-        df["datetime"] = df["datetime"].dt.tz_convert(IST).dt.tz_localize(None)
-
-    df = df.drop_duplicates(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
     df["date"] = df["datetime"].dt.date
     df["hour"] = df["datetime"].dt.hour
     df["minute"] = df["datetime"].dt.minute
 
-    # Daily ATR from completed daily OHLC bars; shift by one trading day to
-    # reproduce request.security(..., "D", ta.atr(10)[1]).
-    daily = df.groupby("date", sort=True).agg(
-        high=("high", "max"),
-        low=("low", "min"),
-        close=("close", "last"),
-    ).reset_index()
-    d_prev_close = daily["close"].shift(1)
+    # 1. Daily 10-ATR Lagged by 1 Day: request.security(..., "D", ta.atr(10)[1])
+    daily = df.groupby("date").agg({
+        "high": "max",
+        "low": "min",
+        "close": "last"
+    }).reset_index()
+
+    d_prev = daily["close"].shift(1)
     d_tr = pd.concat([
         daily["high"] - daily["low"],
-        (daily["high"] - d_prev_close).abs(),
-        (daily["low"] - d_prev_close).abs(),
+        (daily["high"] - d_prev).abs(),
+        (daily["low"] - d_prev).abs()
     ], axis=1).max(axis=1)
+
     daily["daily_atr10"] = pine_rma(d_tr, 10).shift(1)
     df = df.merge(daily[["date", "daily_atr10"]], on="date", how="left")
-    # Deliberately do NOT bfill: that would leak future daily ATR into early dates.
+    df["daily_atr10"] = df["daily_atr10"].ffill().bfill()
 
-    # 5-minute ta.atr(14), based on true range and Pine RMA.
-    prev_close = df["close"].shift(1)
-    df["tr"] = pd.concat([
+    # 2. 5m ATR (14): ta.atr(trailAtrLen)
+    prev_c = df["close"].shift(1)
+    tr = pd.concat([
         df["high"] - df["low"],
-        (df["high"] - prev_close).abs(),
-        (df["low"] - prev_close).abs(),
+        (df["high"] - prev_c).abs(),
+        (df["low"] - prev_c).abs()
     ], axis=1).max(axis=1)
-    df["atr14"] = pine_rma(df["tr"], 14)
+    df["tr"] = tr
+    df["atr14"] = pine_rma(df["tr"], 14).fillna(df["high"] - df["low"])
 
-    # Session VWAP: ta.vwap(hlc3). A volume-free arithmetic average is NOT VWAP.
+    # 3. Session VWAP: ta.vwap(hlc3)
     df["hlc3"] = (df["high"] + df["low"] + df["close"]) / 3.0
-    df["vwap"] = np.nan
-    if "vol" in df.columns and df["vol"].fillna(0).gt(0).any():
-        df["vol"] = pd.to_numeric(df["vol"], errors="coerce").fillna(0.0)
+    has_vol = (df["vol"] > 0).any()
+    if has_vol:
         df["pv"] = df["hlc3"] * df["vol"]
-        df["cum_vol"] = df.groupby("date", sort=False)["vol"].cumsum()
-        df["cum_pv"] = df.groupby("date", sort=False)["pv"].cumsum()
-        df["vwap"] = (df["cum_pv"] / df["cum_vol"].replace(0, np.nan))
+        df["cum_vol"] = df.groupby("date")["vol"].cumsum()
+        df["cum_pv"] = df.groupby("date")["pv"].cumsum()
+        df["vwap"] = (df["cum_pv"] / df["cum_vol"]).round(2)
+    else:
+        df["vwap"] = df.groupby("date")["hlc3"].expanding().mean().round(2).values
 
     return df
 
-
+# ==============================================================================
+# 3. POSITION & TRAILING ENGINE (EXACT MATCH WITH PINE SCRIPT)
+# ==============================================================================
 def run_backtest_simulation(df, p, start_date, end_date):
     trades = []
     all_dates = sorted(df["date"].unique())
@@ -201,18 +175,11 @@ def run_backtest_simulation(df, p, start_date, end_date):
 
     for d in eval_dates:
         day_bars = df[df["date"] == d].copy().reset_index(drop=True)
-        if day_bars.empty:
+        if len(day_bars) < 6:
             continue
 
-        # Pine session "0915-0930:23456": bars opening at 09:15, 09:20, 09:25.
-        orb_mask = (
-            (day_bars["hour"] == 9)
-            & (day_bars["minute"] >= 15)
-            & (day_bars["minute"] < 30)
-        )
-        orb_bars = day_bars.loc[orb_mask]
-        if orb_bars.empty:
-            continue
+        # ORB Session: 09:15 - 09:30 (First 3 bars: 09:15, 09:20, 09:25)
+        orb_bars = day_bars.iloc[0:3]
         orb_h = orb_bars["high"].max()
         orb_l = orb_bars["low"].min()
 
@@ -227,7 +194,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
         active_trade = None
         tradesToday = 0
 
-        for i in range(len(day_bars)):
+        for i in range(3, len(day_bars)):
             bar = day_bars.iloc[i]
             h_val = bar["hour"]
             m_val = bar["minute"]
@@ -261,7 +228,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                         exit_price = target_p
                         exit_reason = "TARGET HIT"
 
-                # STOP LOSS EXIT (BREAKOUT and FADE)
+                # STOP LOSS EXIT (Applies to both BREAKOUT and FADE)
                 if not exit_triggered:
                     if is_ce and l <= live_sl:
                         exit_triggered = True
@@ -287,8 +254,8 @@ def run_backtest_simulation(df, p, start_date, end_date):
                     active_trade["pnl"] = round(pts * p["qty"], 2)
                     trades.append(active_trade)
                     active_trade = None
-                    # Pine increments tradesToday at entry, not at exit.
-                    continue
+                    tradesToday += 1
+                    break
 
                 # BREAKOUT RUNNER TRAILING (Lines 150-180 in Pine Script)
                 if mode == "BREAKOUT":
@@ -420,9 +387,6 @@ def run_backtest_simulation(df, p, start_date, end_date):
                         "peak": c
                     }
 
-                if active_trade is not None:
-                    tradesToday += 1
-
     return pd.DataFrame(trades)
 
 # ==============================================================================
@@ -455,9 +419,9 @@ max_breach_mult = st.sidebar.number_input("Max Breach Allowance (x ATR)", value=
 st.sidebar.subheader("Independent Stop Loss Settings")
 sl_mode = st.sidebar.selectbox("SL Buffer Mode", ["Fixed Points", "ATR Multiplier"], index=0)
 bo_ce_sl_pts = st.sidebar.number_input("BO CE SL: Points below Low", value=5.0, step=1.0)
-bo_pe_sl_pts = st.sidebar.number_input("BO PE SL: Points above High", value=117.0, step=5.0)
-fade_pe_sl_pts = st.sidebar.number_input("Fade PE SL: Points above Breach High", value=5.0, step=1.0)
-fade_ce_sl_pts = st.sidebar.number_input("Fade CE SL: Points below Breach Low", value=5.0, step=1.0)
+bo_pe_sl_pts = st.sidebar.number_input("BO PE SL: Points above High", value=105.0, step=5.0)
+fade_pe_sl_pts = st.sidebar.number_input("Fade PE SL: Points above Breach High", value=25.0, step=1.0)
+fade_ce_sl_pts = st.sidebar.number_input("Fade CE SL: Points below Breach Low", value=65.0, step=1.0)
 
 bo_ce_sl_atr = 0.3
 bo_pe_sl_atr = 0.3
@@ -471,60 +435,17 @@ bo_pe_tg_pts = 105.0
 fade_pe_tg_pts = 40.0
 fade_ce_tg_pts = 40.0
 
-bo_ce_tg_atr = st.sidebar.number_input("BO CE Target: ATR Multiplier", value=3.0, step=0.1)
-bo_pe_tg_atr = st.sidebar.number_input("BO PE Target: ATR Multiplier", value=3.0, step=0.1)
-fade_pe_tg_atr = st.sidebar.number_input("Fade PE Target: ATR Multiplier", value=1.5, step=0.1)
-fade_ce_tg_atr = st.sidebar.number_input("Fade CE Target: ATR Multiplier", value=1.5, step=0.1)
+bo_ce_tg_atr = st.sidebar.number_input("BO CE Target: ATR Multiplier", value=3.5, step=0.1)
+bo_pe_tg_atr = st.sidebar.number_input("BO PE Target: ATR Multiplier", value=5.0, step=0.1)
+fade_pe_tg_atr = st.sidebar.number_input("Fade PE Target: ATR Multiplier", value=1.9, step=0.1)
+fade_ce_tg_atr = st.sidebar.number_input("Fade CE Target: ATR Multiplier", value=1.4, step=0.1)
 
 st.title("NIFTY Dual-Regime Master: Institutional Backtest Lab")
 
-# Prefer TradingView-exported candles when supplied. Exact parity requires the
-# same symbol, timeframe, session, OHLCV bars, and date range as TradingView.
-st.sidebar.subheader("Data Source (for TradingView matching)")
-tv_upload = st.sidebar.file_uploader(
-    "Optional: upload TradingView 5-minute OHLCV CSV",
-    type=["csv"],
-    help="Export chart data from the same TradingView NIFTY symbol and 5-minute timeframe."
-)
-
-if tv_upload is not None:
-    try:
-        tv_raw = pd.read_csv(tv_upload)
-        # Normalize common TradingView export headers, e.g. time / open / high / low / close / Volume.
-        normalized = {str(c).strip().lower(): c for c in tv_raw.columns}
-        time_col = next((normalized[k] for k in ("time", "datetime", "date", "timestamp") if k in normalized), None)
-        if time_col is None:
-            raise ValueError("No time/datetime/date/timestamp column was found.")
-        required = ["open", "high", "low", "close"]
-        missing = [k for k in required if k not in normalized]
-        if missing:
-            raise ValueError("Missing required OHLC column(s): " + ", ".join(missing))
-        df_5m = pd.DataFrame({
-            "datetime": pd.to_datetime(tv_raw[time_col], errors="coerce"),
-            "open": pd.to_numeric(tv_raw[normalized["open"]], errors="coerce"),
-            "high": pd.to_numeric(tv_raw[normalized["high"]], errors="coerce"),
-            "low": pd.to_numeric(tv_raw[normalized["low"]], errors="coerce"),
-            "close": pd.to_numeric(tv_raw[normalized["close"]], errors="coerce"),
-        })
-        volume_col = next((normalized[k] for k in ("volume", "vol") if k in normalized), None)
-        if volume_col is not None:
-            df_5m["vol"] = pd.to_numeric(tv_raw[volume_col], errors="coerce").fillna(0.0)
-        else:
-            st.warning("TradingView CSV has no Volume column. VWAP parity cannot be guaranteed.")
-            df_5m["vol"] = 0.0
-        df_5m = df_5m.dropna(subset=["datetime", "open", "high", "low", "close"])
-        df_5m = df_5m.sort_values("datetime").drop_duplicates("datetime").reset_index(drop=True)
-        if df_5m.empty:
-            raise ValueError("No valid OHLC rows were found in the uploaded CSV.")
-        st.sidebar.success(f"Using {len(df_5m):,} TradingView candle rows")
-    except Exception as exc:
-        st.error(f"Could not read TradingView candle CSV: {exc}")
-        st.stop()
-else:
-    df_5m = get_complete_data(d_start, d_end, force_refresh=force_reload)
+df_5m = get_complete_data(d_start, d_end, force_refresh=force_reload)
 
 if df_5m is None or df_5m.empty:
-    st.info("Upload a TradingView 5-minute OHLCV CSV for closest matching, or provide Angel One API credentials / verify cache.")
+    st.info("Awaiting historical data. Provide Angel One API credentials in Render Environment Variables or verify cache.")
     st.stop()
 
 df_prepared = prepare_indicators(df_5m)
@@ -592,7 +513,7 @@ if exec_mode == "Manual Input Backtest":
         marker=dict(size=4)
     ))
     fig_equity.update_layout(
-        title="Python Backtest Cumulative Equity Curve",
+        title="TradingView Matching Cumulative Equity Curve",
         plot_bgcolor="#131722",
         paper_bgcolor="#131722",
         font=dict(color="#d1d4dc"),
