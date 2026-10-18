@@ -8,7 +8,14 @@ import plotly.graph_objects as go
 import pyotp
 import streamlit as st
 import zoneinfo
-from SmartApi import SmartConnect
+from dotenv import load_dotenv
+
+load_dotenv()
+
+try:
+    from SmartApi import SmartConnect
+except ImportError:
+    SmartConnect = None
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 INDEX_TOKEN = "99926000"
@@ -20,6 +27,8 @@ st.set_page_config(page_title="NIFTY ORB Institutional Backtest Lab", layout="wi
 # 1. ANGEL ONE HISTORICAL DATA DOWNLOADER & LOCAL CACHE
 # ==============================================================================
 def get_angel_session():
+    if SmartConnect is None:
+        return None
     api_key = os.getenv("API_KEY", "")
     client_code = os.getenv("CLIENT_CODE", "")
     pin = os.getenv("PIN", "")
@@ -32,8 +41,8 @@ def get_angel_session():
         session = api.generateSession(client_code, pin, totp)
         if session.get("status"):
             return api
-    except Exception as e:
-        st.error(f"Authentication Error: {e}")
+    except Exception:
+        pass
     return None
 
 def fetch_chunked_data(api, start_date, end_date):
@@ -96,7 +105,7 @@ def load_historical_data(start_date, end_date):
     return pd.DataFrame()
 
 # ==============================================================================
-# 2. STRATEGY EXECUTION ENGINE (EXACT PINE SCRIPT REPLICATION)
+# 2. STRATEGY EXECUTION ENGINE
 # ==============================================================================
 def prepare_indicators(df):
     df["date"] = df["datetime"].dt.date
@@ -138,7 +147,6 @@ def run_backtest_simulation(df, p):
         if len(day_bars) < 6:
             continue
 
-        # 09:15 - 09:30 ORB
         orb_bars = day_bars[(day_bars["time"] >= datetime.time(9, 15)) & (day_bars["time"] < datetime.time(9, 30))]
         if len(orb_bars) == 0:
             orb_bars = day_bars.iloc[0:3]
@@ -165,7 +173,6 @@ def run_backtest_simulation(df, p):
             vw = bar["vwap"]
             atr = bar["atr14"]
 
-            # Intra-day Trailing & Exits
             if active_trade is not None:
                 is_ce = (active_trade["type"] == "CE")
                 cur_sl = active_trade["current_sl"]
@@ -177,7 +184,6 @@ def run_backtest_simulation(df, p):
                 exit_price = 0.0
                 exit_reason = ""
 
-                # Target Test
                 if is_ce and h >= target_p:
                     exit_triggered = True
                     exit_price = target_p
@@ -187,7 +193,6 @@ def run_backtest_simulation(df, p):
                     exit_price = target_p
                     exit_reason = "TARGET HIT"
 
-                # Stop Loss Test
                 if not exit_triggered:
                     if is_ce and l <= cur_sl:
                         exit_triggered = True
@@ -198,7 +203,6 @@ def run_backtest_simulation(df, p):
                         exit_price = cur_sl
                         exit_reason = "STOP LOSS HIT"
 
-                # 15:15 EOD Exit
                 if not exit_triggered and b_time >= datetime.time(15, 15):
                     exit_triggered = True
                     exit_price = c
@@ -213,9 +217,8 @@ def run_backtest_simulation(df, p):
                     active_trade["pnl"] = round(pts * p["qty"], 2)
                     trades.append(active_trade)
                     active_trade = None
-                    break  # 1 trade per day limit
+                    break
 
-                # Dynamic Trailing SL Engine
                 if mode == "BREAKOUT":
                     if is_ce:
                         active_trade["peak"] = max(active_trade["peak"], h)
@@ -239,7 +242,6 @@ def run_backtest_simulation(df, p):
                             active_trade["current_sl"] = min(active_trade["current_sl"], min(fib_sl, min(min_sl, bar_sl)))
                 continue
 
-            # Breach Tracking
             if datetime.time(9, 30) <= b_time < datetime.time(10, 0):
                 if h > orb_h:
                     pierced_h = True
@@ -325,19 +327,27 @@ st.sidebar.title("Backtest Configuration")
 exec_mode = st.sidebar.radio("Execution Mode", ["Manual Input Backtest", "Automated Grid Optimizer"])
 
 st.sidebar.subheader("Date Horizon")
-d_start = st.sidebar.date_input("Start Date", datetime.date(2021, 1, 1))
-d_end = st.sidebar.date_input("End Date", datetime.date(2026, 10, 16))
+col_s1, col_s2 = st.sidebar.columns(2)
+start_year = col_s1.selectbox("Start Year", list(range(2015, 2027)), index=6) # 2021
+start_month = col_s2.selectbox("Start Month", list(range(1, 13)), index=0)
+
+col_e1, col_e2 = st.sidebar.columns(2)
+end_year = col_e1.selectbox("End Year", list(range(2015, 2027)), index=11) # 2026
+end_month = col_e2.selectbox("End Month", list(range(1, 13)), index=9)
+
+d_start = datetime.date(start_year, start_month, 1)
+d_end = datetime.date(end_year, end_month, 28)
 
 st.sidebar.subheader("Macro Strategy Parameters")
-vol_threshold = st.sidebar.number_input("Macro Regime Threshold (Daily 10-ATR)", value=229.0, step=5.0)[cite: 22]
-enable_fade = st.sidebar.checkbox("Trade Fades when Daily ATR < 229", value=True)[cite: 22]
-max_breach_mult = st.sidebar.number_input("Max Breach Allowance (x ATR)", value=0.5, step=0.1)[cite: 22]
+vol_threshold = st.sidebar.number_input("Macro Regime Threshold (Daily 10-ATR)", value=229.0, step=5.0)
+enable_fade = st.sidebar.checkbox("Trade Fades when Daily ATR < 229", value=True)
+max_breach_mult = st.sidebar.number_input("Max Breach Allowance (x ATR)", value=0.5, step=0.1)
 
 st.sidebar.subheader("Independent Stop Loss Settings")
-sl_mode = st.sidebar.selectbox("SL Buffer Mode", ["Fixed Points", "ATR Multiplier"], index=0)[cite: 22]
-bo_ce_sl_pts = st.sidebar.number_input("BO CE SL: Points below Low", value=5.0, step=1.0)[cite: 22]
-bo_pe_sl_pts = st.sidebar.number_input("BO PE SL: Points above High", value=105.0, step=5.0)[cite: 22]
-fade_pe_sl_pts = st.sidebar.number_input("Fade PE SL: Points above Breach High", value=25.0, step=1.0)[cite: 22]
+sl_mode = st.sidebar.selectbox("SL Buffer Mode", ["Fixed Points", "ATR Multiplier"], index=0)
+bo_ce_sl_pts = st.sidebar.number_input("BO CE SL: Points below Low", value=5.0, step=1.0)
+bo_pe_sl_pts = st.sidebar.number_input("BO PE SL: Points above High", value=105.0, step=5.0)
+fade_pe_sl_pts = st.sidebar.number_input("Fade PE SL: Points above Breach High", value=25.0, step=1.0)
 fade_ce_sl_pts = st.sidebar.number_input("Fade CE SL: Points below Breach Low", value=5.0, step=1.0)
 
 bo_ce_sl_atr = 0.3
@@ -360,7 +370,7 @@ with st.spinner("Loading Multi-Year 5m Intraday Data..."):
     df_raw = load_historical_data(d_start, d_end)
 
 if df_raw.empty:
-    st.warning("No data found for the selected period. Ensure your SmartAPI credentials are active or load local Parquet files.")
+    st.info("Awaiting historical data. Ensure your API keys are in Render Environment Variables or test within available cached bars.")
     st.stop()
 
 df_prepared = prepare_indicators(df_raw)
@@ -407,14 +417,12 @@ if exec_mode == "Manual Input Backtest":
     drawdown = cum_max - df_trades["cum_pnl"]
     max_dd = drawdown.max()
 
-    # Key Stats Panel
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total PnL", f"₹{total_pnl:,.2f}", f"{win_rate:.1f}% Win Rate")[cite: 19]
-    c2.metric("Profit Factor", f"{profit_factor:.2f}")[cite: 19]
-    c3.metric("Trades (W / L)", f"{total_trades} ({wins} / {losses})")[cite: 19]
-    c4.metric("Max Drawdown", f"₹{max_dd:,.2f}")[cite: 19]
+    c1.metric("Total PnL", f"₹{total_pnl:,.2f}", f"{win_rate:.1f}% Win Rate")
+    c2.metric("Profit Factor", f"{profit_factor:.2f}")
+    c3.metric("Trades (W / L)", f"{total_trades} ({wins} / {losses})")
+    c4.metric("Max Drawdown", f"₹{max_dd:,.2f}")
 
-    # TradingView-style Performance Graph
     fig_equity = go.Figure()
     fig_equity.add_trace(go.Scatter(
         x=df_trades["exit_time"],
@@ -434,7 +442,6 @@ if exec_mode == "Manual Input Backtest":
     )
     st.plotly_chart(fig_equity, use_container_width=True)
 
-    # Detailed Log
     st.subheader("Historical Trade Ledger")
     st.dataframe(df_trades[["entry_time", "type", "mode", "entry", "init_sl", "exit_price", "exit_time", "exit_reason", "pts", "pnl"]], use_container_width=True)
 
