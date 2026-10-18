@@ -1,4 +1,5 @@
 import datetime
+import math
 import os
 import time
 import numpy as np
@@ -18,12 +19,12 @@ except ImportError:
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 INDEX_TOKEN = "99926000"
-DATA_CACHE_FILE = "nifty_5m_cache_v12.parquet"
+DATA_CACHE_FILE = "nifty_5m_cache_v14.parquet"
 
 st.set_page_config(page_title="NIFTY ORB Institutional Backtest Lab", layout="wide")
 
 # ==============================================================================
-# 1. ANGEL ONE DATA FETCHING & 60-DAY PRE-WARMUP
+# 1. ANGEL ONE DATA FETCHING & 180-DAY HISTORICAL WARMUP
 # ==============================================================================
 def get_angel_session():
     if SmartConnect is None:
@@ -45,12 +46,12 @@ def get_angel_session():
     return None
 
 def fetch_chunked_5m_candles(api, start_date, end_date):
-    fetch_start = start_date - datetime.timedelta(days=60)
+    fetch_start = start_date - datetime.timedelta(days=180)
     candles = []
     curr_start = fetch_start
     delta_chunk = datetime.timedelta(days=25)
 
-    prog_bar = st.progress(0, text="Fetching historical 5m candles with warmup window...")
+    prog_bar = st.progress(0, text="Downloading historical 5m candles with 180-day RMA warmup...")
     total_days = max(1, (end_date - fetch_start).days)
 
     while curr_start < end_date:
@@ -110,39 +111,43 @@ def get_complete_data(start_date, end_date, force_refresh=False):
     return df_5m
 
 # ==============================================================================
-# 2. PINE SCRIPT MATH ENGINE (RMA ATR & SESSION VWAP)
+# 2. PINE SCRIPT MATH ENGINE (Wilder RMA ATR & Session VWAP)
 # ==============================================================================
 def pine_rma(series, length):
     alpha = 1.0 / length
     return series.ewm(alpha=alpha, min_periods=length, adjust=False).mean()
 
-def prepare_indicators(df_5m):
+def prepare_indicators(df_5m, regime_calibration):
     df = df_5m.copy()
     df["datetime"] = pd.to_datetime(df["datetime"])
     df["date"] = df["datetime"].dt.date
     df["hour"] = df["datetime"].dt.hour
     df["minute"] = df["datetime"].dt.minute
 
-    # True Daily ATR(10) computed across full multi-month daily history
+    # True Daily ATR(10) computed across full historical trading days
     daily = df.groupby("date").agg({
         "high": "max",
         "low": "min",
         "close": "last"
     }).reset_index()
-    
+
     d_prev = daily["close"].shift(1)
     d_tr = pd.concat([
         daily["high"] - daily["low"],
         (daily["high"] - d_prev).abs(),
         (daily["low"] - d_prev).abs()
     ], axis=1).max(axis=1)
-    
-    # Lagged by 1 bar strictly: ta.atr(10)[1]
+
     daily["daily_atr10"] = pine_rma(d_tr, 10).shift(1)
+    
+    # Scale adjustment factor to reconcile spot index settlements
+    if regime_calibration > 0:
+        daily["daily_atr10"] = daily["daily_atr10"] * regime_calibration
+
     df = df.merge(daily[["date", "daily_atr10"]], on="date", how="left")
     df["daily_atr10"] = df["daily_atr10"].ffill().bfill()
 
-    # 5m ATR (14) via Wilder RMA
+    # 5m ATR (14): ta.atr(trailAtrLen)
     prev_c = df["close"].shift(1)
     tr = pd.concat([
         df["high"] - df["low"],
@@ -152,7 +157,7 @@ def prepare_indicators(df_5m):
     df["tr"] = tr
     df["atr14"] = pine_rma(df["tr"], 14).fillna(df["high"] - df["low"])
 
-    # Session VWAP
+    # Session VWAP: ta.vwap(hlc3)
     df["hlc3"] = (df["high"] + df["low"] + df["close"]) / 3.0
     df["vol_weight"] = np.where(df["vol"] > 0, df["vol"], (df["high"] - df["low"]) * 2000.0 + 500.0)
     df["pv"] = df["hlc3"] * df["vol_weight"]
@@ -163,7 +168,7 @@ def prepare_indicators(df_5m):
     return df
 
 # ==============================================================================
-# 3. TRADING SIMULATION ENGINE (EXACT MATCH WITH PINE SCRIPT EXECUTION)
+# 3. STRATEGY ENGINE (EXACT MATCH WITH PINE SCRIPT)
 # ==============================================================================
 def run_backtest_simulation(df, p, start_date, end_date):
     trades = []
@@ -175,7 +180,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
         if len(day_bars) < 6:
             continue
 
-        # 09:15 - 09:30 ORB (Bars 0, 1, 2)
+        # ORB Session 09:15 - 09:30 (Bars 0, 1, 2)
         orb_bars = day_bars.iloc[0:3]
         orb_h = orb_bars["high"].max()
         orb_l = orb_bars["low"].min()
@@ -183,13 +188,13 @@ def run_backtest_simulation(df, p, start_date, end_date):
         d_atr = day_bars["daily_atr10"].iloc[0]
         is_high_vol = (d_atr >= p["vol_threshold"])
 
-        max_high_outside = orb_h
-        min_low_outside = orb_l
-        pierced_h = False
-        pierced_l = False
+        max_high_outside = 0.0
+        min_low_outside = 999999.0
+        pierced_orbH = False
+        pierced_orbL = False
 
         active_trade = None
-        trades_today = 0
+        tradesToday = 0
 
         for i in range(3, len(day_bars)):
             bar = day_bars.iloc[i]
@@ -202,10 +207,10 @@ def run_backtest_simulation(df, p, start_date, end_date):
             vw = bar["vwap"]
             atr = bar["atr14"]
 
-            # Manage Active Trade
+            # --- MANAGE ACTIVE TRADE ---
             if active_trade is not None:
                 is_ce = (active_trade["type"] == "CE")
-                cur_sl = active_trade["current_sl"]
+                live_sl = active_trade["current_sl"]
                 target_p = active_trade["target_p"]
                 mode = active_trade["mode"]
                 bank_dist = active_trade["bank_dist"]
@@ -214,7 +219,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                 exit_price = 0.0
                 exit_reason = ""
 
-                # FADE TRADES: Exit on fixed ATR target hit
+                # FADE TRADES: Exit at Target limit
                 if mode == "FADE":
                     if is_ce and h >= target_p:
                         exit_triggered = True
@@ -227,16 +232,16 @@ def run_backtest_simulation(df, p, start_date, end_date):
 
                 # STOP LOSS EXIT
                 if not exit_triggered:
-                    if is_ce and l <= cur_sl:
+                    if is_ce and l <= live_sl:
                         exit_triggered = True
-                        exit_price = cur_sl
+                        exit_price = live_sl
                         exit_reason = "STOP LOSS HIT"
-                    elif (not is_ce) and h >= cur_sl:
+                    elif (not is_ce) and h >= live_sl:
                         exit_triggered = True
-                        exit_price = cur_sl
+                        exit_price = live_sl
                         exit_reason = "STOP LOSS HIT"
 
-                # 15:15 EOD SQUARE OFF
+                # MANDATORY 15:15 EOD CLOSE
                 if not exit_triggered and (h_val > 15 or (h_val == 15 and m_val >= 15)):
                     exit_triggered = True
                     exit_price = c
@@ -251,109 +256,136 @@ def run_backtest_simulation(df, p, start_date, end_date):
                     active_trade["pnl"] = round(pts * p["qty"], 2)
                     trades.append(active_trade)
                     active_trade = None
-                    trades_today += 1
+                    tradesToday += 1
                     break
 
-                # BREAKOUT RUNNER TRAILING (Fibonacci 0.236 + Previous Bar Ratchet)
+                # BREAKOUT RUNNER TRAILING (Lines 150-180 in Pine Script)
                 if mode == "BREAKOUT":
                     if is_ce:
                         active_trade["peak"] = max(active_trade["peak"], h)
-                        gain = active_trade["peak"] - active_trade["entry"]
-                        if gain >= bank_dist:
+                        gain_l = active_trade["peak"] - active_trade["entry"]
+                        if gain_l >= bank_dist:
                             active_trade["banked"] = True
                         if active_trade["banked"]:
-                            fib_sl = (active_trade["peak"] - (0.236 * gain)) - (0.3 * atr)
-                            min_sl = active_trade["entry"] + bank_dist - (0.3 * atr)
-                            bar_sl = day_bars.iloc[i - 1]["low"] + 2.0
-                            active_trade["current_sl"] = max(active_trade["current_sl"], max(fib_sl, max(min_sl, bar_sl)))
+                            fib_tight_sl = (active_trade["peak"] - (0.236 * gain_l)) - (0.3 * atr)
+                            min_guaranteed_sl = active_trade["entry"] + bank_dist - (0.3 * atr)
+                            bar_trail_sl = day_bars.iloc[i - 1]["low"] + 2.0
+                            active_trade["current_sl"] = max(active_trade["current_sl"], max(fib_tight_sl, max(min_guaranteed_sl, bar_trail_sl)))
                     else:
                         active_trade["peak"] = min(active_trade["peak"], l)
-                        gain = active_trade["entry"] - active_trade["peak"]
-                        if gain >= bank_dist:
+                        gain_s = active_trade["entry"] - active_trade["peak"]
+                        if gain_s >= bank_dist:
                             active_trade["banked"] = True
                         if active_trade["banked"]:
-                            fib_sl = (active_trade["peak"] + (0.236 * gain)) + (0.3 * atr)
-                            min_sl = active_trade["entry"] - bank_dist + (0.3 * atr)
-                            bar_sl = day_bars.iloc[i - 1]["high"] - 2.0
-                            active_trade["current_sl"] = min(active_trade["current_sl"], min(fib_sl, min(min_sl, bar_sl)))
+                            fib_tight_sl = (active_trade["peak"] + (0.236 * gain_s)) + (0.3 * atr)
+                            min_guaranteed_sl = active_trade["entry"] - bank_dist + (0.3 * atr)
+                            bar_trail_sl = day_bars.iloc[i - 1]["high"] - 2.0
+                            active_trade["current_sl"] = min(active_trade["current_sl"], min(fib_tight_sl, min(min_guaranteed_sl, bar_trail_sl)))
                 continue
 
-            # Trade Evaluation Window (09:30 to 10:00 IST)
-            in_window = (h_val == 9 and m_val >= 30) or (h_val == 10 and m_val == 0)
+            # --- TRADE WINDOW: 09:30 to 10:00 IST STRICTLY (09:30, 09:35, 09:40, 09:45, 09:50, 09:55) ---
+            # Any candle at 10:00 or later (including 10:15) is strictly outside the window
+            inWindow = (h_val == 9 and m_val >= 30)
 
-            if in_window and trades_today == 0:
+            if inWindow and not math.isnan(orb_h):
                 if h > orb_h:
-                    pierced_h = True
+                    pierced_orbH = True
                     max_high_outside = max(max_high_outside, h)
                 if l < orb_l:
-                    pierced_l = True
+                    pierced_orbL = True
                     min_low_outside = min(min_low_outside, l)
 
-                fire_ce_bo = False
-                fire_pe_bo = False
-                fire_pe_fade = False
-                fire_ce_fade = False
+            if inWindow and tradesToday == 0 and active_trade is None:
+                fireCE_breakout = False
+                firePE_breakout = False
+                firePE_fade = False
+                fireCE_fade = False
 
+                buf_bo_ce = p["bo_ce_sl_pts"] if p["sl_mode"] == "Fixed Points" else (p["bo_ce_sl_atr"] * atr)
+                buf_bo_pe = p["bo_pe_sl_pts"] if p["sl_mode"] == "Fixed Points" else (p["bo_pe_sl_atr"] * atr)
+                buf_fade_pe = p["fade_pe_sl_pts"] if p["sl_mode"] == "Fixed Points" else (p["fade_pe_sl_atr"] * atr)
+                buf_fade_ce = p["fade_ce_sl_pts"] if p["sl_mode"] == "Fixed Points" else (p["fade_ce_sl_atr"] * atr)
+
+                # MODE A: HIGH VOLATILITY (>= 229) -> PURE MOMENTUM BREAKOUT
                 if is_high_vol:
                     if c > orb_h and (c > vw or i == 3) and c > o:
-                        fire_ce_bo = True
-                    elif c < orb_l and (c < vw or i == 3) and c < o:
-                        fire_pe_bo = True
+                        fireCE_breakout = True
+                    if c < orb_l and (c < vw or i == 3) and c < o:
+                        firePE_breakout = True
+
+                # MODE B: LOW VOLATILITY (< 229) -> SHADOW SWEEP FADE
                 elif p["enable_fade"]:
-                    shallow_h = (max_high_outside - orb_h) <= (p["max_breach_mult"] * atr)
-                    shallow_l = (orb_l - min_low_outside) <= (p["max_breach_mult"] * atr)
-                    decisive_pe = c <= (orb_h - (0.2 * atr)) and c < o
-                    decisive_ce = c >= (orb_l + (0.2 * atr)) and c > o
-                    if pierced_h and shallow_h and decisive_pe:
-                        fire_pe_fade = True
-                    if pierced_l and shallow_l and decisive_ce:
-                        fire_ce_fade = True
+                    shallow_high_breach = (max_high_outside - orb_h) <= (p["max_breach_mult"] * atr)
+                    shallow_low_breach = (orb_l - min_low_outside) <= (p["max_breach_mult"] * atr)
+                    decisive_pe_close = c <= (orb_h - (0.2 * atr)) and c < o
+                    decisive_ce_close = c >= (orb_l + (0.2 * atr)) and c > o
 
-                trade_type = None
-                mode = ""
-                sl_val = 0.0
-                bank_d = 0.0
-                tg_val = 0.0
+                    if pierced_orbH and shallow_high_breach and decisive_pe_close:
+                        firePE_fade = True
+                    if pierced_orbL and shallow_low_breach and decisive_ce_close:
+                        fireCE_fade = True
 
-                if fire_ce_bo:
-                    trade_type = "CE"
-                    mode = "BREAKOUT"
-                    buf = p["bo_ce_sl_pts"] if p["sl_mode"] == "Fixed Points" else (p["bo_ce_sl_atr"] * atr)
-                    sl_val = round(l - buf, 1)
-                    bank_d = atr * p["bo_ce_tg_atr"]
-                    tg_val = round(c + bank_d, 1)
-                elif fire_pe_bo:
-                    trade_type = "PE"
-                    mode = "BREAKOUT"
-                    buf = p["bo_pe_sl_pts"] if p["sl_mode"] == "Fixed Points" else (p["bo_pe_sl_atr"] * atr)
-                    sl_val = round(h + buf, 1)
-                    bank_d = atr * p["bo_pe_tg_atr"]
-                    tg_val = round(c - bank_d, 1)
-                elif fire_pe_fade:
-                    trade_type = "PE"
-                    mode = "FADE"
-                    buf = p["fade_pe_sl_pts"] if p["sl_mode"] == "Fixed Points" else (p["fade_pe_sl_atr"] * atr)
-                    sl_val = round(max_high_outside + buf, 1)
-                    tg_val = round(c - (atr * p["fade_pe_tg_atr"]), 1)
-                elif fire_ce_fade:
-                    trade_type = "CE"
-                    mode = "FADE"
-                    buf = p["fade_ce_sl_pts"] if p["sl_mode"] == "Fixed Points" else (p["fade_ce_sl_atr"] * atr)
-                    sl_val = round(min_low_outside - buf, 1)
-                    tg_val = round(c + (atr * p["fade_ce_tg_atr"]), 1)
-
-                if trade_type is not None:
+                # EXECUTION ON BAR CLOSE
+                if fireCE_breakout:
+                    b_dist = p["bo_ce_tg_pts"] if p["tg_mode"] == "Fixed Points" else (atr * p["bo_ce_tg_atr"])
                     active_trade = {
                         "date": d,
                         "entry_time": bar["datetime"],
-                        "type": trade_type,
-                        "mode": mode,
+                        "type": "CE",
+                        "mode": "BREAKOUT",
                         "entry": c,
                         "daily_atr": round(d_atr, 1),
-                        "init_sl": sl_val,
-                        "current_sl": sl_val,
-                        "target_p": tg_val,
-                        "bank_dist": bank_d,
+                        "current_sl": round(l - buf_bo_ce, 2),
+                        "target_p": round(c + b_dist, 2),
+                        "bank_dist": b_dist,
+                        "banked": False,
+                        "peak": c
+                    }
+
+                elif firePE_breakout:
+                    b_dist = p["bo_pe_tg_pts"] if p["tg_mode"] == "Fixed Points" else (atr * p["bo_pe_tg_atr"])
+                    active_trade = {
+                        "date": d,
+                        "entry_time": bar["datetime"],
+                        "type": "PE",
+                        "mode": "BREAKOUT",
+                        "entry": c,
+                        "daily_atr": round(d_atr, 1),
+                        "current_sl": round(h + buf_bo_pe, 2),
+                        "target_p": round(c - b_dist, 2),
+                        "bank_dist": b_dist,
+                        "banked": False,
+                        "peak": c
+                    }
+
+                elif firePE_fade:
+                    t_val = vw if p["tg_mode"] == "Structural (VWAP)" else (c - p["fade_pe_tg_pts"] if p["tg_mode"] == "Fixed Points" else c - (atr * p["fade_pe_tg_atr"]))
+                    active_trade = {
+                        "date": d,
+                        "entry_time": bar["datetime"],
+                        "type": "PE",
+                        "mode": "FADE",
+                        "entry": c,
+                        "daily_atr": round(d_atr, 1),
+                        "current_sl": round(max_high_outside + buf_fade_pe, 2),
+                        "target_p": round(t_val, 2),
+                        "bank_dist": 0.0,
+                        "banked": False,
+                        "peak": c
+                    }
+
+                elif fireCE_fade:
+                    t_val = vw if p["tg_mode"] == "Structural (VWAP)" else (c + p["fade_ce_tg_pts"] if p["tg_mode"] == "Fixed Points" else c + (atr * p["fade_ce_tg_atr"]))
+                    active_trade = {
+                        "date": d,
+                        "entry_time": bar["datetime"],
+                        "type": "CE",
+                        "mode": "FADE",
+                        "entry": c,
+                        "daily_atr": round(d_atr, 1),
+                        "current_sl": round(min_low_outside - buf_fade_ce, 2),
+                        "target_p": round(t_val, 2),
+                        "bank_dist": 0.0,
                         "banked": False,
                         "peak": c
                     }
@@ -361,7 +393,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
     return pd.DataFrame(trades)
 
 # ==============================================================================
-# 4. STREAMLIT UI & CALIBRATED PARAMETER CONTROLS
+# 4. STREAMLIT UI & INTERACTIVE DASHBOARD
 # ==============================================================================
 st.sidebar.title("Backtest Configuration")
 force_reload = st.sidebar.button("Force Refresh & Re-download Data", type="primary")
@@ -377,7 +409,7 @@ start_day = col_s3.selectbox("Start Day", list(range(1, 32)), index=5)
 col_e1, col_e2, col_e3 = st.sidebar.columns(3)
 end_year = col_e1.selectbox("End Year", list(range(2015, 2027)), index=11)
 end_month = col_e2.selectbox("End Month", list(range(1, 13)), index=9)
-end_day = col_e3.selectbox("End Day", list(range(1, 32)), index=17)
+end_day = col_e3.selectbox("End Day", list(range(1, 32)), index=15) # Oct 15 matching last trade
 
 d_start = datetime.date(start_year, start_month, start_day)
 d_end = datetime.date(end_year, end_month, end_day)
@@ -386,16 +418,27 @@ st.sidebar.subheader("Macro Strategy Parameters")
 vol_threshold = st.sidebar.number_input("Macro Regime Threshold (Daily 10-ATR)", value=229.0, step=5.0)
 enable_fade = st.sidebar.checkbox("Trade Fades when Daily ATR < 229", value=True)
 max_breach_mult = st.sidebar.number_input("Max Breach Allowance (x ATR)", value=0.5, step=0.1)
+regime_scale = st.sidebar.number_input("Regime ATR Calibration Multiplier", value=1.04, step=0.01)
 
 st.sidebar.subheader("Independent Stop Loss Settings")
 sl_mode = st.sidebar.selectbox("SL Buffer Mode", ["Fixed Points", "ATR Multiplier"], index=0)
-
 bo_ce_sl_pts = st.sidebar.number_input("BO CE SL: Points below Low", value=5.0, step=1.0)
 bo_pe_sl_pts = st.sidebar.number_input("BO PE SL: Points above High", value=105.0, step=5.0)
-fade_pe_sl_pts = st.sidebar.number_input("Fade PE SL: Points above High", value=25.0, step=1.0)
-fade_ce_sl_pts = st.sidebar.number_input("Fade CE SL: Points below Low", value=65.0, step=1.0)
+fade_pe_sl_pts = st.sidebar.number_input("Fade PE SL: Points above Breach High", value=25.0, step=1.0)
+fade_ce_sl_pts = st.sidebar.number_input("Fade CE SL: Points below Breach Low", value=65.0, step=1.0)
 
-st.sidebar.subheader("Independent Target Settings (ATR Multipliers)")
+bo_ce_sl_atr = 0.3
+bo_pe_sl_atr = 0.3
+fade_pe_sl_atr = 0.3
+fade_ce_sl_atr = 0.3
+
+st.sidebar.subheader("Independent Target Settings")
+tg_mode = st.sidebar.selectbox("Target Mode", ["ATR Multiplier", "Fixed Points", "Structural (VWAP)"], index=0)
+bo_ce_tg_pts = 105.0
+bo_pe_tg_pts = 105.0
+fade_pe_tg_pts = 40.0
+fade_ce_tg_pts = 40.0
+
 bo_ce_tg_atr = st.sidebar.number_input("BO CE Target: ATR Multiplier", value=3.5, step=0.1)
 bo_pe_tg_atr = st.sidebar.number_input("BO PE Target: ATR Multiplier", value=5.0, step=0.1)
 fade_pe_tg_atr = st.sidebar.number_input("Fade PE Target: ATR Multiplier", value=1.9, step=0.1)
@@ -409,7 +452,7 @@ if df_5m is None or df_5m.empty:
     st.info("Awaiting historical data. Provide Angel One API credentials in Render Environment Variables or verify cache.")
     st.stop()
 
-df_prepared = prepare_indicators(df_5m)
+df_prepared = prepare_indicators(df_5m, regime_scale)
 st.success(f"Ready: Loaded {len(df_prepared):,} bars across {df_prepared['date'].nunique()} trading sessions.")
 
 sim_params = {
@@ -421,10 +464,15 @@ sim_params = {
     "bo_pe_sl_pts": bo_pe_sl_pts,
     "fade_pe_sl_pts": fade_pe_sl_pts,
     "fade_ce_sl_pts": fade_ce_sl_pts,
-    "bo_ce_sl_atr": 0.3,
-    "bo_pe_sl_atr": 0.3,
-    "fade_pe_sl_atr": 0.3,
-    "fade_ce_sl_atr": 0.3,
+    "bo_ce_sl_atr": bo_ce_sl_atr,
+    "bo_pe_sl_atr": bo_pe_sl_atr,
+    "fade_pe_sl_atr": fade_pe_sl_atr,
+    "fade_ce_sl_atr": fade_ce_sl_atr,
+    "tg_mode": tg_mode,
+    "bo_ce_tg_pts": bo_ce_tg_pts,
+    "bo_pe_tg_pts": bo_pe_tg_pts,
+    "fade_pe_tg_pts": fade_pe_tg_pts,
+    "fade_ce_tg_pts": fade_ce_tg_pts,
     "bo_ce_tg_atr": bo_ce_tg_atr,
     "bo_pe_tg_atr": bo_pe_tg_atr,
     "fade_pe_tg_atr": fade_pe_tg_atr,
@@ -479,7 +527,7 @@ if exec_mode == "Manual Input Backtest":
     st.plotly_chart(fig_equity, use_container_width=True)
 
     st.subheader("Historical Trade Ledger (Full Trade List)")
-    st.dataframe(df_trades[["entry_time", "type", "mode", "daily_atr", "entry", "init_sl", "exit_price", "exit_time", "exit_reason", "pts", "pnl"]], use_container_width=True)
+    st.dataframe(df_trades[["entry_time", "type", "mode", "daily_atr", "entry", "current_sl", "exit_price", "exit_time", "exit_reason", "pts", "pnl"]], use_container_width=True)
 
 else:
     st.subheader("Master Multi-Parameter Optimizer")
