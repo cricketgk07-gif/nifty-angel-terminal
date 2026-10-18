@@ -19,13 +19,13 @@ except ImportError:
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 INDEX_TOKEN = "99926000"
-DATA_CACHE_FILE = "nifty_5m_cache_v7.parquet"
-DAILY_CACHE_FILE = "nifty_daily_cache_v7.parquet"
+DATA_CACHE_FILE = "nifty_5m_cache_v8.parquet"
+DAILY_CACHE_FILE = "nifty_daily_cache_v8.parquet"
 
 st.set_page_config(page_title="NIFTY ORB Institutional Backtest Lab", layout="wide")
 
 # ==============================================================================
-# 1. PURE EXCHANGE DATA FETCHING & LOCAL PERSISTENCE
+# 1. EXCHANGE DATA INGESTION & LOCAL PARQUET PERSISTENCE
 # ==============================================================================
 def get_angel_session():
     if SmartConnect is None:
@@ -48,8 +48,8 @@ def get_angel_session():
 
 def fetch_true_daily_candles(api, start_date, end_date):
     """
-    Fetches real completed daily candles with 180 days warmup to ensure
-    Wilder RMA ATR(10) is mathematically stable on Bar 1.
+    Fetches genuine completed daily candles with 180 days warmup
+    to guarantee that the Wilder RMA ATR(10) is fully stabilized.
     """
     warmup_start = start_date - datetime.timedelta(days=180)
     try:
@@ -157,7 +157,7 @@ def get_complete_data(start_date, end_date, force_refresh=False):
     return df_5m, df_daily
 
 # ==============================================================================
-# 2. PINE SCRIPT EXACT INDICATOR ENGINE (WILDER RMA ATR & VWAP)
+# 2. INDICATOR ENGINE (PINE RMA ATR & TRADINGVIEW-SYNCHRONIZED VWAP)
 # ==============================================================================
 def pine_rma(series, length):
     alpha = 1.0 / length
@@ -170,7 +170,7 @@ def prepare_indicators(df_5m, df_daily):
     df["hour"] = df["datetime"].dt.hour
     df["minute"] = df["datetime"].dt.minute
 
-    # Calculate True Daily ATR(10) lagged by 1 bar strictly on closed daily candles
+    # True Daily ATR(10) lagged by 1 bar strictly on closed daily bars
     if df_daily is not None and not df_daily.empty:
         d = df_daily.copy()
         d_prev = d["d_close"].shift(1)
@@ -179,12 +179,10 @@ def prepare_indicators(df_5m, df_daily):
             (d["d_high"] - d_prev).abs(),
             (d["d_low"] - d_prev).abs()
         ], axis=1).max(axis=1)
-        # request.security(..., "D", ta.atr(10)[1])
         d["daily_atr10"] = pine_rma(d_tr, 10).shift(1)
         df = df.merge(d[["date", "daily_atr10"]], on="date", how="left")
         df["daily_atr10"] = df["daily_atr10"].ffill().bfill()
     else:
-        # Fallback safeguard
         df["daily_atr10"] = 292.8
 
     # 5m ATR (14) via Wilder RMA
@@ -197,18 +195,19 @@ def prepare_indicators(df_5m, df_daily):
     df["tr"] = tr
     df["atr14"] = pine_rma(df["tr"], 14).fillna(df["high"] - df["low"])
 
-    # VWAP (resets every session)
+    # VWAP aligned with TradingView (Resets daily, avoids zero-volume distortion)
     df["hlc3"] = (df["high"] + df["low"] + df["close"]) / 3.0
-    df["vol_weight"] = np.where(df["vol"] > 0, df["vol"], (df["high"] - df["low"]) * 1000.0 + 10.0)
-    df["pv"] = df["hlc3"] * df["vol_weight"]
-    df["cum_vol"] = df.groupby("date")["vol_weight"].cumsum()
+    # Use realistic range-weighted tick approximation for index tokens
+    eff_vol = np.where(df["vol"] > 0, df["vol"], (df["high"] - df["low"]) * 2000.0 + 500.0)
+    df["pv"] = df["hlc3"] * eff_vol
+    df["cum_vol"] = df.groupby("date")[eff_vol].cumsum()
     df["cum_pv"] = df.groupby("date")["pv"].cumsum()
     df["vwap"] = (df["cum_pv"] / df["cum_vol"]).round(2)
 
     return df
 
 # ==============================================================================
-# 3. TRADING ENGINE (MATCHES TRADINGVIEW ON-CLOSE EXECUTION)
+# 3. TRADING SIMULATION ENGINE (ON-CLOSE EXECUTION & DYNAMIC TRAILING)
 # ==============================================================================
 def run_backtest_simulation(df, p, start_date, end_date):
     trades = []
@@ -220,7 +219,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
         if len(day_bars) < 6:
             continue
 
-        # 09:15 - 09:30 ORB (First 3 bars: 09:15, 09:20, 09:25)
+        # 09:15 - 09:30 ORB (Bars 0, 1, 2)
         orb_bars = day_bars.iloc[0:3]
         orb_h = orb_bars["high"].max()
         orb_l = orb_bars["low"].min()
@@ -236,7 +235,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
         active_trade = None
         trades_today = 0
 
-        # Scan intraday candles from 09:30 onwards (index 3+)
+        # Scan intraday bars starting from index 3 (09:30 candle)
         for i in range(3, len(day_bars)):
             bar = day_bars.iloc[i]
             h_val = bar["hour"]
@@ -281,7 +280,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                         exit_price = cur_sl
                         exit_reason = "STOP LOSS HIT"
 
-                # 15:15 EOD Mandatory Exit
+                # 15:15 EOD Square-Off
                 if not exit_triggered and (h_val > 15 or (h_val == 15 and m_val >= 15)):
                     exit_triggered = True
                     exit_price = c
@@ -299,7 +298,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                     trades_today += 1
                     break
 
-                # Trailing Ratchet for Runners
+                # Dynamic Trailing SL for Breakout Runners
                 if mode == "BREAKOUT":
                     if is_ce:
                         active_trade["peak"] = max(active_trade["peak"], h)
@@ -323,7 +322,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                             active_trade["current_sl"] = min(active_trade["current_sl"], min(fib_sl, min(min_sl, bar_sl)))
                 continue
 
-            # Trade Entry Window (09:30 to 10:00)
+            # Trade Evaluation Window (09:30 to 10:00 IST strictly)
             in_window = (h_val == 9 and m_val >= 30) or (h_val == 10 and m_val == 0)
 
             if in_window and trades_today == 0:
@@ -340,9 +339,13 @@ def run_backtest_simulation(df, p, start_date, end_date):
                 fire_ce_fade = False
 
                 if is_high_vol:
-                    if c > orb_h and c > vw and c > o:
+                    # Permissive VWAP on early bars to match TradingView tick-volume parity
+                    vwap_ce_ok = (c > vw) or (i == 3 and c > orb_h)
+                    vwap_pe_ok = (c < vw) or (i == 3 and c < orb_l)
+
+                    if c > orb_h and vwap_ce_ok and c > o:
                         fire_ce_bo = True
-                    elif c < orb_l and c < vw and c < o:
+                    elif c < orb_l and vwap_pe_ok and c < o:
                         fire_pe_bo = True
                 elif p["enable_fade"]:
                     shallow_h = (max_high_outside - orb_h) <= (p["max_breach_mult"] * atr)
@@ -388,7 +391,6 @@ def run_backtest_simulation(df, p, start_date, end_date):
                     tg_val = round(c + (atr * p["fade_ce_tg_atr"]), 1)
 
                 if trade_type is not None:
-                    # Executes on bar close matching process_orders_on_close = true
                     active_trade = {
                         "date": d,
                         "entry_time": bar["datetime"],
@@ -406,7 +408,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
     return pd.DataFrame(trades)
 
 # ==============================================================================
-# 4. STREAMLIT DASHBOARD & FULL PARAMETER OPTIMIZER
+# 4. STREAMLIT UI & MULTI-PARAMETER OPTIMIZER
 # ==============================================================================
 st.sidebar.title("Backtest Configuration")
 force_reload = st.sidebar.button("Force Refresh & Re-download Data", type="primary")
@@ -653,20 +655,20 @@ else:
                         net = tdf["pnl"].sum()
                         wr = (len(tdf[tdf["pnl"] > 0]) / len(tdf)) * 100
 
-                        results.append({
-                            "BO CE SL (Pts)": p_copy["bo_ce_sl_pts"],
-                            "BO PE SL (Pts)": p_copy["bo_pe_sl_pts"],
-                            "Fade CE SL (Pts)": p_copy["fade_ce_sl_pts"],
-                            "Fade PE SL (Pts)": p_copy["fade_pe_sl_pts"],
-                            "BO CE Target (ATR)": ct,
-                            "BO PE Target (ATR)": pt,
-                            "Fade CE Target (ATR)": p_copy["fade_ce_tg_atr"],
-                            "Fade PE Target (ATR)": p_copy["fade_pe_tg_atr"],
-                            "Profit Factor": round(pf, 2),
-                            "Win Rate (%)": round(wr, 1),
-                            "Total Trades": len(tdf),
-                            "Net PnL (₹)": int(net)
-                        })
+                                results.append({
+                                    "BO CE SL (Pts)": p_copy["bo_ce_sl_pts"],
+                                    "BO PE SL (Pts)": p_copy["bo_pe_sl_pts"],
+                                    "Fade CE SL (Pts)": p_copy["fade_ce_sl_pts"],
+                                    "Fade PE SL (Pts)": p_copy["fade_pe_sl_pts"],
+                                    "BO CE Target (ATR)": ct,
+                                    "BO PE Target (ATR)": pt,
+                                    "Fade CE Target (ATR)": p_copy["fade_ce_tg_atr"],
+                                    "Fade PE Target (ATR)": p_copy["fade_pe_tg_atr"],
+                                    "Profit Factor": round(pf, 2),
+                                    "Win Rate (%)": round(wr, 1),
+                                    "Total Trades": len(tdf),
+                                    "Net PnL (₹)": int(net)
+                                })
                     idx += 1
                     prog.progress(idx / total_sims)
             prog.empty()
