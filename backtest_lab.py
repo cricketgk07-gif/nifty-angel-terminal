@@ -24,7 +24,7 @@ DATA_CACHE_FILE = "nifty_5m_historical_cache.parquet"
 st.set_page_config(page_title="NIFTY ORB Institutional Backtest Lab", layout="wide")
 
 # ==============================================================================
-# 1. ANGEL ONE HISTORICAL DATA DOWNLOADER & LOCAL CACHE
+# 1. HISTORICAL DATA DOWNLOADER WITH WARM-UP & PERSISTENT CACHING
 # ==============================================================================
 def get_angel_session():
     if SmartConnect is None:
@@ -46,12 +46,14 @@ def get_angel_session():
     return None
 
 def fetch_chunked_data(api, start_date, end_date):
+    # Include a 30-day warm-up window so Daily ATR(10) is accurate on Bar 1
+    fetch_start = start_date - datetime.timedelta(days=35)
     candles = []
-    curr_start = start_date
+    curr_start = fetch_start
     delta_chunk = datetime.timedelta(days=28)
 
-    prog_bar = st.progress(0, text="Downloading Multi-Year Historical 5m Candles...")
-    total_days = max(1, (end_date - start_date).days)
+    prog_bar = st.progress(0, text="Fetching historical candles from Angel One...")
+    total_days = max(1, (end_date - fetch_start).days)
 
     while curr_start < end_date:
         curr_end = min(curr_start + delta_chunk, end_date)
@@ -77,9 +79,9 @@ def fetch_chunked_data(api, start_date, end_date):
                     })
         except Exception:
             pass
-        time.sleep(0.35)
+        time.sleep(0.3)
         curr_start = curr_end + datetime.timedelta(days=1)
-        done_days = min(total_days, (curr_start - start_date).days)
+        done_days = min(total_days, (curr_start - fetch_start).days)
         prog_bar.progress(min(1.0, done_days / total_days))
 
     prog_bar.empty()
@@ -87,72 +89,106 @@ def fetch_chunked_data(api, start_date, end_date):
     if not df.empty:
         df["datetime"] = df["datetime"].dt.tz_localize(None)
         df = df.drop_duplicates(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
+        # Store locally so subsequent runs don't re-download
         df.to_parquet(DATA_CACHE_FILE)
     return df
 
-@st.cache_data(show_spinner=False)
-def load_historical_data(start_date, end_date):
+def get_nifty_data(start_date, end_date):
+    # Check if data already exists in Streamlit session memory
+    if "cached_master_df" in st.session_state:
+        df = st.session_state["cached_master_df"]
+        return df
+
+    # Check local Parquet file
     if os.path.exists(DATA_CACHE_FILE):
         df = pd.read_parquet(DATA_CACHE_FILE)
         df["datetime"] = pd.to_datetime(df["datetime"])
-        if df["datetime"].min().date() <= start_date and df["datetime"].max().date() >= (end_date - datetime.timedelta(days=5)):
-            mask = (df["datetime"].dt.date >= start_date) & (df["datetime"].dt.date <= end_date)
-            return df[mask].copy().reset_index(drop=True)
+        st.session_state["cached_master_df"] = df
+        return df
 
+    # Fetch via Angel One API
     api = get_angel_session()
     if api is not None:
-        return fetch_chunked_data(api, start_date, end_date)
+        df = fetch_chunked_data(api, start_date, end_date)
+        if not df.empty:
+            st.session_state["cached_master_df"] = df
+        return df
+
     return pd.DataFrame()
 
 # ==============================================================================
-# 2. STRATEGY EXECUTION ENGINE
+# 2. EXACT PINE SCRIPT INDICATOR REPLICATION (RMA ATR & DAILY 10-ATR)
 # ==============================================================================
+def pine_rma(series, length):
+    alpha = 1.0 / length
+    return series.ewm(alpha=alpha, min_periods=length, adjust=False).mean()
+
 def prepare_indicators(df):
+    df = df.copy()
     df["date"] = df["datetime"].dt.date
     df["time"] = df["datetime"].dt.time
-    
-    # 5m ATR (14)
-    tr1 = df["high"] - df["low"]
-    tr2 = (df["high"] - df["close"].shift(1)).abs()
-    tr3 = (df["low"] - df["close"].shift(1)).abs()
-    df["tr"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    df["atr14"] = df["tr"].rolling(14).mean().fillna(14.0)
 
-    # Intraday VWAP
+    # True Range & 5m ATR (using Pine Script RMA formula)
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
+    df["tr"] = tr
+    df["atr14"] = pine_rma(df["tr"], 14).fillna(df["high"] - df["low"])
+
+    # Standard VWAP (Resetting Daily)
     df["hlc3"] = (df["high"] + df["low"] + df["close"]) / 3.0
     spread = (df["high"] - df["low"]) + (df["close"] - df["open"]).abs()
-    df["vol_weight"] = spread * 1250.0 + 500.0
+    df["vol_weight"] = np.where(df["vol"] > 0, df["vol"], spread * 1000.0 + 100.0)
     df["pv"] = df["hlc3"] * df["vol_weight"]
     df["cum_vol"] = df.groupby("date")["vol_weight"].cumsum()
     df["cum_pv"] = df.groupby("date")["pv"].cumsum()
     df["vwap"] = (df["cum_pv"] / df["cum_vol"]).round(2)
 
-    # Daily 10-ATR (Closed Bars, Lookahead Disabled)
-    daily = df.groupby("date").agg({"high": "max", "low": "min", "close": "last"}).reset_index()
-    d_tr1 = daily["high"] - daily["low"]
-    d_tr2 = (daily["high"] - daily["close"].shift(1)).abs()
-    d_tr3 = (daily["low"] - daily["close"].shift(1)).abs()
-    daily["d_tr"] = pd.concat([d_tr1, d_tr2, d_tr3], axis=1).max(axis=1)
-    daily["daily_atr10"] = daily["d_tr"].rolling(10).mean().shift(1).fillna(180.0)
+    # Daily 10-ATR (Using closed daily bars, lagged by 1 to prevent lookahead bias)
+    daily = df.groupby("date").agg({
+        "high": "max",
+        "low": "min",
+        "close": "last"
+    }).reset_index()
+
+    d_prev_close = daily["close"].shift(1)
+    d_tr = pd.concat([
+        daily["high"] - daily["low"],
+        (daily["high"] - d_prev_close).abs(),
+        (daily["low"] - d_prev_close).abs()
+    ], axis=1).max(axis=1)
+    daily["daily_atr10"] = pine_rma(d_tr, 10).shift(1)
     
+    # Forward-fill any NaN values with the last valid daily ATR or standard 290
+    daily["daily_atr10"] = daily["daily_atr10"].bfill().fillna(292.0)
+
     df = df.merge(daily[["date", "daily_atr10"]], on="date", how="left")
     return df
 
-def run_backtest_simulation(df, p):
+# ==============================================================================
+# 3. TRADING ENGINE (EXACT ENTRY, 15:15 EOD FORCED CLOSE, RUNNER RATCHET)
+# ==============================================================================
+def run_backtest_simulation(df, p, start_date, end_date):
     trades = []
-    dates = df["date"].unique()
+    # Filter only to target date range for trading, using earlier bars strictly for indicator warm-up
+    eval_dates = [d for d in df["date"].unique() if start_date <= d <= end_date]
 
-    for d in dates:
+    for d in eval_dates:
         day_bars = df[df["date"] == d].copy().reset_index(drop=True)
         if len(day_bars) < 6:
             continue
 
+        # 09:15 - 09:30 ORB Definition
         orb_bars = day_bars[(day_bars["time"] >= datetime.time(9, 15)) & (day_bars["time"] < datetime.time(9, 30))]
-        if len(orb_bars) == 0:
+        if len(orb_bars) < 3:
             orb_bars = day_bars.iloc[0:3]
-            
+
         orb_h = orb_bars["high"].max()
         orb_l = orb_bars["low"].min()
+
         d_atr = day_bars["daily_atr10"].iloc[0]
         is_high_vol = (d_atr >= p["vol_threshold"])
 
@@ -162,6 +198,7 @@ def run_backtest_simulation(df, p):
         pierced_l = False
 
         active_trade = None
+        trades_today = 0
 
         for i in range(len(day_bars)):
             bar = day_bars.iloc[i]
@@ -173,6 +210,7 @@ def run_backtest_simulation(df, p):
             vw = bar["vwap"]
             atr = bar["atr14"]
 
+            # Manage Active Trade
             if active_trade is not None:
                 is_ce = (active_trade["type"] == "CE")
                 cur_sl = active_trade["current_sl"]
@@ -184,6 +222,7 @@ def run_backtest_simulation(df, p):
                 exit_price = 0.0
                 exit_reason = ""
 
+                # Target Exit
                 if is_ce and h >= target_p:
                     exit_triggered = True
                     exit_price = target_p
@@ -193,6 +232,7 @@ def run_backtest_simulation(df, p):
                     exit_price = target_p
                     exit_reason = "TARGET HIT"
 
+                # Stop Loss Exit
                 if not exit_triggered:
                     if is_ce and l <= cur_sl:
                         exit_triggered = True
@@ -203,22 +243,25 @@ def run_backtest_simulation(df, p):
                         exit_price = cur_sl
                         exit_reason = "STOP LOSS HIT"
 
+                # Mandatory 15:15 EOD Close
                 if not exit_triggered and b_time >= datetime.time(15, 15):
                     exit_triggered = True
                     exit_price = c
-                    exit_reason = "15:15 EOD EXIT"
+                    exit_reason = "15:15 EOD CLOSE"
 
                 if exit_triggered:
                     pts = (exit_price - active_trade["entry"]) if is_ce else (active_trade["entry"] - exit_price)
-                    active_trade["exit_price"] = exit_price
+                    active_trade["exit_price"] = round(exit_price, 2)
                     active_trade["exit_time"] = bar["datetime"]
                     active_trade["exit_reason"] = exit_reason
                     active_trade["pts"] = round(pts, 1)
                     active_trade["pnl"] = round(pts * p["qty"], 2)
                     trades.append(active_trade)
                     active_trade = None
-                    break
+                    trades_today += 1
+                    break  # Intraday limit reached for this session
 
+                # Dynamic Trailing SL Logic
                 if mode == "BREAKOUT":
                     if is_ce:
                         active_trade["peak"] = max(active_trade["peak"], h)
@@ -242,7 +285,8 @@ def run_backtest_simulation(df, p):
                             active_trade["current_sl"] = min(active_trade["current_sl"], min(fib_sl, min(min_sl, bar_sl)))
                 continue
 
-            if datetime.time(9, 30) <= b_time < datetime.time(10, 0):
+            # Evaluate Entry Conditions (09:30 to 10:00 Window Only)
+            if datetime.time(9, 30) <= b_time < datetime.time(10, 0) and trades_today == 0:
                 if h > orb_h:
                     pierced_h = True
                     max_high_outside = max(max_high_outside, h)
@@ -321,22 +365,22 @@ def run_backtest_simulation(df, p):
     return pd.DataFrame(trades)
 
 # ==============================================================================
-# 3. INTERACTIVE UI & SIDEBAR INPUTS
+# 4. STREAMLIT USER INTERFACE & CONTROLS
 # ==============================================================================
 st.sidebar.title("Backtest Configuration")
 exec_mode = st.sidebar.radio("Execution Mode", ["Manual Input Backtest", "Automated Grid Optimizer"])
 
 st.sidebar.subheader("Date Horizon")
 col_s1, col_s2 = st.sidebar.columns(2)
-start_year = col_s1.selectbox("Start Year", list(range(2015, 2027)), index=6) # 2021
-start_month = col_s2.selectbox("Start Month", list(range(1, 13)), index=0)
+start_year = col_s1.selectbox("Start Year", list(range(2015, 2027)), index=11)  # 2026 default
+start_month = col_s2.selectbox("Start Month", list(range(1, 13)), index=6)       # July default
 
 col_e1, col_e2 = st.sidebar.columns(2)
-end_year = col_e1.selectbox("End Year", list(range(2015, 2027)), index=11) # 2026
-end_month = col_e2.selectbox("End Month", list(range(1, 13)), index=9)
+end_year = col_e1.selectbox("End Year", list(range(2015, 2027)), index=11)        # 2026 default
+end_month = col_e2.selectbox("End Month", list(range(1, 13)), index=9)           # October default
 
-d_start = datetime.date(start_year, start_month, 1)
-d_end = datetime.date(end_year, end_month, 28)
+d_start = datetime.date(start_year, start_month, 6)
+d_end = datetime.date(end_year, end_month, 18)
 
 st.sidebar.subheader("Macro Strategy Parameters")
 vol_threshold = st.sidebar.number_input("Macro Regime Threshold (Daily 10-ATR)", value=229.0, step=5.0)
@@ -350,33 +394,25 @@ bo_pe_sl_pts = st.sidebar.number_input("BO PE SL: Points above High", value=105.
 fade_pe_sl_pts = st.sidebar.number_input("Fade PE SL: Points above Breach High", value=25.0, step=1.0)
 fade_ce_sl_pts = st.sidebar.number_input("Fade CE SL: Points below Breach Low", value=5.0, step=1.0)
 
-bo_ce_sl_atr = 0.3
-bo_pe_sl_atr = 0.3
-fade_pe_sl_atr = 0.3
-fade_ce_sl_atr = 0.3
-
 st.sidebar.subheader("Independent Target Settings (ATR Multipliers)")
 bo_ce_tg_atr = st.sidebar.number_input("BO CE Target: ATR Multiplier", value=3.5, step=0.1)
 bo_pe_tg_atr = st.sidebar.number_input("BO PE Target: ATR Multiplier", value=5.0, step=0.1)
 fade_pe_tg_atr = st.sidebar.number_input("Fade PE Target: ATR Multiplier", value=1.9, step=0.1)
 fade_ce_tg_atr = st.sidebar.number_input("Fade CE Target: ATR Multiplier", value=1.4, step=0.1)
 
-# ==============================================================================
-# 4. EXECUTION & VISUALIZATION
-# ==============================================================================
-st.title("NIFTY Dual-Regime Master: Multi-Year Institutional Backtester")
+st.title("NIFTY Dual-Regime Master: Institutional Backtest Lab")
 
-with st.spinner("Loading Multi-Year 5m Intraday Data..."):
-    df_raw = load_historical_data(d_start, d_end)
+# Load candles (uses in-memory cache or local parquet)
+df_raw = get_nifty_data(d_start, d_end)
 
 if df_raw.empty:
-    st.info("Awaiting historical data. Ensure your API keys are in Render Environment Variables or test within available cached bars.")
+    st.info("Awaiting historical data. Provide Angel One API credentials in Render Environment Variables or verify cache.")
     st.stop()
 
 df_prepared = prepare_indicators(df_raw)
-st.success(f"Loaded {len(df_prepared):,} 5-minute bars across {df_prepared['date'].nunique()} trading sessions.")
+st.success(f"Ready: Loaded 5-minute bars across {df_prepared['date'].nunique()} trading sessions.")
 
-default_p = {
+sim_params = {
     "vol_threshold": vol_threshold,
     "enable_fade": enable_fade,
     "max_breach_mult": max_breach_mult,
@@ -385,10 +421,10 @@ default_p = {
     "bo_pe_sl_pts": bo_pe_sl_pts,
     "fade_pe_sl_pts": fade_pe_sl_pts,
     "fade_ce_sl_pts": fade_ce_sl_pts,
-    "bo_ce_sl_atr": bo_ce_sl_atr,
-    "bo_pe_sl_atr": bo_pe_sl_atr,
-    "fade_pe_sl_atr": fade_pe_sl_atr,
-    "fade_ce_sl_atr": fade_ce_sl_atr,
+    "bo_ce_sl_atr": 0.3,
+    "bo_pe_sl_atr": 0.3,
+    "fade_pe_sl_atr": 0.3,
+    "fade_ce_sl_atr": 0.3,
     "bo_ce_tg_atr": bo_ce_tg_atr,
     "bo_pe_tg_atr": bo_pe_tg_atr,
     "fade_pe_tg_atr": fade_pe_tg_atr,
@@ -397,10 +433,10 @@ default_p = {
 }
 
 if exec_mode == "Manual Input Backtest":
-    df_trades = run_backtest_simulation(df_prepared, default_p)
+    df_trades = run_backtest_simulation(df_prepared, sim_params, d_start, d_end)
 
     if df_trades.empty:
-        st.warning("No trades triggered under current parameters.")
+        st.warning("No trades triggered for this date range with the selected settings.")
         st.stop()
 
     df_trades["cum_pnl"] = df_trades["pnl"].cumsum()
@@ -433,7 +469,7 @@ if exec_mode == "Manual Input Backtest":
         marker=dict(size=4)
     ))
     fig_equity.update_layout(
-        title="TradingView Cumulative Equity Curve",
+        title="TradingView Matching Cumulative Equity Curve",
         plot_bgcolor="#131722",
         paper_bgcolor="#131722",
         font=dict(color="#d1d4dc"),
@@ -447,7 +483,7 @@ if exec_mode == "Manual Input Backtest":
 
 else:
     st.subheader("Automated Multi-Year Parameter Grid Search")
-    st.write("Simulating across combinations of SL & Target inputs to extract the mathematical frontier...")
+    st.write("Simulating combinations to optimize Profit Factor and Net PnL...")
 
     if st.button("Start Grid Optimization"):
         results = []
@@ -462,12 +498,12 @@ else:
         for ct in ce_targets:
             for pt in pe_targets:
                 for psl in pe_sls:
-                    sim_p = default_p.copy()
+                    sim_p = sim_params.copy()
                     sim_p["bo_ce_tg_atr"] = ct
                     sim_p["bo_pe_tg_atr"] = pt
                     sim_p["bo_pe_sl_pts"] = psl
 
-                    tdf = run_backtest_simulation(df_prepared, sim_p)
+                    tdf = run_backtest_simulation(df_prepared, sim_p, d_start, d_end)
                     if not tdf.empty:
                         gp = tdf[tdf["pnl"] > 0]["pnl"].sum()
                         gl = abs(tdf[tdf["pnl"] < 0]["pnl"].sum())
@@ -488,6 +524,6 @@ else:
                     bar.progress(idx / total_sims)
 
         bar.empty()
-        res_df = pd.DataFrame(results).sort_values("Profit Factor", reverse=True).reset_index(drop=True)
+        res_df = pd.DataFrame(results).sort_values("Profit Factor", ascending=False).reset_index(drop=True)
         st.subheader("Optimal Parameter Configurations")
         st.dataframe(res_df.head(15), use_container_width=True)
