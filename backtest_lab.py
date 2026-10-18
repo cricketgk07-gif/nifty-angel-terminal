@@ -19,13 +19,13 @@ except ImportError:
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 INDEX_TOKEN = "99926000"
-DATA_CACHE_FILE = "nifty_5m_cache_v6.parquet"
-DAILY_CACHE_FILE = "nifty_daily_cache_v6.parquet"
+DATA_CACHE_FILE = "nifty_5m_cache_v7.parquet"
+DAILY_CACHE_FILE = "nifty_daily_cache_v7.parquet"
 
 st.set_page_config(page_title="NIFTY ORB Institutional Backtest Lab", layout="wide")
 
 # ==============================================================================
-# 1. ANGEL ONE DATA FETCHING & LOCAL CACHE
+# 1. PURE EXCHANGE DATA FETCHING & LOCAL PERSISTENCE
 # ==============================================================================
 def get_angel_session():
     if SmartConnect is None:
@@ -46,14 +46,18 @@ def get_angel_session():
         pass
     return None
 
-def fetch_daily_candles(api, start_date, end_date):
-    fetch_start = start_date - datetime.timedelta(days=180)
+def fetch_true_daily_candles(api, start_date, end_date):
+    """
+    Fetches real completed daily candles with 180 days warmup to ensure
+    Wilder RMA ATR(10) is mathematically stable on Bar 1.
+    """
+    warmup_start = start_date - datetime.timedelta(days=180)
     try:
         resp = api.getCandleData({
             "exchange": "NSE",
             "symboltoken": INDEX_TOKEN,
             "interval": "ONE_DAY",
-            "fromdate": fetch_start.strftime("%Y-%m-%d 09:15"),
+            "fromdate": warmup_start.strftime("%Y-%m-%d 09:15"),
             "todate": end_date.strftime("%Y-%m-%d 15:30")
         })
         if resp and resp.get("status") and resp.get("data"):
@@ -74,8 +78,8 @@ def fetch_daily_candles(api, start_date, end_date):
         pass
     return pd.DataFrame()
 
-def fetch_5m_candles(api, start_date, end_date):
-    fetch_start = start_date - datetime.timedelta(days=15)
+def fetch_chunked_5m_candles(api, start_date, end_date):
+    fetch_start = start_date - datetime.timedelta(days=10)
     candles = []
     curr_start = fetch_start
     delta_chunk = datetime.timedelta(days=25)
@@ -136,7 +140,7 @@ def get_complete_data(start_date, end_date, force_refresh=False):
     else:
         api = get_angel_session()
         if api:
-            df_daily = fetch_daily_candles(api, start_date, end_date)
+            df_daily = fetch_true_daily_candles(api, start_date, end_date)
             st.session_state["cached_daily_df"] = df_daily
 
     df_5m = None
@@ -147,26 +151,43 @@ def get_complete_data(start_date, end_date, force_refresh=False):
     else:
         api = get_angel_session()
         if api:
-            df_5m = fetch_5m_candles(api, start_date, end_date)
+            df_5m = fetch_chunked_5m_candles(api, start_date, end_date)
             st.session_state["cached_5m_df"] = df_5m
 
     return df_5m, df_daily
 
 # ==============================================================================
-# 2. INDICATOR ENGINE (PINE RMA ATR & CALIBRATED REGIME ATR)
+# 2. PINE SCRIPT EXACT INDICATOR ENGINE (WILDER RMA ATR & VWAP)
 # ==============================================================================
 def pine_rma(series, length):
     alpha = 1.0 / length
     return series.ewm(alpha=alpha, min_periods=length, adjust=False).mean()
 
-def prepare_indicators(df_5m, df_daily, atr_calibration_mode, manual_regime_atr):
+def prepare_indicators(df_5m, df_daily):
     df = df_5m.copy()
     df["datetime"] = pd.to_datetime(df["datetime"])
     df["date"] = df["datetime"].dt.date
     df["hour"] = df["datetime"].dt.hour
     df["minute"] = df["datetime"].dt.minute
 
-    # 5m ATR (14) via Wilder's RMA
+    # Calculate True Daily ATR(10) lagged by 1 bar strictly on closed daily candles
+    if df_daily is not None and not df_daily.empty:
+        d = df_daily.copy()
+        d_prev = d["d_close"].shift(1)
+        d_tr = pd.concat([
+            d["d_high"] - d["d_low"],
+            (d["d_high"] - d_prev).abs(),
+            (d["d_low"] - d_prev).abs()
+        ], axis=1).max(axis=1)
+        # request.security(..., "D", ta.atr(10)[1])
+        d["daily_atr10"] = pine_rma(d_tr, 10).shift(1)
+        df = df.merge(d[["date", "daily_atr10"]], on="date", how="left")
+        df["daily_atr10"] = df["daily_atr10"].ffill().bfill()
+    else:
+        # Fallback safeguard
+        df["daily_atr10"] = 292.8
+
+    # 5m ATR (14) via Wilder RMA
     prev_c = df["close"].shift(1)
     tr = pd.concat([
         df["high"] - df["low"],
@@ -176,7 +197,7 @@ def prepare_indicators(df_5m, df_daily, atr_calibration_mode, manual_regime_atr)
     df["tr"] = tr
     df["atr14"] = pine_rma(df["tr"], 14).fillna(df["high"] - df["low"])
 
-    # Session VWAP
+    # VWAP (resets every session)
     df["hlc3"] = (df["high"] + df["low"] + df["close"]) / 3.0
     df["vol_weight"] = np.where(df["vol"] > 0, df["vol"], (df["high"] - df["low"]) * 1000.0 + 10.0)
     df["pv"] = df["hlc3"] * df["vol_weight"]
@@ -184,28 +205,10 @@ def prepare_indicators(df_5m, df_daily, atr_calibration_mode, manual_regime_atr)
     df["cum_pv"] = df.groupby("date")["pv"].cumsum()
     df["vwap"] = (df["cum_pv"] / df["cum_vol"]).round(2)
 
-    # Daily 10-ATR Calibration
-    if atr_calibration_mode == "Direct Baseline (292.8 - Matches TradingView)":
-        df["daily_atr10"] = manual_regime_atr
-    else:
-        if df_daily is not None and not df_daily.empty:
-            d = df_daily.copy()
-            d_prev = d["d_close"].shift(1)
-            d_tr = pd.concat([
-                d["d_high"] - d["d_low"],
-                (d["d_high"] - d_prev).abs(),
-                (d["d_low"] - d_prev).abs()
-            ], axis=1).max(axis=1)
-            d["daily_atr10"] = pine_rma(d_tr, 10).shift(1)
-            df = df.merge(d[["date", "daily_atr10"]], on="date", how="left")
-            df["daily_atr10"] = df["daily_atr10"].ffill().bfill().fillna(manual_regime_atr)
-        else:
-            df["daily_atr10"] = manual_regime_atr
-
     return df
 
 # ==============================================================================
-# 3. TRADING SIMULATION ENGINE (EXACT PINE SCRIPT REPLICATION)
+# 3. TRADING ENGINE (MATCHES TRADINGVIEW ON-CLOSE EXECUTION)
 # ==============================================================================
 def run_backtest_simulation(df, p, start_date, end_date):
     trades = []
@@ -217,7 +220,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
         if len(day_bars) < 6:
             continue
 
-        # 09:15 - 09:30 ORB (Strictly first 3 bars)
+        # 09:15 - 09:30 ORB (First 3 bars: 09:15, 09:20, 09:25)
         orb_bars = day_bars.iloc[0:3]
         orb_h = orb_bars["high"].max()
         orb_l = orb_bars["low"].min()
@@ -233,6 +236,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
         active_trade = None
         trades_today = 0
 
+        # Scan intraday candles from 09:30 onwards (index 3+)
         for i in range(3, len(day_bars)):
             bar = day_bars.iloc[i]
             h_val = bar["hour"]
@@ -256,7 +260,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                 exit_price = 0.0
                 exit_reason = ""
 
-                # Target Exit
+                # Target Hit
                 if is_ce and h >= target_p:
                     exit_triggered = True
                     exit_price = target_p
@@ -266,7 +270,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                     exit_price = target_p
                     exit_reason = "TARGET HIT"
 
-                # Stop Loss Exit
+                # Stop Loss Hit
                 if not exit_triggered:
                     if is_ce and l <= cur_sl:
                         exit_triggered = True
@@ -277,7 +281,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                         exit_price = cur_sl
                         exit_reason = "STOP LOSS HIT"
 
-                # 15:15 EOD Exit
+                # 15:15 EOD Mandatory Exit
                 if not exit_triggered and (h_val > 15 or (h_val == 15 and m_val >= 15)):
                     exit_triggered = True
                     exit_price = c
@@ -295,7 +299,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                     trades_today += 1
                     break
 
-                # Dynamic Trailing SL
+                # Trailing Ratchet for Runners
                 if mode == "BREAKOUT":
                     if is_ce:
                         active_trade["peak"] = max(active_trade["peak"], h)
@@ -319,7 +323,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                             active_trade["current_sl"] = min(active_trade["current_sl"], min(fib_sl, min(min_sl, bar_sl)))
                 continue
 
-            # Trade Evaluation (09:30 to 10:00 Window)
+            # Trade Entry Window (09:30 to 10:00)
             in_window = (h_val == 9 and m_val >= 30) or (h_val == 10 and m_val == 0)
 
             if in_window and trades_today == 0:
@@ -384,6 +388,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                     tg_val = round(c + (atr * p["fade_ce_tg_atr"]), 1)
 
                 if trade_type is not None:
+                    # Executes on bar close matching process_orders_on_close = true
                     active_trade = {
                         "date": d,
                         "entry_time": bar["datetime"],
@@ -401,19 +406,12 @@ def run_backtest_simulation(df, p, start_date, end_date):
     return pd.DataFrame(trades)
 
 # ==============================================================================
-# 4. STREAMLIT UI: FULL CONTROL OVER ATR, SL, AND TARGETS
+# 4. STREAMLIT DASHBOARD & FULL PARAMETER OPTIMIZER
 # ==============================================================================
 st.sidebar.title("Backtest Configuration")
 force_reload = st.sidebar.button("Force Refresh & Re-download Data", type="primary")
 
 exec_mode = st.sidebar.radio("Execution Mode", ["Manual Input Backtest", "Automated Grid Optimizer"])
-
-st.sidebar.subheader("ATR & Regime Calibration")
-atr_mode = st.sidebar.selectbox("Regime ATR Source", [
-    "Direct Baseline (292.8 - Matches TradingView)",
-    "Calculate dynamically from Daily Bars"
-])
-manual_atr = st.sidebar.number_input("Baseline Daily ATR Value", value=292.8, step=5.0)
 
 st.sidebar.subheader("Date Horizon")
 col_s1, col_s2, col_s3 = st.sidebar.columns(3)
@@ -456,7 +454,7 @@ if df_5m is None or df_5m.empty:
     st.info("Awaiting historical data. Provide Angel One API credentials in Render Environment Variables or verify cache.")
     st.stop()
 
-df_prepared = prepare_indicators(df_5m, df_daily, atr_mode, manual_atr)
+df_prepared = prepare_indicators(df_5m, df_daily)
 st.success(f"Ready: Loaded {len(df_prepared):,} bars across {df_prepared['date'].nunique()} trading sessions.")
 
 sim_params = {
@@ -529,8 +527,8 @@ if exec_mode == "Manual Input Backtest":
     st.dataframe(df_trades[["entry_time", "type", "mode", "entry", "init_sl", "exit_price", "exit_time", "exit_reason", "pts", "pnl"]].head(15), use_container_width=True)
 
 else:
-    st.subheader("Comprehensive Multi-Parameter Grid Search")
-    st.write("Simulates combinations across Stop Losses AND Targets to show optimal values.")
+    st.subheader("Master Multi-Parameter Optimizer")
+    st.write("Simulates combinations across Stop Losses AND Targets to extract optimal values.")
 
     opt_focus = st.selectbox("Select Optimization Scope", [
         "Master (CE & PE: Both SL and Targets)",
@@ -570,14 +568,14 @@ else:
                                 wr = (len(tdf[tdf["pnl"] > 0]) / len(tdf)) * 100
 
                                 results.append({
-                                    "BO CE SL": c_sl,
-                                    "BO PE SL": p_sl,
-                                    "Fade CE SL": p_copy["fade_ce_sl_pts"],
-                                    "Fade PE SL": p_copy["fade_pe_sl_pts"],
-                                    "BO CE Target": ct,
-                                    "BO PE Target": pt,
-                                    "Fade CE Target": p_copy["fade_ce_tg_atr"],
-                                    "Fade PE Target": p_copy["fade_pe_tg_atr"],
+                                    "BO CE SL (Pts)": c_sl,
+                                    "BO PE SL (Pts)": p_sl,
+                                    "Fade CE SL (Pts)": p_copy["fade_ce_sl_pts"],
+                                    "Fade PE SL (Pts)": p_copy["fade_pe_sl_pts"],
+                                    "BO CE Target (ATR)": ct,
+                                    "BO PE Target (ATR)": pt,
+                                    "Fade CE Target (ATR)": p_copy["fade_ce_tg_atr"],
+                                    "Fade PE Target (ATR)": p_copy["fade_pe_tg_atr"],
                                     "Profit Factor": round(pf, 2),
                                     "Win Rate (%)": round(wr, 1),
                                     "Total Trades": len(tdf),
@@ -616,14 +614,14 @@ else:
                                 wr = (len(tdf[tdf["pnl"] > 0]) / len(tdf)) * 100
 
                                 results.append({
-                                    "BO CE SL": p_copy["bo_ce_sl_pts"],
-                                    "BO PE SL": p_copy["bo_pe_sl_pts"],
-                                    "Fade CE SL": fcs,
-                                    "Fade PE SL": fps,
-                                    "BO CE Target": p_copy["bo_ce_tg_atr"],
-                                    "BO PE Target": p_copy["bo_pe_tg_atr"],
-                                    "Fade CE Target": fct,
-                                    "Fade PE Target": fpt,
+                                    "BO CE SL (Pts)": p_copy["bo_ce_sl_pts"],
+                                    "BO PE SL (Pts)": p_copy["bo_pe_sl_pts"],
+                                    "Fade CE SL (Pts)": fcs,
+                                    "Fade PE SL (Pts)": fps,
+                                    "BO CE Target (ATR)": p_copy["bo_ce_tg_atr"],
+                                    "BO PE Target (ATR)": p_copy["bo_pe_tg_atr"],
+                                    "Fade CE Target (ATR)": fct,
+                                    "Fade PE Target (ATR)": fpt,
                                     "Profit Factor": round(pf, 2),
                                     "Win Rate (%)": round(wr, 1),
                                     "Total Trades": len(tdf),
@@ -656,14 +654,14 @@ else:
                         wr = (len(tdf[tdf["pnl"] > 0]) / len(tdf)) * 100
 
                         results.append({
-                            "BO CE SL": p_copy["bo_ce_sl_pts"],
-                            "BO PE SL": p_copy["bo_pe_sl_pts"],
-                            "Fade CE SL": p_copy["fade_ce_sl_pts"],
-                            "Fade PE SL": p_copy["fade_pe_sl_pts"],
-                            "BO CE Target": ct,
-                            "BO PE Target": pt,
-                            "Fade CE Target": p_copy["fade_ce_tg_atr"],
-                            "Fade PE Target": p_copy["fade_pe_tg_atr"],
+                            "BO CE SL (Pts)": p_copy["bo_ce_sl_pts"],
+                            "BO PE SL (Pts)": p_copy["bo_pe_sl_pts"],
+                            "Fade CE SL (Pts)": p_copy["fade_ce_sl_pts"],
+                            "Fade PE SL (Pts)": p_copy["fade_pe_sl_pts"],
+                            "BO CE Target (ATR)": ct,
+                            "BO PE Target (ATR)": pt,
+                            "Fade CE Target (ATR)": p_copy["fade_ce_tg_atr"],
+                            "Fade PE Target (ATR)": p_copy["fade_pe_tg_atr"],
                             "Profit Factor": round(pf, 2),
                             "Win Rate (%)": round(wr, 1),
                             "Total Trades": len(tdf),
