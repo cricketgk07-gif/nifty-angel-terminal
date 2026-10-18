@@ -19,13 +19,12 @@ except ImportError:
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 INDEX_TOKEN = "99926000"
-DATA_CACHE_FILE = "nifty_5m_cache_v10.parquet"
-DAILY_CACHE_FILE = "nifty_daily_cache_v10.parquet"
+DATA_CACHE_FILE = "nifty_5m_cache_v11.parquet"
 
 st.set_page_config(page_title="NIFTY ORB Institutional Backtest Lab", layout="wide")
 
 # ==============================================================================
-# 1. EXCHANGE DATA INGESTION & LOCAL PARQUET PERSISTENCE
+# 1. EXCHANGE DATA FETCHING & 45-DAY PRE-WARMUP
 # ==============================================================================
 def get_angel_session():
     if SmartConnect is None:
@@ -46,36 +45,9 @@ def get_angel_session():
         pass
     return None
 
-def fetch_true_daily_candles(api, start_date, end_date):
-    warmup_start = start_date - datetime.timedelta(days=180)
-    try:
-        resp = api.getCandleData({
-            "exchange": "NSE",
-            "symboltoken": INDEX_TOKEN,
-            "interval": "ONE_DAY",
-            "fromdate": warmup_start.strftime("%Y-%m-%d 09:15"),
-            "todate": end_date.strftime("%Y-%m-%d 15:30")
-        })
-        if resp and resp.get("status") and resp.get("data"):
-            rows = []
-            for b in resp["data"]:
-                dt = pd.to_datetime(b[0])
-                rows.append({
-                    "date": dt.date(),
-                    "d_open": float(b[1]),
-                    "d_high": float(b[2]),
-                    "d_low": float(b[3]),
-                    "d_close": float(b[4])
-                })
-            df_d = pd.DataFrame(rows).drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
-            df_d.to_parquet(DAILY_CACHE_FILE)
-            return df_d
-    except Exception:
-        pass
-    return pd.DataFrame()
-
 def fetch_chunked_5m_candles(api, start_date, end_date):
-    fetch_start = start_date - datetime.timedelta(days=10)
+    # Fetch 45 days earlier so Daily ATR(10) has sufficient historical days
+    fetch_start = start_date - datetime.timedelta(days=45)
     candles = []
     curr_start = fetch_start
     delta_chunk = datetime.timedelta(days=25)
@@ -121,23 +93,10 @@ def fetch_chunked_5m_candles(api, start_date, end_date):
 
 def get_complete_data(start_date, end_date, force_refresh=False):
     if force_refresh:
-        for f in [DATA_CACHE_FILE, DAILY_CACHE_FILE]:
-            if os.path.exists(f):
-                os.remove(f)
-        for k in ["cached_5m_df", "cached_daily_df"]:
-            if k in st.session_state:
-                del st.session_state[k]
-
-    df_daily = None
-    if not force_refresh and os.path.exists(DAILY_CACHE_FILE):
-        df_daily = pd.read_parquet(DAILY_CACHE_FILE)
-    elif "cached_daily_df" in st.session_state and not force_refresh:
-        df_daily = st.session_state["cached_daily_df"]
-    else:
-        api = get_angel_session()
-        if api:
-            df_daily = fetch_true_daily_candles(api, start_date, end_date)
-            st.session_state["cached_daily_df"] = df_daily
+        if os.path.exists(DATA_CACHE_FILE):
+            os.remove(DATA_CACHE_FILE)
+        if "cached_5m_df" in st.session_state:
+            del st.session_state["cached_5m_df"]
 
     df_5m = None
     if not force_refresh and os.path.exists(DATA_CACHE_FILE):
@@ -150,36 +109,43 @@ def get_complete_data(start_date, end_date, force_refresh=False):
             df_5m = fetch_chunked_5m_candles(api, start_date, end_date)
             st.session_state["cached_5m_df"] = df_5m
 
-    return df_5m, df_daily
+    return df_5m
 
 # ==============================================================================
-# 2. INDICATOR ENGINE (PINE RMA ATR & RESOLVED VWAP)
+# 2. INDICATOR ENGINE (TRUE RESAMPLED DAILY ATR & 5M ATR)
 # ==============================================================================
 def pine_rma(series, length):
     alpha = 1.0 / length
     return series.ewm(alpha=alpha, min_periods=length, adjust=False).mean()
 
-def prepare_indicators(df_5m, df_daily):
+def prepare_indicators(df_5m, override_daily_atr=None):
     df = df_5m.copy()
     df["datetime"] = pd.to_datetime(df["datetime"])
     df["date"] = df["datetime"].dt.date
     df["hour"] = df["datetime"].dt.hour
     df["minute"] = df["datetime"].dt.minute
 
-    # True Daily ATR(10) lagged by 1 bar strictly on closed daily bars
-    if df_daily is not None and not df_daily.empty:
-        d = df_daily.copy()
-        d_prev = d["d_close"].shift(1)
-        d_tr = pd.concat([
-            d["d_high"] - d["d_low"],
-            (d["d_high"] - d_prev).abs(),
-            (d["d_low"] - d_prev).abs()
-        ], axis=1).max(axis=1)
-        d["daily_atr10"] = pine_rma(d_tr, 10).shift(1)
-        df = df.merge(d[["date", "daily_atr10"]], on="date", how="left")
-        df["daily_atr10"] = df["daily_atr10"].ffill().bfill()
+    # True Daily ATR(10) computed from full warmup days
+    if override_daily_atr is not None and override_daily_atr > 0:
+        df["daily_atr10"] = override_daily_atr
     else:
-        df["daily_atr10"] = 292.8
+        # Build clean daily bars from all sessions
+        daily = df.groupby("date").agg({
+            "high": "max",
+            "low": "min",
+            "close": "last"
+        }).reset_index()
+        
+        d_prev = daily["close"].shift(1)
+        d_tr = pd.concat([
+            daily["high"] - daily["low"],
+            (daily["high"] - d_prev).abs(),
+            (daily["low"] - d_prev).abs()
+        ], axis=1).max(axis=1)
+        
+        daily["daily_atr10"] = pine_rma(d_tr, 10).shift(1)
+        df = df.merge(daily[["date", "daily_atr10"]], on="date", how="left")
+        df["daily_atr10"] = df["daily_atr10"].ffill().bfill().fillna(292.8)
 
     # 5m ATR (14) via Wilder RMA
     prev_c = df["close"].shift(1)
@@ -191,7 +157,7 @@ def prepare_indicators(df_5m, df_daily):
     df["tr"] = tr
     df["atr14"] = pine_rma(df["tr"], 14).fillna(df["high"] - df["low"])
 
-    # VWAP aligned with TradingView session calculation
+    # VWAP (resets per calendar date)
     df["hlc3"] = (df["high"] + df["low"] + df["close"]) / 3.0
     df["vol_weight"] = np.where(df["vol"] > 0, df["vol"], (df["high"] - df["low"]) * 2000.0 + 500.0)
     df["pv"] = df["hlc3"] * df["vol_weight"]
@@ -202,7 +168,7 @@ def prepare_indicators(df_5m, df_daily):
     return df
 
 # ==============================================================================
-# 3. TRADING SIMULATION ENGINE (ON-CLOSE EXECUTION & DYNAMIC TRAILING)
+# 3. TRADING SIMULATION ENGINE (ON-CLOSE STRICT EXECUTION)
 # ==============================================================================
 def run_backtest_simulation(df, p, start_date, end_date):
     trades = []
@@ -214,7 +180,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
         if len(day_bars) < 6:
             continue
 
-        # 09:15 - 09:30 ORB (Bars 0, 1, 2)
+        # 09:15 - 09:30 ORB (Bars index 0, 1, 2)
         orb_bars = day_bars.iloc[0:3]
         orb_h = orb_bars["high"].max()
         orb_l = orb_bars["low"].min()
@@ -230,7 +196,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
         active_trade = None
         trades_today = 0
 
-        # Scan intraday bars starting from index 3 (09:30 candle)
+        # Scan intraday bars from index 3 (09:30 candle)
         for i in range(3, len(day_bars)):
             bar = day_bars.iloc[i]
             h_val = bar["hour"]
@@ -275,7 +241,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                         exit_price = cur_sl
                         exit_reason = "STOP LOSS HIT"
 
-                # 15:15 EOD Square-Off
+                # 15:15 EOD Exit
                 if not exit_triggered and (h_val > 15 or (h_val == 15 and m_val >= 15)):
                     exit_triggered = True
                     exit_price = c
@@ -317,7 +283,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                             active_trade["current_sl"] = min(active_trade["current_sl"], min(fib_sl, min(min_sl, bar_sl)))
                 continue
 
-            # Trade Evaluation Window (09:30 to 10:00 IST strictly)
+            # Trade Entry Window: 09:30 to 10:00 IST
             in_window = (h_val == 9 and m_val >= 30) or (h_val == 10 and m_val == 0)
 
             if in_window and trades_today == 0:
@@ -334,12 +300,10 @@ def run_backtest_simulation(df, p, start_date, end_date):
                 fire_ce_fade = False
 
                 if is_high_vol:
-                    vwap_ce_ok = (c > vw) or (i == 3 and c > orb_h)
-                    vwap_pe_ok = (c < vw) or (i == 3 and c < orb_l)
-
-                    if c > orb_h and vwap_ce_ok and c > o:
+                    # In Pine Script, bar 09:30 triggers when close breaches ORB low
+                    if c > orb_h and (c > vw or i == 3) and c > o:
                         fire_ce_bo = True
-                    elif c < orb_l and vwap_pe_ok and c < o:
+                    elif c < orb_l and (c < vw or i == 3) and c < o:
                         fire_pe_bo = True
                 elif p["enable_fade"]:
                     shallow_h = (max_high_outside - orb_h) <= (p["max_breach_mult"] * atr)
@@ -391,6 +355,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                         "type": trade_type,
                         "mode": mode,
                         "entry": c,
+                        "daily_atr": round(d_atr, 1),
                         "init_sl": sl_val,
                         "current_sl": sl_val,
                         "target_p": tg_val,
@@ -402,12 +367,19 @@ def run_backtest_simulation(df, p, start_date, end_date):
     return pd.DataFrame(trades)
 
 # ==============================================================================
-# 4. STREAMLIT UI & MULTI-PARAMETER OPTIMIZER
+# 4. STREAMLIT UI & CALIBRATION CONTROLS
 # ==============================================================================
 st.sidebar.title("Backtest Configuration")
 force_reload = st.sidebar.button("Force Refresh & Re-download Data", type="primary")
 
 exec_mode = st.sidebar.radio("Execution Mode", ["Manual Input Backtest", "Automated Grid Optimizer"])
+
+st.sidebar.subheader("Regime ATR Calibration")
+atr_override_opt = st.sidebar.selectbox("Regime ATR Source", [
+    "Lock to TradingView Baseline (292.8)",
+    "Calculate dynamically from 45-Day Warmup"
+])
+override_val = 292.8 if "Lock to TradingView Baseline" in atr_override_opt else None
 
 st.sidebar.subheader("Date Horizon")
 col_s1, col_s2, col_s3 = st.sidebar.columns(3)
@@ -444,13 +416,13 @@ fade_ce_tg_atr = st.sidebar.number_input("Fade CE Target: ATR Multiplier", value
 
 st.title("NIFTY Dual-Regime Master: Institutional Backtest Lab")
 
-df_5m, df_daily = get_complete_data(d_start, d_end, force_refresh=force_reload)
+df_5m = get_complete_data(d_start, d_end, force_refresh=force_reload)
 
 if df_5m is None or df_5m.empty:
     st.info("Awaiting historical data. Provide Angel One API credentials in Render Environment Variables or verify cache.")
     st.stop()
 
-df_prepared = prepare_indicators(df_5m, df_daily)
+df_prepared = prepare_indicators(df_5m, override_daily_atr=override_val)
 st.success(f"Ready: Loaded {len(df_prepared):,} bars across {df_prepared['date'].nunique()} trading sessions.")
 
 sim_params = {
@@ -520,7 +492,7 @@ if exec_mode == "Manual Input Backtest":
     st.plotly_chart(fig_equity, use_container_width=True)
 
     st.subheader("Historical Trade Ledger (First 15 Trades)")
-    st.dataframe(df_trades[["entry_time", "type", "mode", "entry", "init_sl", "exit_price", "exit_time", "exit_reason", "pts", "pnl"]].head(15), use_container_width=True)
+    st.dataframe(df_trades[["entry_time", "type", "mode", "daily_atr", "entry", "init_sl", "exit_price", "exit_time", "exit_reason", "pts", "pnl"]].head(15), use_container_width=True)
 
 else:
     st.subheader("Master Multi-Parameter Optimizer")
