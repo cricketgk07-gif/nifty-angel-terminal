@@ -19,12 +19,12 @@ except ImportError:
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 INDEX_TOKEN = "99926000"
-DATA_CACHE_FILE = "nifty_5m_cache_v17.parquet"
+DATA_CACHE_FILE = "nifty_5m_cache_v18.parquet"
 
 st.set_page_config(page_title="NIFTY ORB Institutional Backtest Lab", layout="wide")
 
 # ==============================================================================
-# 1. ANGEL ONE DATA FETCHING WITH 180-DAY PRE-WARMUP
+# 1. ANGEL ONE DATA FETCHING & 180-DAY PRE-WARMUP
 # ==============================================================================
 def get_angel_session():
     if SmartConnect is None:
@@ -166,7 +166,7 @@ def prepare_indicators(df_5m):
     return df
 
 # ==============================================================================
-# 3. POSITION & TRAILING ENGINE (EXACT MATCH WITH PINE SCRIPT)
+# 3. POSITION & TRAILING ENGINE (EXACT PINE SCRIPT LOGIC)
 # ==============================================================================
 def run_backtest_simulation(df, p, start_date, end_date):
     trades = []
@@ -228,7 +228,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                         exit_price = target_p
                         exit_reason = "TARGET HIT"
 
-                # STOP LOSS EXIT (BREAKOUT and FADE)
+                # STOP LOSS EXIT (Applies to both BREAKOUT and FADE)
                 if not exit_triggered:
                     if is_ce and l <= live_sl:
                         exit_triggered = True
