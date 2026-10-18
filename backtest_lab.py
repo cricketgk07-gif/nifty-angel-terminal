@@ -19,8 +19,8 @@ except ImportError:
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 INDEX_TOKEN = "99926000"
-DATA_CACHE_FILE = "nifty_5m_historical_v3.parquet"
-DAILY_CACHE_FILE = "nifty_daily_v3.parquet"
+DATA_CACHE_FILE = "nifty_5m_cache_v4.parquet"
+DAILY_CACHE_FILE = "nifty_daily_cache_v4.parquet"
 
 st.set_page_config(page_title="NIFTY ORB Institutional Backtest Lab", layout="wide")
 
@@ -47,7 +47,7 @@ def get_angel_session():
     return None
 
 def fetch_daily_candles(api, start_date, end_date):
-    fetch_start = start_date - datetime.timedelta(days=120)
+    fetch_start = start_date - datetime.timedelta(days=90)
     try:
         resp = api.getCandleData({
             "exchange": "NSE",
@@ -77,9 +77,9 @@ def fetch_5m_candles(api, start_date, end_date):
     fetch_start = start_date - datetime.timedelta(days=10)
     candles = []
     curr_start = fetch_start
-    delta_chunk = datetime.timedelta(days=28)
+    delta_chunk = datetime.timedelta(days=25)
 
-    prog_bar = st.progress(0, text="Fetching raw 5m historical data from Angel One...")
+    prog_bar = st.progress(0, text="Fetching raw 5m historical candles from Angel One...")
     total_days = max(1, (end_date - fetch_start).days)
 
     while curr_start < end_date:
@@ -151,7 +151,7 @@ def get_complete_data(start_date, end_date, force_refresh=False):
     return df_5m, df_daily
 
 # ==============================================================================
-# 2. INDICATOR ENGINE (PINE RMA & LAGGED DAILY ATR)
+# 2. INDICATOR ENGINE (PINE RMA ATR & DAILY 10-ATR)
 # ==============================================================================
 def pine_rma(series, length):
     alpha = 1.0 / length
@@ -162,7 +162,7 @@ def prepare_indicators(df_5m, df_daily):
     df["date"] = df["datetime"].dt.date
     df["time"] = df["datetime"].dt.time
 
-    # 5m ATR (14) via Wilder's RMA
+    # 5m ATR (14) using Wilder's RMA
     prev_c = df["close"].shift(1)
     tr = pd.concat([
         df["high"] - df["low"],
@@ -172,7 +172,7 @@ def prepare_indicators(df_5m, df_daily):
     df["tr"] = tr
     df["atr14"] = pine_rma(df["tr"], 14).fillna(df["high"] - df["low"])
 
-    # Session VWAP
+    # VWAP (resets daily)
     df["hlc3"] = (df["high"] + df["low"] + df["close"]) / 3.0
     spread = (df["high"] - df["low"]) + (df["close"] - df["open"]).abs()
     df["vol_weight"] = np.where(df["vol"] > 0, df["vol"], spread * 1000.0 + 100.0)
@@ -181,7 +181,7 @@ def prepare_indicators(df_5m, df_daily):
     df["cum_pv"] = df.groupby("date")["pv"].cumsum()
     df["vwap"] = (df["cum_pv"] / df["cum_vol"]).round(2)
 
-    # True Daily ATR(10) Lagged by 1 Day (Matches Pine's request.security(..., "D", atr(10)[1]))
+    # Daily 10-ATR (shift 1 to match Pine's request.security(..., "D", atr(10)[1]))
     if df_daily is not None and not df_daily.empty:
         d = df_daily.copy()
         d_prev = d["d_close"].shift(1)
@@ -192,7 +192,7 @@ def prepare_indicators(df_5m, df_daily):
         ], axis=1).max(axis=1)
         d["daily_atr10"] = pine_rma(d_tr, 10).shift(1)
         df = df.merge(d[["date", "daily_atr10"]], on="date", how="left")
-        df["daily_atr10"] = df["daily_atr10"].ffill().bfill()
+        df["daily_atr10"] = df["daily_atr10"].ffill().bfill().fillna(292.8)
     else:
         d = df.groupby("date").agg({"high": "max", "low": "min", "close": "last"}).reset_index()
         d_prev = d["close"].shift(1)
@@ -203,16 +203,18 @@ def prepare_indicators(df_5m, df_daily):
         ], axis=1).max(axis=1)
         d["daily_atr10"] = pine_rma(d_tr, 10).shift(1)
         df = df.merge(d[["date", "daily_atr10"]], on="date", how="left")
-        df["daily_atr10"] = df["daily_atr10"].ffill().bfill()
+        df["daily_atr10"] = df["daily_atr10"].ffill().bfill().fillna(292.8)
 
     return df
 
 # ==============================================================================
-# 3. STRATEGY ENGINE WITH NEXT-BAR EXECUTION & RUNNER RATCHET
+# 3. TRADING SIMULATION ENGINE (EXACT MATCH WITH TRADINGVIEW PROCESS_ORDERS_ON_CLOSE)
 # ==============================================================================
 def run_backtest_simulation(df, p, start_date, end_date):
     trades = []
-    eval_dates = [d for d in df["date"].unique() if start_date <= d <= end_date]
+    # Filter dates
+    all_dates = sorted(df["date"].unique())
+    eval_dates = [d for d in all_dates if d >= start_date and d <= end_date]
 
     for d in eval_dates:
         day_bars = df[df["date"] == d].copy().reset_index(drop=True)
@@ -236,7 +238,6 @@ def run_backtest_simulation(df, p, start_date, end_date):
         pierced_l = False
 
         active_trade = None
-        pending_signal = None
         trades_today = 0
 
         for i in range(len(day_bars)):
@@ -249,25 +250,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
             vw = bar["vwap"]
             atr = bar["atr14"]
 
-            # Execute pending order on the open of the following bar (matches Pine's process_orders_on_close)
-            if pending_signal is not None and active_trade is None and trades_today == 0:
-                active_trade = pending_signal.copy()
-                active_trade["entry"] = o
-                active_trade["entry_time"] = bar["datetime"]
-                active_trade["peak"] = o
-                if active_trade["mode"] == "BREAKOUT":
-                    if active_trade["type"] == "CE":
-                        active_trade["target_p"] = round(o + active_trade["bank_dist"], 1)
-                    else:
-                        active_trade["target_p"] = round(o - active_trade["bank_dist"], 1)
-                elif active_trade["mode"] == "FADE":
-                    if active_trade["type"] == "PE":
-                        active_trade["target_p"] = round(o - (atr * p["fade_pe_tg_atr"]), 1)
-                    else:
-                        active_trade["target_p"] = round(o + (atr * p["fade_ce_tg_atr"]), 1)
-                pending_signal = None
-
-            # Intra-bar stop loss, target, and trailing management
+            # Manage Active Trade
             if active_trade is not None:
                 is_ce = (active_trade["type"] == "CE")
                 cur_sl = active_trade["current_sl"]
@@ -279,7 +262,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                 exit_price = 0.0
                 exit_reason = ""
 
-                # Target Check
+                # Target Exit
                 if is_ce and h >= target_p:
                     exit_triggered = True
                     exit_price = target_p
@@ -289,7 +272,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                     exit_price = target_p
                     exit_reason = "TARGET HIT"
 
-                # Stop Loss Check
+                # Stop Loss Exit
                 if not exit_triggered:
                     if is_ce and l <= cur_sl:
                         exit_triggered = True
@@ -318,7 +301,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                     trades_today += 1
                     break
 
-                # Dynamic Trailing SL for Breakout Runners
+                # Dynamic Trailing SL
                 if mode == "BREAKOUT":
                     if is_ce:
                         active_trade["peak"] = max(active_trade["peak"], h)
@@ -343,7 +326,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                 continue
 
             # Trade Evaluation (09:30 to 10:00 Window)
-            if datetime.time(9, 30) <= b_time < datetime.time(10, 0) and trades_today == 0 and pending_signal is None:
+            if datetime.time(9, 30) <= b_time < datetime.time(10, 0) and trades_today == 0:
                 if h > orb_h:
                     pierced_h = True
                     max_high_outside = max(max_high_outside, h)
@@ -375,6 +358,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                 mode = ""
                 sl_val = 0.0
                 bank_d = 0.0
+                tg_val = 0.0
 
                 if fire_ce_bo:
                     trade_type = "CE"
@@ -382,38 +366,47 @@ def run_backtest_simulation(df, p, start_date, end_date):
                     buf = p["bo_ce_sl_pts"] if p["sl_mode"] == "Fixed Points" else (p["bo_ce_sl_atr"] * atr)
                     sl_val = round(l - buf, 1)
                     bank_d = atr * p["bo_ce_tg_atr"]
+                    tg_val = round(c + bank_d, 1)
                 elif fire_pe_bo:
                     trade_type = "PE"
                     mode = "BREAKOUT"
                     buf = p["bo_pe_sl_pts"] if p["sl_mode"] == "Fixed Points" else (p["bo_pe_sl_atr"] * atr)
                     sl_val = round(h + buf, 1)
                     bank_d = atr * p["bo_pe_tg_atr"]
+                    tg_val = round(c - bank_d, 1)
                 elif fire_pe_fade:
                     trade_type = "PE"
                     mode = "FADE"
                     buf = p["fade_pe_sl_pts"] if p["sl_mode"] == "Fixed Points" else (p["fade_pe_sl_atr"] * atr)
                     sl_val = round(max_high_outside + buf, 1)
+                    tg_val = round(c - (atr * p["fade_pe_tg_atr"]), 1)
                 elif fire_ce_fade:
                     trade_type = "CE"
                     mode = "FADE"
                     buf = p["fade_ce_sl_pts"] if p["sl_mode"] == "Fixed Points" else (p["fade_ce_sl_atr"] * atr)
                     sl_val = round(min_low_outside - buf, 1)
+                    tg_val = round(c + (atr * p["fade_ce_tg_atr"]), 1)
 
                 if trade_type is not None:
-                    pending_signal = {
+                    # Executes on Close price of the trigger bar (matching Pine's process_orders_on_close=true)
+                    active_trade = {
                         "date": d,
+                        "entry_time": bar["datetime"],
                         "type": trade_type,
                         "mode": mode,
+                        "entry": c,
                         "init_sl": sl_val,
                         "current_sl": sl_val,
+                        "target_p": tg_val,
                         "bank_dist": bank_d,
-                        "banked": False
+                        "banked": False,
+                        "peak": c
                     }
 
     return pd.DataFrame(trades)
 
 # ==============================================================================
-# 4. FULL CONTROL UI: ALL SL & TARGET SETTINGS
+# 4. STREAMLIT UI: FULL CONTROL OVER ALL PARAMETERS
 # ==============================================================================
 st.sidebar.title("Backtest Configuration")
 force_reload = st.sidebar.button("Force Refresh & Re-download Data", type="primary")
@@ -421,16 +414,18 @@ force_reload = st.sidebar.button("Force Refresh & Re-download Data", type="prima
 exec_mode = st.sidebar.radio("Execution Mode", ["Manual Input Backtest", "Automated Grid Optimizer"])
 
 st.sidebar.subheader("Date Horizon")
-col_s1, col_s2 = st.sidebar.columns(2)
+col_s1, col_s2, col_s3 = st.sidebar.columns(3)
 start_year = col_s1.selectbox("Start Year", list(range(2015, 2027)), index=11)
 start_month = col_s2.selectbox("Start Month", list(range(1, 13)), index=6)
+start_day = col_s3.selectbox("Start Day", list(range(1, 32)), index=5) # 6th
 
-col_e1, col_e2 = st.sidebar.columns(2)
+col_e1, col_e2, col_e3 = st.sidebar.columns(3)
 end_year = col_e1.selectbox("End Year", list(range(2015, 2027)), index=11)
 end_month = col_e2.selectbox("End Month", list(range(1, 13)), index=9)
+end_day = col_e3.selectbox("End Day", list(range(1, 32)), index=17) # 18th
 
-d_start = datetime.date(start_year, start_month, 6)
-d_end = datetime.date(end_year, end_month, 18)
+d_start = datetime.date(start_year, start_month, start_day)
+d_end = datetime.date(end_year, end_month, end_day)
 
 st.sidebar.subheader("Macro Strategy Parameters")
 vol_threshold = st.sidebar.number_input("Macro Regime Threshold (Daily 10-ATR)", value=229.0, step=5.0)
@@ -528,8 +523,8 @@ if exec_mode == "Manual Input Backtest":
     )
     st.plotly_chart(fig_equity, use_container_width=True)
 
-    st.subheader("Historical Trade Ledger")
-    st.dataframe(df_trades[["entry_time", "type", "mode", "entry", "init_sl", "exit_price", "exit_time", "exit_reason", "pts", "pnl"]], use_container_width=True)
+    st.subheader("Historical Trade Ledger (First 10 Trades)")
+    st.dataframe(df_trades[["entry_time", "type", "mode", "entry", "init_sl", "exit_price", "exit_time", "exit_reason", "pts", "pnl"]].head(10), use_container_width=True)
 
 else:
     st.subheader("Comprehensive Multi-Parameter Grid Search")
