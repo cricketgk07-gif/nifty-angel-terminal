@@ -19,12 +19,12 @@ except ImportError:
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 INDEX_TOKEN = "99926000"
-DATA_CACHE_FILE = "nifty_5m_cache_v14.parquet"
+DATA_CACHE_FILE = "nifty_5m_cache_v15.parquet"
 
 st.set_page_config(page_title="NIFTY ORB Institutional Backtest Lab", layout="wide")
 
 # ==============================================================================
-# 1. ANGEL ONE DATA FETCHING & 180-DAY HISTORICAL WARMUP
+# 1. ANGEL ONE DATA FETCHING & 180-DAY PRE-WARMUP
 # ==============================================================================
 def get_angel_session():
     if SmartConnect is None:
@@ -51,7 +51,7 @@ def fetch_chunked_5m_candles(api, start_date, end_date):
     curr_start = fetch_start
     delta_chunk = datetime.timedelta(days=25)
 
-    prog_bar = st.progress(0, text="Downloading historical 5m candles with 180-day RMA warmup...")
+    prog_bar = st.progress(0, text="Fetching raw 5m historical candles from Angel One...")
     total_days = max(1, (end_date - fetch_start).days)
 
     while curr_start < end_date:
@@ -111,20 +111,20 @@ def get_complete_data(start_date, end_date, force_refresh=False):
     return df_5m
 
 # ==============================================================================
-# 2. PINE SCRIPT MATH ENGINE (Wilder RMA ATR & Session VWAP)
+# 2. EXACT PINE SCRIPT MATH ENGINE (RMA ATR & VWAP)
 # ==============================================================================
 def pine_rma(series, length):
     alpha = 1.0 / length
     return series.ewm(alpha=alpha, min_periods=length, adjust=False).mean()
 
-def prepare_indicators(df_5m, regime_calibration):
+def prepare_indicators(df_5m):
     df = df_5m.copy()
     df["datetime"] = pd.to_datetime(df["datetime"])
     df["date"] = df["datetime"].dt.date
     df["hour"] = df["datetime"].dt.hour
     df["minute"] = df["datetime"].dt.minute
 
-    # True Daily ATR(10) computed across full historical trading days
+    # 1. True Daily 10-ATR Lagged by 1 Day: request.security(..., "D", ta.atr(10)[1])
     daily = df.groupby("date").agg({
         "high": "max",
         "low": "min",
@@ -139,15 +139,10 @@ def prepare_indicators(df_5m, regime_calibration):
     ], axis=1).max(axis=1)
 
     daily["daily_atr10"] = pine_rma(d_tr, 10).shift(1)
-    
-    # Scale adjustment factor to reconcile spot index settlements
-    if regime_calibration > 0:
-        daily["daily_atr10"] = daily["daily_atr10"] * regime_calibration
-
     df = df.merge(daily[["date", "daily_atr10"]], on="date", how="left")
     df["daily_atr10"] = df["daily_atr10"].ffill().bfill()
 
-    # 5m ATR (14): ta.atr(trailAtrLen)
+    # 2. 5m ATR (14): ta.atr(trailAtrLen)
     prev_c = df["close"].shift(1)
     tr = pd.concat([
         df["high"] - df["low"],
@@ -157,7 +152,7 @@ def prepare_indicators(df_5m, regime_calibration):
     df["tr"] = tr
     df["atr14"] = pine_rma(df["tr"], 14).fillna(df["high"] - df["low"])
 
-    # Session VWAP: ta.vwap(hlc3)
+    # 3. Session VWAP: ta.vwap(hlc3)
     df["hlc3"] = (df["high"] + df["low"] + df["close"]) / 3.0
     df["vol_weight"] = np.where(df["vol"] > 0, df["vol"], (df["high"] - df["low"]) * 2000.0 + 500.0)
     df["pv"] = df["hlc3"] * df["vol_weight"]
@@ -168,7 +163,7 @@ def prepare_indicators(df_5m, regime_calibration):
     return df
 
 # ==============================================================================
-# 3. STRATEGY ENGINE (EXACT MATCH WITH PINE SCRIPT)
+# 3. POSITION & TRAILING ENGINE (EXACT MATCH WITH PINE SCRIPT)
 # ==============================================================================
 def run_backtest_simulation(df, p, start_date, end_date):
     trades = []
@@ -180,7 +175,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
         if len(day_bars) < 6:
             continue
 
-        # ORB Session 09:15 - 09:30 (Bars 0, 1, 2)
+        # ORB Session 09:15 - 09:30 (First 3 bars: 09:15, 09:20, 09:25)
         orb_bars = day_bars.iloc[0:3]
         orb_h = orb_bars["high"].max()
         orb_l = orb_bars["low"].min()
@@ -219,7 +214,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                 exit_price = 0.0
                 exit_reason = ""
 
-                # FADE TRADES: Exit at Target limit
+                # FADE TRADES: Limit exit at Target
                 if mode == "FADE":
                     if is_ce and h >= target_p:
                         exit_triggered = True
@@ -283,8 +278,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                             active_trade["current_sl"] = min(active_trade["current_sl"], min(fib_tight_sl, min(min_guaranteed_sl, bar_trail_sl)))
                 continue
 
-            # --- TRADE WINDOW: 09:30 to 10:00 IST STRICTLY (09:30, 09:35, 09:40, 09:45, 09:50, 09:55) ---
-            # Any candle at 10:00 or later (including 10:15) is strictly outside the window
+            # --- STRICT TRADE WINDOW: 09:30 to 10:00 IST (Bars 09:30, 09:35, 09:40, 09:45, 09:50, 09:55) ---
             inWindow = (h_val == 9 and m_val >= 30)
 
             if inWindow and not math.isnan(orb_h):
@@ -306,14 +300,15 @@ def run_backtest_simulation(df, p, start_date, end_date):
                 buf_fade_pe = p["fade_pe_sl_pts"] if p["sl_mode"] == "Fixed Points" else (p["fade_pe_sl_atr"] * atr)
                 buf_fade_ce = p["fade_ce_sl_pts"] if p["sl_mode"] == "Fixed Points" else (p["fade_ce_sl_atr"] * atr)
 
-                # MODE A: HIGH VOLATILITY (>= 229) -> PURE MOMENTUM BREAKOUT
+                # MODE A: HIGH VOLATILITY (>= 229) -> PURE MOMENTUM BREAKOUT (Lines 76-80)
+                # STRICT MATCH: NO "or i == 3" BYPASS!
                 if is_high_vol:
-                    if c > orb_h and (c > vw or i == 3) and c > o:
+                    if c > orb_h and c > vw and c > o:
                         fireCE_breakout = True
-                    if c < orb_l and (c < vw or i == 3) and c < o:
+                    if c < orb_l and c < vw and c < o:
                         firePE_breakout = True
 
-                # MODE B: LOW VOLATILITY (< 229) -> SHADOW SWEEP FADE
+                # MODE B: LOW VOLATILITY (< 229) -> SHADOW SWEEP FADE (Lines 83-93)
                 elif p["enable_fade"]:
                     shallow_high_breach = (max_high_outside - orb_h) <= (p["max_breach_mult"] * atr)
                     shallow_low_breach = (orb_l - min_low_outside) <= (p["max_breach_mult"] * atr)
@@ -325,7 +320,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                     if pierced_orbL and shallow_low_breach and decisive_ce_close:
                         fireCE_fade = True
 
-                # EXECUTION ON BAR CLOSE
+                # EXECUTION ON BAR CLOSE (process_orders_on_close = true)
                 if fireCE_breakout:
                     b_dist = p["bo_ce_tg_pts"] if p["tg_mode"] == "Fixed Points" else (atr * p["bo_ce_tg_atr"])
                     active_trade = {
@@ -418,7 +413,6 @@ st.sidebar.subheader("Macro Strategy Parameters")
 vol_threshold = st.sidebar.number_input("Macro Regime Threshold (Daily 10-ATR)", value=229.0, step=5.0)
 enable_fade = st.sidebar.checkbox("Trade Fades when Daily ATR < 229", value=True)
 max_breach_mult = st.sidebar.number_input("Max Breach Allowance (x ATR)", value=0.5, step=0.1)
-regime_scale = st.sidebar.number_input("Regime ATR Calibration Multiplier", value=1.04, step=0.01)
 
 st.sidebar.subheader("Independent Stop Loss Settings")
 sl_mode = st.sidebar.selectbox("SL Buffer Mode", ["Fixed Points", "ATR Multiplier"], index=0)
@@ -452,7 +446,7 @@ if df_5m is None or df_5m.empty:
     st.info("Awaiting historical data. Provide Angel One API credentials in Render Environment Variables or verify cache.")
     st.stop()
 
-df_prepared = prepare_indicators(df_5m, regime_scale)
+df_prepared = prepare_indicators(df_5m)
 st.success(f"Ready: Loaded {len(df_prepared):,} bars across {df_prepared['date'].nunique()} trading sessions.")
 
 sim_params = {
