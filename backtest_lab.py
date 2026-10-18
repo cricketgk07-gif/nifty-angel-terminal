@@ -19,8 +19,8 @@ except ImportError:
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 INDEX_TOKEN = "99926000"
-DATA_CACHE_FILE = "nifty_5m_cache_v8.parquet"
-DAILY_CACHE_FILE = "nifty_daily_cache_v8.parquet"
+DATA_CACHE_FILE = "nifty_5m_cache_v9.parquet"
+DAILY_CACHE_FILE = "nifty_daily_cache_v9.parquet"
 
 st.set_page_config(page_title="NIFTY ORB Institutional Backtest Lab", layout="wide")
 
@@ -47,10 +47,6 @@ def get_angel_session():
     return None
 
 def fetch_true_daily_candles(api, start_date, end_date):
-    """
-    Fetches genuine completed daily candles with 180 days warmup
-    to guarantee that the Wilder RMA ATR(10) is fully stabilized.
-    """
     warmup_start = start_date - datetime.timedelta(days=180)
     try:
         resp = api.getCandleData({
@@ -157,7 +153,7 @@ def get_complete_data(start_date, end_date, force_refresh=False):
     return df_5m, df_daily
 
 # ==============================================================================
-# 2. INDICATOR ENGINE (PINE RMA ATR & TRADINGVIEW-SYNCHRONIZED VWAP)
+# 2. INDICATOR ENGINE (PINE RMA ATR & CALIBRATED VWAP)
 # ==============================================================================
 def pine_rma(series, length):
     alpha = 1.0 / length
@@ -195,9 +191,8 @@ def prepare_indicators(df_5m, df_daily):
     df["tr"] = tr
     df["atr14"] = pine_rma(df["tr"], 14).fillna(df["high"] - df["low"])
 
-    # VWAP aligned with TradingView (Resets daily, avoids zero-volume distortion)
+    # VWAP aligned with TradingView session calculation
     df["hlc3"] = (df["high"] + df["low"] + df["close"]) / 3.0
-    # Use realistic range-weighted tick approximation for index tokens
     eff_vol = np.where(df["vol"] > 0, df["vol"], (df["high"] - df["low"]) * 2000.0 + 500.0)
     df["pv"] = df["hlc3"] * eff_vol
     df["cum_vol"] = df.groupby("date")[eff_vol].cumsum()
@@ -339,7 +334,6 @@ def run_backtest_simulation(df, p, start_date, end_date):
                 fire_ce_fade = False
 
                 if is_high_vol:
-                    # Permissive VWAP on early bars to match TradingView tick-volume parity
                     vwap_ce_ok = (c > vw) or (i == 3 and c > orb_h)
                     vwap_pe_ok = (c < vw) or (i == 3 and c < orb_l)
 
@@ -440,7 +434,7 @@ sl_mode = st.sidebar.selectbox("SL Buffer Mode", ["Fixed Points", "ATR Multiplie
 bo_ce_sl_pts = st.sidebar.number_input("BO CE SL: Points below Low", value=5.0, step=1.0)
 bo_pe_sl_pts = st.sidebar.number_input("BO PE SL: Points above High", value=105.0, step=5.0)
 fade_pe_sl_pts = st.sidebar.number_input("Fade PE SL: Points above High", value=25.0, step=1.0)
-fade_ce_sl_pts = st.sidebar.number_input("Fade CE SL: Points below Low", value=5.0, step=1.0)
+fade_ce_sl_pts = st.sidebar.number_input("Fade CE SL: Points below Low", value=65.0, step=1.0)
 
 st.sidebar.subheader("Independent Target Settings (ATR Multipliers)")
 bo_ce_tg_atr = st.sidebar.number_input("BO CE Target: ATR Multiplier", value=3.5, step=0.1)
@@ -591,7 +585,7 @@ else:
             grid_f_pe_tg = [1.5, 1.9, 2.5]
             grid_f_ce_tg = [1.2, 1.4, 1.8]
             grid_f_pe_sl = [15.0, 25.0, 35.0]
-            grid_f_ce_sl = [5.0, 10.0]
+            grid_f_ce_sl = [40.0, 50.0, 65.0]
 
             total_sims = len(grid_f_pe_tg) * len(grid_f_ce_tg) * len(grid_f_pe_sl) * len(grid_f_ce_sl)
             prog = st.progress(0, text="Evaluating Fade SL + Target Grid...")
@@ -655,20 +649,20 @@ else:
                         net = tdf["pnl"].sum()
                         wr = (len(tdf[tdf["pnl"] > 0]) / len(tdf)) * 100
 
-                                results.append({
-                                    "BO CE SL (Pts)": p_copy["bo_ce_sl_pts"],
-                                    "BO PE SL (Pts)": p_copy["bo_pe_sl_pts"],
-                                    "Fade CE SL (Pts)": p_copy["fade_ce_sl_pts"],
-                                    "Fade PE SL (Pts)": p_copy["fade_pe_sl_pts"],
-                                    "BO CE Target (ATR)": ct,
-                                    "BO PE Target (ATR)": pt,
-                                    "Fade CE Target (ATR)": p_copy["fade_ce_tg_atr"],
-                                    "Fade PE Target (ATR)": p_copy["fade_pe_tg_atr"],
-                                    "Profit Factor": round(pf, 2),
-                                    "Win Rate (%)": round(wr, 1),
-                                    "Total Trades": len(tdf),
-                                    "Net PnL (₹)": int(net)
-                                })
+                        results.append({
+                            "BO CE SL (Pts)": p_copy["bo_ce_sl_pts"],
+                            "BO PE SL (Pts)": p_copy["bo_pe_sl_pts"],
+                            "Fade CE SL (Pts)": p_copy["fade_ce_sl_pts"],
+                            "Fade PE SL (Pts)": p_copy["fade_pe_sl_pts"],
+                            "BO CE Target (ATR)": ct,
+                            "BO PE Target (ATR)": pt,
+                            "Fade CE Target (ATR)": p_copy["fade_ce_tg_atr"],
+                            "Fade PE Target (ATR)": p_copy["fade_pe_tg_atr"],
+                            "Profit Factor": round(pf, 2),
+                            "Win Rate (%)": round(wr, 1),
+                            "Total Trades": len(tdf),
+                            "Net PnL (₹)": int(net)
+                        })
                     idx += 1
                     prog.progress(idx / total_sims)
             prog.empty()
