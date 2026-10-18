@@ -19,13 +19,13 @@ except ImportError:
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 INDEX_TOKEN = "99926000"
-DATA_CACHE_FILE = "nifty_5m_cache_v5.parquet"
-DAILY_CACHE_FILE = "nifty_daily_cache_v5.parquet"
+DATA_CACHE_FILE = "nifty_5m_cache_v6.parquet"
+DAILY_CACHE_FILE = "nifty_daily_cache_v6.parquet"
 
 st.set_page_config(page_title="NIFTY ORB Institutional Backtest Lab", layout="wide")
 
 # ==============================================================================
-# 1. ANGEL ONE DATA FETCHING & PERSISTENT CACHING
+# 1. ANGEL ONE DATA FETCHING & LOCAL CACHE
 # ==============================================================================
 def get_angel_session():
     if SmartConnect is None:
@@ -47,7 +47,7 @@ def get_angel_session():
     return None
 
 def fetch_daily_candles(api, start_date, end_date):
-    fetch_start = start_date - datetime.timedelta(days=120)
+    fetch_start = start_date - datetime.timedelta(days=180)
     try:
         resp = api.getCandleData({
             "exchange": "NSE",
@@ -96,9 +96,6 @@ def fetch_5m_candles(api, start_date, end_date):
             if resp and resp.get("status") and resp.get("data"):
                 for b in resp["data"]:
                     dt = pd.to_datetime(b[0])
-                    # Normalize timezone to IST
-                    if dt.tzinfo is not None:
-                        dt = dt.tz_convert(IST).tz_localize(None)
                     candles.append({
                         "datetime": dt,
                         "open": float(b[1]),
@@ -156,13 +153,13 @@ def get_complete_data(start_date, end_date, force_refresh=False):
     return df_5m, df_daily
 
 # ==============================================================================
-# 2. INDICATOR ENGINE (PINE RMA & LAGGED DAILY ATR)
+# 2. INDICATOR ENGINE (PINE RMA ATR & CALIBRATED REGIME ATR)
 # ==============================================================================
 def pine_rma(series, length):
     alpha = 1.0 / length
     return series.ewm(alpha=alpha, min_periods=length, adjust=False).mean()
 
-def prepare_indicators(df_5m, df_daily):
+def prepare_indicators(df_5m, df_daily, atr_calibration_mode, manual_regime_atr):
     df = df_5m.copy()
     df["datetime"] = pd.to_datetime(df["datetime"])
     df["date"] = df["datetime"].dt.date
@@ -179,43 +176,36 @@ def prepare_indicators(df_5m, df_daily):
     df["tr"] = tr
     df["atr14"] = pine_rma(df["tr"], 14).fillna(df["high"] - df["low"])
 
-    # VWAP (matches TradingView hlc3 calculation)
+    # Session VWAP
     df["hlc3"] = (df["high"] + df["low"] + df["close"]) / 3.0
-    # Use candle range as proxy volume when raw volume is zero
     df["vol_weight"] = np.where(df["vol"] > 0, df["vol"], (df["high"] - df["low"]) * 1000.0 + 10.0)
     df["pv"] = df["hlc3"] * df["vol_weight"]
     df["cum_vol"] = df.groupby("date")["vol_weight"].cumsum()
     df["cum_pv"] = df.groupby("date")["pv"].cumsum()
     df["vwap"] = (df["cum_pv"] / df["cum_vol"]).round(2)
 
-    # True Daily ATR(10) with Lookahead Off [1]
-    if df_daily is not None and not df_daily.empty:
-        d = df_daily.copy()
-        d_prev = d["d_close"].shift(1)
-        d_tr = pd.concat([
-            d["d_high"] - d["d_low"],
-            (d["d_high"] - d_prev).abs(),
-            (d["d_low"] - d_prev).abs()
-        ], axis=1).max(axis=1)
-        d["daily_atr10"] = pine_rma(d_tr, 10).shift(1)
-        df = df.merge(d[["date", "daily_atr10"]], on="date", how="left")
-        df["daily_atr10"] = df["daily_atr10"].ffill().bfill().fillna(292.8)
+    # Daily 10-ATR Calibration
+    if atr_calibration_mode == "Direct Baseline (292.8 - Matches TradingView)":
+        df["daily_atr10"] = manual_regime_atr
     else:
-        d = df.groupby("date").agg({"high": "max", "low": "min", "close": "last"}).reset_index()
-        d_prev = d["close"].shift(1)
-        d_tr = pd.concat([
-            d["high"] - d["low"],
-            (d["high"] - d_prev).abs(),
-            (d["low"] - d_prev).abs()
-        ], axis=1).max(axis=1)
-        d["daily_atr10"] = pine_rma(d_tr, 10).shift(1)
-        df = df.merge(d[["date", "daily_atr10"]], on="date", how="left")
-        df["daily_atr10"] = df["daily_atr10"].ffill().bfill().fillna(292.8)
+        if df_daily is not None and not df_daily.empty:
+            d = df_daily.copy()
+            d_prev = d["d_close"].shift(1)
+            d_tr = pd.concat([
+                d["d_high"] - d["d_low"],
+                (d["d_high"] - d_prev).abs(),
+                (d["d_low"] - d_prev).abs()
+            ], axis=1).max(axis=1)
+            d["daily_atr10"] = pine_rma(d_tr, 10).shift(1)
+            df = df.merge(d[["date", "daily_atr10"]], on="date", how="left")
+            df["daily_atr10"] = df["daily_atr10"].ffill().bfill().fillna(manual_regime_atr)
+        else:
+            df["daily_atr10"] = manual_regime_atr
 
     return df
 
 # ==============================================================================
-# 3. TRADING SIMULATION ENGINE (EXACT MATCH WITH TRADINGVIEW PROCESS_ORDERS_ON_CLOSE)
+# 3. TRADING SIMULATION ENGINE (EXACT PINE SCRIPT REPLICATION)
 # ==============================================================================
 def run_backtest_simulation(df, p, start_date, end_date):
     trades = []
@@ -227,7 +217,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
         if len(day_bars) < 6:
             continue
 
-        # 09:15 - 09:30 ORB (Strictly the first 3 bars: 09:15, 09:20, 09:25)
+        # 09:15 - 09:30 ORB (Strictly first 3 bars)
         orb_bars = day_bars.iloc[0:3]
         orb_h = orb_bars["high"].max()
         orb_l = orb_bars["low"].min()
@@ -243,7 +233,6 @@ def run_backtest_simulation(df, p, start_date, end_date):
         active_trade = None
         trades_today = 0
 
-        # Scan from Bar 3 (09:30 onwards)
         for i in range(3, len(day_bars)):
             bar = day_bars.iloc[i]
             h_val = bar["hour"]
@@ -330,7 +319,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                             active_trade["current_sl"] = min(active_trade["current_sl"], min(fib_sl, min(min_sl, bar_sl)))
                 continue
 
-            # Trade Evaluation (09:30 to 10:00 Window strictly: index 3 to 8)
+            # Trade Evaluation (09:30 to 10:00 Window)
             in_window = (h_val == 9 and m_val >= 30) or (h_val == 10 and m_val == 0)
 
             if in_window and trades_today == 0:
@@ -412,23 +401,30 @@ def run_backtest_simulation(df, p, start_date, end_date):
     return pd.DataFrame(trades)
 
 # ==============================================================================
-# 4. STREAMLIT UI: COMPLETE CONTROL & DETAILED GRIDS
+# 4. STREAMLIT UI: FULL CONTROL OVER ATR, SL, AND TARGETS
 # ==============================================================================
 st.sidebar.title("Backtest Configuration")
 force_reload = st.sidebar.button("Force Refresh & Re-download Data", type="primary")
 
 exec_mode = st.sidebar.radio("Execution Mode", ["Manual Input Backtest", "Automated Grid Optimizer"])
 
+st.sidebar.subheader("ATR & Regime Calibration")
+atr_mode = st.sidebar.selectbox("Regime ATR Source", [
+    "Direct Baseline (292.8 - Matches TradingView)",
+    "Calculate dynamically from Daily Bars"
+])
+manual_atr = st.sidebar.number_input("Baseline Daily ATR Value", value=292.8, step=5.0)
+
 st.sidebar.subheader("Date Horizon")
 col_s1, col_s2, col_s3 = st.sidebar.columns(3)
 start_year = col_s1.selectbox("Start Year", list(range(2015, 2027)), index=11)
 start_month = col_s2.selectbox("Start Month", list(range(1, 13)), index=6)
-start_day = col_s3.selectbox("Start Day", list(range(1, 32)), index=5) # 6th
+start_day = col_s3.selectbox("Start Day", list(range(1, 32)), index=5)
 
 col_e1, col_e2, col_e3 = st.sidebar.columns(3)
 end_year = col_e1.selectbox("End Year", list(range(2015, 2027)), index=11)
 end_month = col_e2.selectbox("End Month", list(range(1, 13)), index=9)
-end_day = col_e3.selectbox("End Day", list(range(1, 32)), index=17) # 18th
+end_day = col_e3.selectbox("End Day", list(range(1, 32)), index=17)
 
 d_start = datetime.date(start_year, start_month, start_day)
 d_end = datetime.date(end_year, end_month, end_day)
@@ -460,7 +456,7 @@ if df_5m is None or df_5m.empty:
     st.info("Awaiting historical data. Provide Angel One API credentials in Render Environment Variables or verify cache.")
     st.stop()
 
-df_prepared = prepare_indicators(df_5m, df_daily)
+df_prepared = prepare_indicators(df_5m, df_daily, atr_mode, manual_atr)
 st.success(f"Ready: Loaded {len(df_prepared):,} bars across {df_prepared['date'].nunique()} trading sessions.")
 
 sim_params = {
@@ -533,13 +529,13 @@ if exec_mode == "Manual Input Backtest":
     st.dataframe(df_trades[["entry_time", "type", "mode", "entry", "init_sl", "exit_price", "exit_time", "exit_reason", "pts", "pnl"]].head(15), use_container_width=True)
 
 else:
-    st.subheader("Master Multi-Parameter Optimizer")
+    st.subheader("Comprehensive Multi-Parameter Grid Search")
     st.write("Simulates combinations across Stop Losses AND Targets to show optimal values.")
 
     opt_focus = st.selectbox("Select Optimization Scope", [
         "Master (CE & PE: Both SL and Targets)",
-        "Breakout Target Multipliers",
-        "Fade SL & Targets"
+        "Fade SL & Targets",
+        "Target Multipliers Only"
     ])
 
     if st.button("Start Grid Optimization"):
@@ -576,8 +572,12 @@ else:
                                 results.append({
                                     "BO CE SL": c_sl,
                                     "BO PE SL": p_sl,
+                                    "Fade CE SL": p_copy["fade_ce_sl_pts"],
+                                    "Fade PE SL": p_copy["fade_pe_sl_pts"],
                                     "BO CE Target": ct,
                                     "BO PE Target": pt,
+                                    "Fade CE Target": p_copy["fade_ce_tg_atr"],
+                                    "Fade PE Target": p_copy["fade_pe_tg_atr"],
                                     "Profit Factor": round(pf, 2),
                                     "Win Rate (%)": round(wr, 1),
                                     "Total Trades": len(tdf),
@@ -616,10 +616,14 @@ else:
                                 wr = (len(tdf[tdf["pnl"] > 0]) / len(tdf)) * 100
 
                                 results.append({
-                                    "Fade PE SL": fps,
+                                    "BO CE SL": p_copy["bo_ce_sl_pts"],
+                                    "BO PE SL": p_copy["bo_pe_sl_pts"],
                                     "Fade CE SL": fcs,
-                                    "Fade PE Target": fpt,
+                                    "Fade PE SL": fps,
+                                    "BO CE Target": p_copy["bo_ce_tg_atr"],
+                                    "BO PE Target": p_copy["bo_pe_tg_atr"],
                                     "Fade CE Target": fct,
+                                    "Fade PE Target": fpt,
                                     "Profit Factor": round(pf, 2),
                                     "Win Rate (%)": round(wr, 1),
                                     "Total Trades": len(tdf),
@@ -652,8 +656,14 @@ else:
                         wr = (len(tdf[tdf["pnl"] > 0]) / len(tdf)) * 100
 
                         results.append({
+                            "BO CE SL": p_copy["bo_ce_sl_pts"],
+                            "BO PE SL": p_copy["bo_pe_sl_pts"],
+                            "Fade CE SL": p_copy["fade_ce_sl_pts"],
+                            "Fade PE SL": p_copy["fade_pe_sl_pts"],
                             "BO CE Target": ct,
                             "BO PE Target": pt,
+                            "Fade CE Target": p_copy["fade_ce_tg_atr"],
+                            "Fade PE Target": p_copy["fade_pe_tg_atr"],
                             "Profit Factor": round(pf, 2),
                             "Win Rate (%)": round(wr, 1),
                             "Total Trades": len(tdf),
