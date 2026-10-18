@@ -19,13 +19,13 @@ except ImportError:
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 INDEX_TOKEN = "99926000"
-DATA_CACHE_FILE = "nifty_5m_historical_cache_v2.parquet"
-DAILY_CACHE_FILE = "nifty_daily_cache_v2.parquet"
+DATA_CACHE_FILE = "nifty_5m_historical_v3.parquet"
+DAILY_CACHE_FILE = "nifty_daily_v3.parquet"
 
 st.set_page_config(page_title="NIFTY ORB Institutional Backtest Lab", layout="wide")
 
 # ==============================================================================
-# 1. AUTHENTICATION & DATA DOWNLOAD ENGINE
+# 1. ANGEL ONE DATA FETCHING & PERSISTENT CACHING
 # ==============================================================================
 def get_angel_session():
     if SmartConnect is None:
@@ -47,7 +47,7 @@ def get_angel_session():
     return None
 
 def fetch_daily_candles(api, start_date, end_date):
-    fetch_start = start_date - datetime.timedelta(days=90)
+    fetch_start = start_date - datetime.timedelta(days=120)
     try:
         resp = api.getCandleData({
             "exchange": "NSE",
@@ -57,41 +57,40 @@ def fetch_daily_candles(api, start_date, end_date):
             "todate": end_date.strftime("%Y-%m-%d 15:30")
         })
         if resp and resp.get("status") and resp.get("data"):
-            daily_rows = []
+            rows = []
             for b in resp["data"]:
-                daily_rows.append({
+                rows.append({
                     "date": pd.to_datetime(b[0]).date(),
                     "d_open": float(b[1]),
                     "d_high": float(b[2]),
                     "d_low": float(b[3]),
                     "d_close": float(b[4])
                 })
-            df_d = pd.DataFrame(daily_rows).drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+            df_d = pd.DataFrame(rows).drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
             df_d.to_parquet(DAILY_CACHE_FILE)
             return df_d
     except Exception:
         pass
     return pd.DataFrame()
 
-def fetch_chunked_5m_data(api, start_date, end_date):
+def fetch_5m_candles(api, start_date, end_date):
+    fetch_start = start_date - datetime.timedelta(days=10)
     candles = []
-    curr_start = start_date - datetime.timedelta(days=5)
+    curr_start = fetch_start
     delta_chunk = datetime.timedelta(days=28)
 
-    prog_bar = st.progress(0, text="Downloading pristine 5m Candles from Angel One...")
-    total_days = max(1, (end_date - curr_start).days)
+    prog_bar = st.progress(0, text="Fetching raw 5m historical data from Angel One...")
+    total_days = max(1, (end_date - fetch_start).days)
 
     while curr_start < end_date:
         curr_end = min(curr_start + delta_chunk, end_date)
-        from_str = curr_start.strftime("%Y-%m-%d 09:15")
-        to_str = curr_end.strftime("%Y-%m-%d 15:30")
         try:
             resp = api.getCandleData({
                 "exchange": "NSE",
                 "symboltoken": INDEX_TOKEN,
                 "interval": "FIVE_MINUTE",
-                "fromdate": from_str,
-                "todate": to_str
+                "fromdate": curr_start.strftime("%Y-%m-%d 09:15"),
+                "todate": curr_end.strftime("%Y-%m-%d 15:30")
             })
             if resp and resp.get("status") and resp.get("data"):
                 for b in resp["data"]:
@@ -105,9 +104,9 @@ def fetch_chunked_5m_data(api, start_date, end_date):
                     })
         except Exception:
             pass
-        time.sleep(0.35)
+        time.sleep(0.3)
         curr_start = curr_end + datetime.timedelta(days=1)
-        done_days = min(total_days, (curr_start - (start_date - datetime.timedelta(days=5))).days)
+        done_days = min(total_days, (curr_start - fetch_start).days)
         prog_bar.progress(min(1.0, done_days / total_days))
 
     prog_bar.empty()
@@ -120,16 +119,13 @@ def fetch_chunked_5m_data(api, start_date, end_date):
 
 def get_complete_data(start_date, end_date, force_refresh=False):
     if force_refresh:
-        if os.path.exists(DATA_CACHE_FILE):
-            os.remove(DATA_CACHE_FILE)
-        if os.path.exists(DAILY_CACHE_FILE):
-            os.remove(DAILY_CACHE_FILE)
-        if "cached_5m_df" in st.session_state:
-            del st.session_state["cached_5m_df"]
-        if "cached_daily_df" in st.session_state:
-            del st.session_state["cached_daily_df"]
+        for f in [DATA_CACHE_FILE, DAILY_CACHE_FILE]:
+            if os.path.exists(f):
+                os.remove(f)
+        for k in ["cached_5m_df", "cached_daily_df"]:
+            if k in st.session_state:
+                del st.session_state[k]
 
-    # 1. Fetch or Load Daily Candles
     df_daily = None
     if not force_refresh and os.path.exists(DAILY_CACHE_FILE):
         df_daily = pd.read_parquet(DAILY_CACHE_FILE)
@@ -141,7 +137,6 @@ def get_complete_data(start_date, end_date, force_refresh=False):
             df_daily = fetch_daily_candles(api, start_date, end_date)
             st.session_state["cached_daily_df"] = df_daily
 
-    # 2. Fetch or Load 5m Candles
     df_5m = None
     if not force_refresh and os.path.exists(DATA_CACHE_FILE):
         df_5m = pd.read_parquet(DATA_CACHE_FILE)
@@ -150,13 +145,13 @@ def get_complete_data(start_date, end_date, force_refresh=False):
     else:
         api = get_angel_session()
         if api:
-            df_5m = fetch_chunked_5m_data(api, start_date, end_date)
+            df_5m = fetch_5m_candles(api, start_date, end_date)
             st.session_state["cached_5m_df"] = df_5m
 
     return df_5m, df_daily
 
 # ==============================================================================
-# 2. PINE SCRIPT EXACT MATH ENGINE (RMA ATR & DAILY 10-ATR)
+# 2. INDICATOR ENGINE (PINE RMA & LAGGED DAILY ATR)
 # ==============================================================================
 def pine_rma(series, length):
     alpha = 1.0 / length
@@ -167,7 +162,7 @@ def prepare_indicators(df_5m, df_daily):
     df["date"] = df["datetime"].dt.date
     df["time"] = df["datetime"].dt.time
 
-    # 5m ATR (14) using Pine's RMA
+    # 5m ATR (14) via Wilder's RMA
     prev_c = df["close"].shift(1)
     tr = pd.concat([
         df["high"] - df["low"],
@@ -177,7 +172,7 @@ def prepare_indicators(df_5m, df_daily):
     df["tr"] = tr
     df["atr14"] = pine_rma(df["tr"], 14).fillna(df["high"] - df["low"])
 
-    # VWAP
+    # Session VWAP
     df["hlc3"] = (df["high"] + df["low"] + df["close"]) / 3.0
     spread = (df["high"] - df["low"]) + (df["close"] - df["open"]).abs()
     df["vol_weight"] = np.where(df["vol"] > 0, df["vol"], spread * 1000.0 + 100.0)
@@ -186,35 +181,34 @@ def prepare_indicators(df_5m, df_daily):
     df["cum_pv"] = df.groupby("date")["pv"].cumsum()
     df["vwap"] = (df["cum_pv"] / df["cum_vol"]).round(2)
 
-    # True Daily ATR(10) with Lookahead Off [1]
+    # True Daily ATR(10) Lagged by 1 Day (Matches Pine's request.security(..., "D", atr(10)[1]))
     if df_daily is not None and not df_daily.empty:
         d = df_daily.copy()
-        d_prev_c = d["d_close"].shift(1)
+        d_prev = d["d_close"].shift(1)
         d_tr = pd.concat([
             d["d_high"] - d["d_low"],
-            (d["d_high"] - d_prev_c).abs(),
-            (d["d_low"] - d_prev_c).abs()
+            (d["d_high"] - d_prev).abs(),
+            (d["d_low"] - d_prev).abs()
         ], axis=1).max(axis=1)
         d["daily_atr10"] = pine_rma(d_tr, 10).shift(1)
         df = df.merge(d[["date", "daily_atr10"]], on="date", how="left")
-        df["daily_atr10"] = df["daily_atr10"].ffill().bfill().fillna(292.8)
+        df["daily_atr10"] = df["daily_atr10"].ffill().bfill()
     else:
-        # Fallback to daily bars reconstructed from 5m data
         d = df.groupby("date").agg({"high": "max", "low": "min", "close": "last"}).reset_index()
-        d_prev_c = d["close"].shift(1)
+        d_prev = d["close"].shift(1)
         d_tr = pd.concat([
             d["high"] - d["low"],
-            (d["high"] - d_prev_c).abs(),
-            (d["low"] - d_prev_c).abs()
+            (d["high"] - d_prev).abs(),
+            (d["low"] - d_prev).abs()
         ], axis=1).max(axis=1)
         d["daily_atr10"] = pine_rma(d_tr, 10).shift(1)
         df = df.merge(d[["date", "daily_atr10"]], on="date", how="left")
-        df["daily_atr10"] = df["daily_atr10"].ffill().bfill().fillna(292.8)
+        df["daily_atr10"] = df["daily_atr10"].ffill().bfill()
 
     return df
 
 # ==============================================================================
-# 3. TRADING SIMULATION ENGINE (15:15 EOD + RUNNER TRAIL)
+# 3. STRATEGY ENGINE WITH NEXT-BAR EXECUTION & RUNNER RATCHET
 # ==============================================================================
 def run_backtest_simulation(df, p, start_date, end_date):
     trades = []
@@ -242,6 +236,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
         pierced_l = False
 
         active_trade = None
+        pending_signal = None
         trades_today = 0
 
         for i in range(len(day_bars)):
@@ -254,7 +249,25 @@ def run_backtest_simulation(df, p, start_date, end_date):
             vw = bar["vwap"]
             atr = bar["atr14"]
 
-            # Intra-bar / Trade Exit Checks
+            # Execute pending order on the open of the following bar (matches Pine's process_orders_on_close)
+            if pending_signal is not None and active_trade is None and trades_today == 0:
+                active_trade = pending_signal.copy()
+                active_trade["entry"] = o
+                active_trade["entry_time"] = bar["datetime"]
+                active_trade["peak"] = o
+                if active_trade["mode"] == "BREAKOUT":
+                    if active_trade["type"] == "CE":
+                        active_trade["target_p"] = round(o + active_trade["bank_dist"], 1)
+                    else:
+                        active_trade["target_p"] = round(o - active_trade["bank_dist"], 1)
+                elif active_trade["mode"] == "FADE":
+                    if active_trade["type"] == "PE":
+                        active_trade["target_p"] = round(o - (atr * p["fade_pe_tg_atr"]), 1)
+                    else:
+                        active_trade["target_p"] = round(o + (atr * p["fade_ce_tg_atr"]), 1)
+                pending_signal = None
+
+            # Intra-bar stop loss, target, and trailing management
             if active_trade is not None:
                 is_ce = (active_trade["type"] == "CE")
                 cur_sl = active_trade["current_sl"]
@@ -266,7 +279,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                 exit_price = 0.0
                 exit_reason = ""
 
-                # Target Hit
+                # Target Check
                 if is_ce and h >= target_p:
                     exit_triggered = True
                     exit_price = target_p
@@ -276,7 +289,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                     exit_price = target_p
                     exit_reason = "TARGET HIT"
 
-                # Stop Loss Hit
+                # Stop Loss Check
                 if not exit_triggered:
                     if is_ce and l <= cur_sl:
                         exit_triggered = True
@@ -305,7 +318,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                     trades_today += 1
                     break
 
-                # Dynamic Trailing SL
+                # Dynamic Trailing SL for Breakout Runners
                 if mode == "BREAKOUT":
                     if is_ce:
                         active_trade["peak"] = max(active_trade["peak"], h)
@@ -329,8 +342,8 @@ def run_backtest_simulation(df, p, start_date, end_date):
                             active_trade["current_sl"] = min(active_trade["current_sl"], min(fib_sl, min(min_sl, bar_sl)))
                 continue
 
-            # Trade Entry Window: 09:30 to 10:00 IST
-            if datetime.time(9, 30) <= b_time < datetime.time(10, 0) and trades_today == 0:
+            # Trade Evaluation (09:30 to 10:00 Window)
+            if datetime.time(9, 30) <= b_time < datetime.time(10, 0) and trades_today == 0 and pending_signal is None:
                 if h > orb_h:
                     pierced_h = True
                     max_high_outside = max(max_high_outside, h)
@@ -361,7 +374,6 @@ def run_backtest_simulation(df, p, start_date, end_date):
                 trade_type = None
                 mode = ""
                 sl_val = 0.0
-                tg_val = 0.0
                 bank_d = 0.0
 
                 if fire_ce_bo:
@@ -370,49 +382,40 @@ def run_backtest_simulation(df, p, start_date, end_date):
                     buf = p["bo_ce_sl_pts"] if p["sl_mode"] == "Fixed Points" else (p["bo_ce_sl_atr"] * atr)
                     sl_val = round(l - buf, 1)
                     bank_d = atr * p["bo_ce_tg_atr"]
-                    tg_val = round(c + bank_d, 1)
                 elif fire_pe_bo:
                     trade_type = "PE"
                     mode = "BREAKOUT"
                     buf = p["bo_pe_sl_pts"] if p["sl_mode"] == "Fixed Points" else (p["bo_pe_sl_atr"] * atr)
                     sl_val = round(h + buf, 1)
                     bank_d = atr * p["bo_pe_tg_atr"]
-                    tg_val = round(c - bank_d, 1)
                 elif fire_pe_fade:
                     trade_type = "PE"
                     mode = "FADE"
                     buf = p["fade_pe_sl_pts"] if p["sl_mode"] == "Fixed Points" else (p["fade_pe_sl_atr"] * atr)
                     sl_val = round(max_high_outside + buf, 1)
-                    tg_val = round(c - (atr * p["fade_pe_tg_atr"]), 1)
                 elif fire_ce_fade:
                     trade_type = "CE"
                     mode = "FADE"
                     buf = p["fade_ce_sl_pts"] if p["sl_mode"] == "Fixed Points" else (p["fade_ce_sl_atr"] * atr)
                     sl_val = round(min_low_outside - buf, 1)
-                    tg_val = round(c + (atr * p["fade_ce_tg_atr"]), 1)
 
                 if trade_type is not None:
-                    active_trade = {
+                    pending_signal = {
                         "date": d,
-                        "entry_time": bar["datetime"],
                         "type": trade_type,
                         "mode": mode,
-                        "entry": c,
                         "init_sl": sl_val,
                         "current_sl": sl_val,
-                        "target_p": tg_val,
                         "bank_dist": bank_d,
-                        "banked": False,
-                        "peak": c
+                        "banked": False
                     }
 
     return pd.DataFrame(trades)
 
 # ==============================================================================
-# 4. STREAMLIT UI
+# 4. FULL CONTROL UI: ALL SL & TARGET SETTINGS
 # ==============================================================================
 st.sidebar.title("Backtest Configuration")
-
 force_reload = st.sidebar.button("Force Refresh & Re-download Data", type="primary")
 
 exec_mode = st.sidebar.radio("Execution Mode", ["Manual Input Backtest", "Automated Grid Optimizer"])
@@ -436,10 +439,11 @@ max_breach_mult = st.sidebar.number_input("Max Breach Allowance (x ATR)", value=
 
 st.sidebar.subheader("Independent Stop Loss Settings")
 sl_mode = st.sidebar.selectbox("SL Buffer Mode", ["Fixed Points", "ATR Multiplier"], index=0)
+
 bo_ce_sl_pts = st.sidebar.number_input("BO CE SL: Points below Low", value=5.0, step=1.0)
 bo_pe_sl_pts = st.sidebar.number_input("BO PE SL: Points above High", value=105.0, step=5.0)
-fade_pe_sl_pts = st.sidebar.number_input("Fade PE SL: Points above Breach High", value=25.0, step=1.0)
-fade_ce_sl_pts = st.sidebar.number_input("Fade CE SL: Points below Breach Low", value=5.0, step=1.0)
+fade_pe_sl_pts = st.sidebar.number_input("Fade PE SL: Points above High", value=25.0, step=1.0)
+fade_ce_sl_pts = st.sidebar.number_input("Fade CE SL: Points below Low", value=5.0, step=1.0)
 
 st.sidebar.subheader("Independent Target Settings (ATR Multipliers)")
 bo_ce_tg_atr = st.sidebar.number_input("BO CE Target: ATR Multiplier", value=3.5, step=0.1)
@@ -528,48 +532,141 @@ if exec_mode == "Manual Input Backtest":
     st.dataframe(df_trades[["entry_time", "type", "mode", "entry", "init_sl", "exit_price", "exit_time", "exit_reason", "pts", "pnl"]], use_container_width=True)
 
 else:
-    st.subheader("Automated Multi-Year Parameter Grid Search")
-    st.write("Simulating combinations to optimize Profit Factor and Net PnL...")
+    st.subheader("Comprehensive Multi-Parameter Grid Search")
+    st.write("Simulating combinations across BO CE/PE & Fade parameters to discover the top configurations...")
+
+    opt_target = st.selectbox("Optimize Focus", ["Breakout Targets & SL", "Fade Parameters", "All Core Multipliers"])
 
     if st.button("Start Grid Optimization"):
         results = []
-        ce_targets = [2.5, 3.0, 3.5, 4.0]
-        pe_targets = [3.5, 4.0, 5.0, 6.0]
-        pe_sls = [75.0, 90.0, 105.0, 117.0]
 
-        total_sims = len(ce_targets) * len(pe_targets) * len(pe_sls)
-        bar = st.progress(0, text="Running Combinations...")
-        idx = 0
+        if opt_target == "Breakout Targets & SL":
+            grid_ce_tg = [2.5, 3.0, 3.5, 4.0]
+            grid_pe_tg = [3.5, 4.0, 5.0, 6.0]
+            grid_ce_sl = [5.0, 10.0, 15.0]
+            grid_pe_sl = [75.0, 90.0, 105.0, 117.0]
 
-        for ct in ce_targets:
-            for pt in pe_targets:
-                for psl in pe_sls:
-                    sim_p = sim_params.copy()
-                    sim_p["bo_ce_tg_atr"] = ct
-                    sim_p["bo_pe_tg_atr"] = pt
-                    sim_p["bo_pe_sl_pts"] = psl
+            total_sims = len(grid_ce_tg) * len(grid_pe_tg) * len(grid_ce_sl) * len(grid_pe_sl)
+            prog = st.progress(0, text="Evaluating Breakout Grid...")
+            idx = 0
 
-                    tdf = run_backtest_simulation(df_prepared, sim_p, d_start, d_end)
-                    if not tdf.empty:
-                        gp = tdf[tdf["pnl"] > 0]["pnl"].sum()
-                        gl = abs(tdf[tdf["pnl"] < 0]["pnl"].sum())
-                        pf = gp / max(1.0, gl)
-                        net = tdf["pnl"].sum()
-                        wr = (len(tdf[tdf["pnl"] > 0]) / len(tdf)) * 100
+            for ct in grid_ce_tg:
+                for pt in grid_pe_tg:
+                    for c_sl in grid_ce_sl:
+                        for p_sl in grid_pe_sl:
+                            p_copy = sim_params.copy()
+                            p_copy["bo_ce_tg_atr"] = ct
+                            p_copy["bo_pe_tg_atr"] = pt
+                            p_copy["bo_ce_sl_pts"] = c_sl
+                            p_copy["bo_pe_sl_pts"] = p_sl
 
-                        results.append({
-                            "CE Target (ATR)": ct,
-                            "PE Target (ATR)": pt,
-                            "PE SL (Pts)": psl,
-                            "Profit Factor": round(pf, 2),
-                            "Win Rate (%)": round(wr, 1),
-                            "Total Trades": len(tdf),
-                            "Net PnL (₹)": int(net)
-                        })
-                    idx += 1
-                    bar.progress(idx / total_sims)
+                            tdf = run_backtest_simulation(df_prepared, p_copy, d_start, d_end)
+                            if not tdf.empty:
+                                gp = tdf[tdf["pnl"] > 0]["pnl"].sum()
+                                gl = abs(tdf[tdf["pnl"] < 0]["pnl"].sum())
+                                pf = gp / max(1.0, gl)
+                                net = tdf["pnl"].sum()
+                                wr = (len(tdf[tdf["pnl"] > 0]) / len(tdf)) * 100
 
-        bar.empty()
-        res_df = pd.DataFrame(results).sort_values("Profit Factor", ascending=False).reset_index(drop=True)
-        st.subheader("Optimal Parameter Configurations")
-        st.dataframe(res_df.head(15), use_container_width=True)
+                                results.append({
+                                    "BO CE Target (ATR)": ct,
+                                    "BO PE Target (ATR)": pt,
+                                    "BO CE SL (Pts)": c_sl,
+                                    "BO PE SL (Pts)": p_sl,
+                                    "Profit Factor": round(pf, 2),
+                                    "Win Rate (%)": round(wr, 1),
+                                    "Total Trades": len(tdf),
+                                    "Net PnL (₹)": int(net)
+                                })
+                            idx += 1
+                            prog.progress(idx / total_sims)
+            prog.empty()
+
+        elif opt_target == "Fade Parameters":
+            grid_f_pe_tg = [1.2, 1.5, 1.9, 2.5]
+            grid_f_ce_tg = [1.0, 1.4, 1.8, 2.2]
+            grid_f_pe_sl = [15.0, 25.0, 35.0]
+            grid_f_ce_sl = [5.0, 10.0, 15.0]
+
+            total_sims = len(grid_f_pe_tg) * len(grid_f_ce_tg) * len(grid_f_pe_sl) * len(grid_f_ce_sl)
+            prog = st.progress(0, text="Evaluating Fade Grid...")
+            idx = 0
+
+            for fpt in grid_f_pe_tg:
+                for fct in grid_f_ce_tg:
+                    for fps in grid_f_pe_sl:
+                        for fcs in grid_f_ce_sl:
+                            p_copy = sim_params.copy()
+                            p_copy["fade_pe_tg_atr"] = fpt
+                            p_copy["fade_ce_tg_atr"] = fct
+                            p_copy["fade_pe_sl_pts"] = fps
+                            p_copy["fade_ce_sl_pts"] = fcs
+
+                            tdf = run_backtest_simulation(df_prepared, p_copy, d_start, d_end)
+                            if not tdf.empty:
+                                gp = tdf[tdf["pnl"] > 0]["pnl"].sum()
+                                gl = abs(tdf[tdf["pnl"] < 0]["pnl"].sum())
+                                pf = gp / max(1.0, gl)
+                                net = tdf["pnl"].sum()
+                                wr = (len(tdf[tdf["pnl"] > 0]) / len(tdf)) * 100
+
+                                results.append({
+                                    "Fade PE Target (ATR)": fpt,
+                                    "Fade CE Target (ATR)": fct,
+                                    "Fade PE SL (Pts)": fps,
+                                    "Fade CE SL (Pts)": fcs,
+                                    "Profit Factor": round(pf, 2),
+                                    "Win Rate (%)": round(wr, 1),
+                                    "Total Trades": len(tdf),
+                                    "Net PnL (₹)": int(net)
+                                })
+                            idx += 1
+                            prog.progress(idx / total_sims)
+            prog.empty()
+
+        else:
+            grid_ce_tg = [3.0, 3.5, 4.0]
+            grid_pe_tg = [4.0, 5.0, 6.0]
+            grid_f_pe_tg = [1.5, 1.9]
+            grid_f_ce_tg = [1.2, 1.4]
+
+            total_sims = len(grid_ce_tg) * len(grid_pe_tg) * len(grid_f_pe_tg) * len(grid_f_ce_tg)
+            prog = st.progress(0, text="Evaluating Core Multipliers...")
+            idx = 0
+
+            for ct in grid_ce_tg:
+                for pt in grid_pe_tg:
+                    for fpt in grid_f_pe_tg:
+                        for fct in grid_f_ce_tg:
+                            p_copy = sim_params.copy()
+                            p_copy["bo_ce_tg_atr"] = ct
+                            p_copy["bo_pe_tg_atr"] = pt
+                            p_copy["fade_pe_tg_atr"] = fpt
+                            p_copy["fade_ce_tg_atr"] = fct
+
+                            tdf = run_backtest_simulation(df_prepared, p_copy, d_start, d_end)
+                            if not tdf.empty:
+                                gp = tdf[tdf["pnl"] > 0]["pnl"].sum()
+                                gl = abs(tdf[tdf["pnl"] < 0]["pnl"].sum())
+                                pf = gp / max(1.0, gl)
+                                net = tdf["pnl"].sum()
+                                wr = (len(tdf[tdf["pnl"] > 0]) / len(tdf)) * 100
+
+                                results.append({
+                                    "BO CE Target": ct,
+                                    "BO PE Target": pt,
+                                    "Fade PE Target": fpt,
+                                    "Fade CE Target": fct,
+                                    "Profit Factor": round(pf, 2),
+                                    "Win Rate (%)": round(wr, 1),
+                                    "Total Trades": len(tdf),
+                                    "Net PnL (₹)": int(net)
+                                })
+                            idx += 1
+                            prog.progress(idx / total_sims)
+            prog.empty()
+
+        if results:
+            res_df = pd.DataFrame(results).sort_values("Profit Factor", ascending=False).reset_index(drop=True)
+            st.subheader("Optimal Parameter Configurations")
+            st.dataframe(res_df.head(20), use_container_width=True)
