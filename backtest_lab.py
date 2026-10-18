@@ -19,8 +19,8 @@ except ImportError:
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 INDEX_TOKEN = "99926000"
-DATA_CACHE_FILE = "nifty_5m_cache_v4.parquet"
-DAILY_CACHE_FILE = "nifty_daily_cache_v4.parquet"
+DATA_CACHE_FILE = "nifty_5m_cache_v5.parquet"
+DAILY_CACHE_FILE = "nifty_daily_cache_v5.parquet"
 
 st.set_page_config(page_title="NIFTY ORB Institutional Backtest Lab", layout="wide")
 
@@ -47,7 +47,7 @@ def get_angel_session():
     return None
 
 def fetch_daily_candles(api, start_date, end_date):
-    fetch_start = start_date - datetime.timedelta(days=90)
+    fetch_start = start_date - datetime.timedelta(days=120)
     try:
         resp = api.getCandleData({
             "exchange": "NSE",
@@ -59,8 +59,9 @@ def fetch_daily_candles(api, start_date, end_date):
         if resp and resp.get("status") and resp.get("data"):
             rows = []
             for b in resp["data"]:
+                dt = pd.to_datetime(b[0])
                 rows.append({
-                    "date": pd.to_datetime(b[0]).date(),
+                    "date": dt.date(),
                     "d_open": float(b[1]),
                     "d_high": float(b[2]),
                     "d_low": float(b[3]),
@@ -74,7 +75,7 @@ def fetch_daily_candles(api, start_date, end_date):
     return pd.DataFrame()
 
 def fetch_5m_candles(api, start_date, end_date):
-    fetch_start = start_date - datetime.timedelta(days=10)
+    fetch_start = start_date - datetime.timedelta(days=15)
     candles = []
     curr_start = fetch_start
     delta_chunk = datetime.timedelta(days=25)
@@ -94,8 +95,12 @@ def fetch_5m_candles(api, start_date, end_date):
             })
             if resp and resp.get("status") and resp.get("data"):
                 for b in resp["data"]:
+                    dt = pd.to_datetime(b[0])
+                    # Normalize timezone to IST
+                    if dt.tzinfo is not None:
+                        dt = dt.tz_convert(IST).tz_localize(None)
                     candles.append({
-                        "datetime": pd.to_datetime(b[0]),
+                        "datetime": dt,
                         "open": float(b[1]),
                         "high": float(b[2]),
                         "low": float(b[3]),
@@ -112,7 +117,7 @@ def fetch_5m_candles(api, start_date, end_date):
     prog_bar.empty()
     df = pd.DataFrame(candles)
     if not df.empty:
-        df["datetime"] = df["datetime"].dt.tz_localize(None)
+        df["datetime"] = pd.to_datetime(df["datetime"])
         df = df.drop_duplicates(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
         df.to_parquet(DATA_CACHE_FILE)
     return df
@@ -151,7 +156,7 @@ def get_complete_data(start_date, end_date, force_refresh=False):
     return df_5m, df_daily
 
 # ==============================================================================
-# 2. INDICATOR ENGINE (PINE RMA ATR & DAILY 10-ATR)
+# 2. INDICATOR ENGINE (PINE RMA & LAGGED DAILY ATR)
 # ==============================================================================
 def pine_rma(series, length):
     alpha = 1.0 / length
@@ -159,10 +164,12 @@ def pine_rma(series, length):
 
 def prepare_indicators(df_5m, df_daily):
     df = df_5m.copy()
+    df["datetime"] = pd.to_datetime(df["datetime"])
     df["date"] = df["datetime"].dt.date
-    df["time"] = df["datetime"].dt.time
+    df["hour"] = df["datetime"].dt.hour
+    df["minute"] = df["datetime"].dt.minute
 
-    # 5m ATR (14) using Wilder's RMA
+    # 5m ATR (14) via Wilder's RMA
     prev_c = df["close"].shift(1)
     tr = pd.concat([
         df["high"] - df["low"],
@@ -172,16 +179,16 @@ def prepare_indicators(df_5m, df_daily):
     df["tr"] = tr
     df["atr14"] = pine_rma(df["tr"], 14).fillna(df["high"] - df["low"])
 
-    # VWAP (resets daily)
+    # VWAP (matches TradingView hlc3 calculation)
     df["hlc3"] = (df["high"] + df["low"] + df["close"]) / 3.0
-    spread = (df["high"] - df["low"]) + (df["close"] - df["open"]).abs()
-    df["vol_weight"] = np.where(df["vol"] > 0, df["vol"], spread * 1000.0 + 100.0)
+    # Use candle range as proxy volume when raw volume is zero
+    df["vol_weight"] = np.where(df["vol"] > 0, df["vol"], (df["high"] - df["low"]) * 1000.0 + 10.0)
     df["pv"] = df["hlc3"] * df["vol_weight"]
     df["cum_vol"] = df.groupby("date")["vol_weight"].cumsum()
     df["cum_pv"] = df.groupby("date")["pv"].cumsum()
     df["vwap"] = (df["cum_pv"] / df["cum_vol"]).round(2)
 
-    # Daily 10-ATR (shift 1 to match Pine's request.security(..., "D", atr(10)[1]))
+    # True Daily ATR(10) with Lookahead Off [1]
     if df_daily is not None and not df_daily.empty:
         d = df_daily.copy()
         d_prev = d["d_close"].shift(1)
@@ -212,7 +219,6 @@ def prepare_indicators(df_5m, df_daily):
 # ==============================================================================
 def run_backtest_simulation(df, p, start_date, end_date):
     trades = []
-    # Filter dates
     all_dates = sorted(df["date"].unique())
     eval_dates = [d for d in all_dates if d >= start_date and d <= end_date]
 
@@ -221,11 +227,8 @@ def run_backtest_simulation(df, p, start_date, end_date):
         if len(day_bars) < 6:
             continue
 
-        # 09:15 - 09:30 ORB
-        orb_bars = day_bars[(day_bars["time"] >= datetime.time(9, 15)) & (day_bars["time"] < datetime.time(9, 30))]
-        if len(orb_bars) < 3:
-            orb_bars = day_bars.iloc[0:3]
-
+        # 09:15 - 09:30 ORB (Strictly the first 3 bars: 09:15, 09:20, 09:25)
+        orb_bars = day_bars.iloc[0:3]
         orb_h = orb_bars["high"].max()
         orb_l = orb_bars["low"].min()
 
@@ -240,9 +243,11 @@ def run_backtest_simulation(df, p, start_date, end_date):
         active_trade = None
         trades_today = 0
 
-        for i in range(len(day_bars)):
+        # Scan from Bar 3 (09:30 onwards)
+        for i in range(3, len(day_bars)):
             bar = day_bars.iloc[i]
-            b_time = bar["time"]
+            h_val = bar["hour"]
+            m_val = bar["minute"]
             c = bar["close"]
             o = bar["open"]
             h = bar["high"]
@@ -284,7 +289,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
                         exit_reason = "STOP LOSS HIT"
 
                 # 15:15 EOD Exit
-                if not exit_triggered and b_time >= datetime.time(15, 15):
+                if not exit_triggered and (h_val > 15 or (h_val == 15 and m_val >= 15)):
                     exit_triggered = True
                     exit_price = c
                     exit_reason = "15:15 EOD CLOSE"
@@ -325,8 +330,10 @@ def run_backtest_simulation(df, p, start_date, end_date):
                             active_trade["current_sl"] = min(active_trade["current_sl"], min(fib_sl, min(min_sl, bar_sl)))
                 continue
 
-            # Trade Evaluation (09:30 to 10:00 Window)
-            if datetime.time(9, 30) <= b_time < datetime.time(10, 0) and trades_today == 0:
+            # Trade Evaluation (09:30 to 10:00 Window strictly: index 3 to 8)
+            in_window = (h_val == 9 and m_val >= 30) or (h_val == 10 and m_val == 0)
+
+            if in_window and trades_today == 0:
                 if h > orb_h:
                     pierced_h = True
                     max_high_outside = max(max_high_outside, h)
@@ -388,7 +395,6 @@ def run_backtest_simulation(df, p, start_date, end_date):
                     tg_val = round(c + (atr * p["fade_ce_tg_atr"]), 1)
 
                 if trade_type is not None:
-                    # Executes on Close price of the trigger bar (matching Pine's process_orders_on_close=true)
                     active_trade = {
                         "date": d,
                         "entry_time": bar["datetime"],
@@ -406,7 +412,7 @@ def run_backtest_simulation(df, p, start_date, end_date):
     return pd.DataFrame(trades)
 
 # ==============================================================================
-# 4. STREAMLIT UI: FULL CONTROL OVER ALL PARAMETERS
+# 4. STREAMLIT UI: COMPLETE CONTROL & DETAILED GRIDS
 # ==============================================================================
 st.sidebar.title("Backtest Configuration")
 force_reload = st.sidebar.button("Force Refresh & Re-download Data", type="primary")
@@ -523,26 +529,30 @@ if exec_mode == "Manual Input Backtest":
     )
     st.plotly_chart(fig_equity, use_container_width=True)
 
-    st.subheader("Historical Trade Ledger (First 10 Trades)")
-    st.dataframe(df_trades[["entry_time", "type", "mode", "entry", "init_sl", "exit_price", "exit_time", "exit_reason", "pts", "pnl"]].head(10), use_container_width=True)
+    st.subheader("Historical Trade Ledger (First 15 Trades)")
+    st.dataframe(df_trades[["entry_time", "type", "mode", "entry", "init_sl", "exit_price", "exit_time", "exit_reason", "pts", "pnl"]].head(15), use_container_width=True)
 
 else:
-    st.subheader("Comprehensive Multi-Parameter Grid Search")
-    st.write("Simulating combinations across BO CE/PE & Fade parameters to discover the top configurations...")
+    st.subheader("Master Multi-Parameter Optimizer")
+    st.write("Simulates combinations across Stop Losses AND Targets to show optimal values.")
 
-    opt_target = st.selectbox("Optimize Focus", ["Breakout Targets & SL", "Fade Parameters", "All Core Multipliers"])
+    opt_focus = st.selectbox("Select Optimization Scope", [
+        "Master (CE & PE: Both SL and Targets)",
+        "Breakout Target Multipliers",
+        "Fade SL & Targets"
+    ])
 
     if st.button("Start Grid Optimization"):
         results = []
 
-        if opt_target == "Breakout Targets & SL":
-            grid_ce_tg = [2.5, 3.0, 3.5, 4.0]
-            grid_pe_tg = [3.5, 4.0, 5.0, 6.0]
-            grid_ce_sl = [5.0, 10.0, 15.0]
-            grid_pe_sl = [75.0, 90.0, 105.0, 117.0]
+        if opt_focus == "Master (CE & PE: Both SL and Targets)":
+            grid_ce_tg = [3.0, 3.5, 4.0]
+            grid_pe_tg = [4.0, 5.0, 6.0]
+            grid_ce_sl = [5.0, 10.0]
+            grid_pe_sl = [90.0, 105.0, 117.0]
 
             total_sims = len(grid_ce_tg) * len(grid_pe_tg) * len(grid_ce_sl) * len(grid_pe_sl)
-            prog = st.progress(0, text="Evaluating Breakout Grid...")
+            prog = st.progress(0, text="Evaluating Master SL + Target Grid...")
             idx = 0
 
             for ct in grid_ce_tg:
@@ -564,10 +574,10 @@ else:
                                 wr = (len(tdf[tdf["pnl"] > 0]) / len(tdf)) * 100
 
                                 results.append({
-                                    "BO CE Target (ATR)": ct,
-                                    "BO PE Target (ATR)": pt,
-                                    "BO CE SL (Pts)": c_sl,
-                                    "BO PE SL (Pts)": p_sl,
+                                    "BO CE SL": c_sl,
+                                    "BO PE SL": p_sl,
+                                    "BO CE Target": ct,
+                                    "BO PE Target": pt,
                                     "Profit Factor": round(pf, 2),
                                     "Win Rate (%)": round(wr, 1),
                                     "Total Trades": len(tdf),
@@ -577,14 +587,14 @@ else:
                             prog.progress(idx / total_sims)
             prog.empty()
 
-        elif opt_target == "Fade Parameters":
-            grid_f_pe_tg = [1.2, 1.5, 1.9, 2.5]
-            grid_f_ce_tg = [1.0, 1.4, 1.8, 2.2]
+        elif opt_focus == "Fade SL & Targets":
+            grid_f_pe_tg = [1.5, 1.9, 2.5]
+            grid_f_ce_tg = [1.2, 1.4, 1.8]
             grid_f_pe_sl = [15.0, 25.0, 35.0]
-            grid_f_ce_sl = [5.0, 10.0, 15.0]
+            grid_f_ce_sl = [5.0, 10.0]
 
             total_sims = len(grid_f_pe_tg) * len(grid_f_ce_tg) * len(grid_f_pe_sl) * len(grid_f_ce_sl)
-            prog = st.progress(0, text="Evaluating Fade Grid...")
+            prog = st.progress(0, text="Evaluating Fade SL + Target Grid...")
             idx = 0
 
             for fpt in grid_f_pe_tg:
@@ -606,50 +616,8 @@ else:
                                 wr = (len(tdf[tdf["pnl"] > 0]) / len(tdf)) * 100
 
                                 results.append({
-                                    "Fade PE Target (ATR)": fpt,
-                                    "Fade CE Target (ATR)": fct,
-                                    "Fade PE SL (Pts)": fps,
-                                    "Fade CE SL (Pts)": fcs,
-                                    "Profit Factor": round(pf, 2),
-                                    "Win Rate (%)": round(wr, 1),
-                                    "Total Trades": len(tdf),
-                                    "Net PnL (₹)": int(net)
-                                })
-                            idx += 1
-                            prog.progress(idx / total_sims)
-            prog.empty()
-
-        else:
-            grid_ce_tg = [3.0, 3.5, 4.0]
-            grid_pe_tg = [4.0, 5.0, 6.0]
-            grid_f_pe_tg = [1.5, 1.9]
-            grid_f_ce_tg = [1.2, 1.4]
-
-            total_sims = len(grid_ce_tg) * len(grid_pe_tg) * len(grid_f_pe_tg) * len(grid_f_ce_tg)
-            prog = st.progress(0, text="Evaluating Core Multipliers...")
-            idx = 0
-
-            for ct in grid_ce_tg:
-                for pt in grid_pe_tg:
-                    for fpt in grid_f_pe_tg:
-                        for fct in grid_f_ce_tg:
-                            p_copy = sim_params.copy()
-                            p_copy["bo_ce_tg_atr"] = ct
-                            p_copy["bo_pe_tg_atr"] = pt
-                            p_copy["fade_pe_tg_atr"] = fpt
-                            p_copy["fade_ce_tg_atr"] = fct
-
-                            tdf = run_backtest_simulation(df_prepared, p_copy, d_start, d_end)
-                            if not tdf.empty:
-                                gp = tdf[tdf["pnl"] > 0]["pnl"].sum()
-                                gl = abs(tdf[tdf["pnl"] < 0]["pnl"].sum())
-                                pf = gp / max(1.0, gl)
-                                net = tdf["pnl"].sum()
-                                wr = (len(tdf[tdf["pnl"] > 0]) / len(tdf)) * 100
-
-                                results.append({
-                                    "BO CE Target": ct,
-                                    "BO PE Target": pt,
+                                    "Fade PE SL": fps,
+                                    "Fade CE SL": fcs,
                                     "Fade PE Target": fpt,
                                     "Fade CE Target": fct,
                                     "Profit Factor": round(pf, 2),
@@ -661,7 +629,41 @@ else:
                             prog.progress(idx / total_sims)
             prog.empty()
 
+        else:
+            grid_ce_tg = [2.5, 3.0, 3.5, 4.0]
+            grid_pe_tg = [3.5, 4.0, 5.0, 6.0]
+
+            total_sims = len(grid_ce_tg) * len(grid_pe_tg)
+            prog = st.progress(0, text="Evaluating Targets...")
+            idx = 0
+
+            for ct in grid_ce_tg:
+                for pt in grid_pe_tg:
+                    p_copy = sim_params.copy()
+                    p_copy["bo_ce_tg_atr"] = ct
+                    p_copy["bo_pe_tg_atr"] = pt
+
+                    tdf = run_backtest_simulation(df_prepared, p_copy, d_start, d_end)
+                    if not tdf.empty:
+                        gp = tdf[tdf["pnl"] > 0]["pnl"].sum()
+                        gl = abs(tdf[tdf["pnl"] < 0]["pnl"].sum())
+                        pf = gp / max(1.0, gl)
+                        net = tdf["pnl"].sum()
+                        wr = (len(tdf[tdf["pnl"] > 0]) / len(tdf)) * 100
+
+                        results.append({
+                            "BO CE Target": ct,
+                            "BO PE Target": pt,
+                            "Profit Factor": round(pf, 2),
+                            "Win Rate (%)": round(wr, 1),
+                            "Total Trades": len(tdf),
+                            "Net PnL (₹)": int(net)
+                        })
+                    idx += 1
+                    prog.progress(idx / total_sims)
+            prog.empty()
+
         if results:
             res_df = pd.DataFrame(results).sort_values("Profit Factor", ascending=False).reset_index(drop=True)
             st.subheader("Optimal Parameter Configurations")
-            st.dataframe(res_df.head(20), use_container_width=True)
+            st.dataframe(res_df, use_container_width=True)
