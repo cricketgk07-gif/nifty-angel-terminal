@@ -19,8 +19,8 @@ except ImportError:
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 INDEX_TOKEN = "99926000"
-DATA_CACHE_FILE = "nifty_5m_cache_v9.parquet"
-DAILY_CACHE_FILE = "nifty_daily_cache_v9.parquet"
+DATA_CACHE_FILE = "nifty_5m_cache_v10.parquet"
+DAILY_CACHE_FILE = "nifty_daily_cache_v10.parquet"
 
 st.set_page_config(page_title="NIFTY ORB Institutional Backtest Lab", layout="wide")
 
@@ -153,7 +153,7 @@ def get_complete_data(start_date, end_date, force_refresh=False):
     return df_5m, df_daily
 
 # ==============================================================================
-# 2. INDICATOR ENGINE (PINE RMA ATR & CALIBRATED VWAP)
+# 2. INDICATOR ENGINE (PINE RMA ATR & RESOLVED VWAP)
 # ==============================================================================
 def pine_rma(series, length):
     alpha = 1.0 / length
@@ -193,9 +193,9 @@ def prepare_indicators(df_5m, df_daily):
 
     # VWAP aligned with TradingView session calculation
     df["hlc3"] = (df["high"] + df["low"] + df["close"]) / 3.0
-    eff_vol = np.where(df["vol"] > 0, df["vol"], (df["high"] - df["low"]) * 2000.0 + 500.0)
-    df["pv"] = df["hlc3"] * eff_vol
-    df["cum_vol"] = df.groupby("date")[eff_vol].cumsum()
+    df["vol_weight"] = np.where(df["vol"] > 0, df["vol"], (df["high"] - df["low"]) * 2000.0 + 500.0)
+    df["pv"] = df["hlc3"] * df["vol_weight"]
+    df["cum_vol"] = df.groupby("date")["vol_weight"].cumsum()
     df["cum_pv"] = df.groupby("date")["pv"].cumsum()
     df["vwap"] = (df["cum_pv"] / df["cum_vol"]).round(2)
 
