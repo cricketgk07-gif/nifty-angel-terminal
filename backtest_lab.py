@@ -19,7 +19,7 @@ except ImportError:
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 INDEX_TOKEN = "99926000"
-DATA_CACHE_FILE = "nifty_5m_cache_v16.parquet"
+DATA_CACHE_FILE = "nifty_5m_cache_v17.parquet"
 
 st.set_page_config(page_title="NIFTY ORB Institutional Backtest Lab", layout="wide")
 
@@ -51,7 +51,7 @@ def fetch_chunked_5m_candles(api, start_date, end_date):
     curr_start = fetch_start
     delta_chunk = datetime.timedelta(days=25)
 
-    prog_bar = st.progress(0, text="Fetching raw 5m candles with 180-day RMA warmup...")
+    prog_bar = st.progress(0, text="Fetching raw 5m historical candles from Angel One...")
     total_days = max(1, (end_date - fetch_start).days)
 
     while curr_start < end_date:
@@ -153,7 +153,6 @@ def prepare_indicators(df_5m):
     df["atr14"] = pine_rma(df["tr"], 14).fillna(df["high"] - df["low"])
 
     # 3. Session VWAP: ta.vwap(hlc3)
-    # TradingView defaults volume to 1 for index charts when missing
     df["hlc3"] = (df["high"] + df["low"] + df["close"]) / 3.0
     has_vol = (df["vol"] > 0).any()
     if has_vol:
@@ -653,22 +652,22 @@ else:
                         net = tdf["pnl"].sum()
                         wr = (len(tdf[tdf["pnl"] > 0]) / len(tdf)) * 100
 
-                                results.append({
-                                    "BO CE SL (Pts)": p_copy["bo_ce_sl_pts"],
-                                    "BO PE SL (Pts)": p_copy["bo_pe_sl_pts"],
-                                    "Fade CE SL (Pts)": p_copy["fade_ce_sl_pts"],
-                                    "Fade PE SL (Pts)": p_copy["fade_pe_sl_pts"],
-                                    "BO CE Target (ATR)": ct,
-                                    "BO PE Target (ATR)": pt,
-                                    "Fade CE Target (ATR)": p_copy["fade_ce_tg_atr"],
-                                    "Fade PE Target (ATR)": p_copy["fade_pe_tg_atr"],
-                                    "Profit Factor": round(pf, 2),
-                                    "Win Rate (%)": round(wr, 1),
-                                    "Total Trades": len(tdf),
-                                    "Net PnL (₹)": int(net)
-                                })
-                            idx += 1
-                            prog.progress(idx / total_sims)
+                        results.append({
+                            "BO CE SL (Pts)": p_copy["bo_ce_sl_pts"],
+                            "BO PE SL (Pts)": p_copy["bo_pe_sl_pts"],
+                            "Fade CE SL (Pts)": p_copy["fade_ce_sl_pts"],
+                            "Fade PE SL (Pts)": p_copy["fade_pe_sl_pts"],
+                            "BO CE Target (ATR)": ct,
+                            "BO PE Target (ATR)": pt,
+                            "Fade CE Target (ATR)": p_copy["fade_ce_tg_atr"],
+                            "Fade PE Target (ATR)": p_copy["fade_pe_tg_atr"],
+                            "Profit Factor": round(pf, 2),
+                            "Win Rate (%)": round(wr, 1),
+                            "Total Trades": len(tdf),
+                            "Net PnL (₹)": int(net)
+                        })
+                    idx += 1
+                    prog.progress(idx / total_sims)
             prog.empty()
 
         if results:
