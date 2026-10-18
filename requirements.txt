@@ -7,3 +7,5 @@ smartapi-python
 websocket-client
 logzero
 python-dotenv
+plotly
+pyarrow
