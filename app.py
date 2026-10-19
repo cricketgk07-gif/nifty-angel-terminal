@@ -1,9 +1,13 @@
 import html
 import json
 import os
+import datetime
+import zoneinfo
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+
+IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 
 st.set_page_config(
     page_title="NIFTY Dual-Regime Master Terminal",
@@ -53,7 +57,6 @@ history_cards = state_data.get("history_cards", {})
 pivots = state_data.get("pivots", {})
 orb_levels = state_data.get("orb_levels", {})
 fib_lines = state_data.get("fib_lines", {})
-contract_preview = state_data.get("contract_preview", {})
 prev_day_summary = state_data.get("prev_day_summary", {})
 hud = state_data.get("hud", {})
 
@@ -131,7 +134,7 @@ if prev_day_summary and prev_day_summary.get("type"):
     )
 
 # -------------------------------------------------------------
-# 3. Session Key Levels
+# 3. Dynamic Session Status & Key Levels
 # -------------------------------------------------------------
 orb_h_display = orb_levels.get("orb_h", "—")
 orb_l_display = orb_levels.get("orb_l", "—")
@@ -143,33 +146,31 @@ fib_50 = fib_lines.get("fib_50", "—")
 fib_100 = fib_lines.get("fib_100", "—")
 fib_161 = fib_lines.get("fib_161", "—")
 
-ce_f = contract_preview.get("CE", {})
-pe_f = contract_preview.get("PE", {})
 regime_mode_desc = f"BREAKOUT (≥{vol_threshold:.0f} ATR: 3x ATR Runner)" if is_high_vol else f"FADE (<{vol_threshold:.0f} ATR: 0.5 ATR Sweep to VWAP)"
 
 active_trade_type = hud.get("type") if (hud and hud.get("entry_spot")) else None
 is_trade_closed = hud.get("trade_closed", False) if hud else False
 
-status_label = "Awaiting 09:30-10:00 Window Trigger" if trades_taken == 0 else ("1/1 Daily Trade Locked (Execution Active)" if not is_trade_closed else f"Trade Closed [{hud.get('exit_reason', 'STOP HIT')}]")
+now_ist = datetime.datetime.now(IST).time()
+t_start = datetime.time(9, 30)
+t_end   = datetime.time(10, 0)
 
-# -------------------------------------------------------------
-# 4. Streamlined Strip Panel with Dynamic Trailing SL & N-Targets
-# -------------------------------------------------------------
-orb_mid = float(fib_lines.get("ORB_MID", ltp))
-orb_h_val = float(orb_levels.get("orb_h", 999999.0))
-orb_l_val = float(orb_levels.get("orb_l", 0.0))
-
-# Strategic Selection: Breakout vs Fade logic
-if is_high_vol:
-    is_strat_call = (ltp >= orb_mid)
+if active_trade_type and not is_trade_closed:
+    status_label = f"<b style='color:#00e676;'>🟢 Active: TRIGGERED {active_trade_type} (BUY)</b>"
+elif is_trade_closed:
+    status_label = f"<b style='color:#4fc3f7;'>🏁 Trade Completed for Today [{hud.get('exit_reason', 'CLOSED')}]</b>"
+elif now_ist < t_start:
+    status_label = "<span style='color:#90a4ae;'>⏳ Awaiting 09:30-10:00 Window Trigger</span>"
+elif t_start <= now_ist < t_end and trades_taken == 0:
+    status_label = "<b style='color:#ffb74d;'>⚡ Window Open: Monitoring for Trigger...</b>"
+elif now_ist >= t_end and trades_taken == 0:
+    status_label = "<b style='color:#78909c;'>🚫 No Trade Today (Window Closed without Trigger)</b>"
 else:
-    if ltp >= orb_h_val:
-        is_strat_call = False
-    elif ltp <= orb_l_val:
-        is_strat_call = True
-    else:
-        is_strat_call = (ltp <= orb_mid)
+    status_label = "<span style='color:#90a4ae;'>Awaiting Trigger</span>"
 
+# -------------------------------------------------------------
+# 4. Streamlined Strip Panel (Visible ONLY after Trigger)
+# -------------------------------------------------------------
 if active_trade_type:
     is_call = (active_trade_type == "CE")
     contract_title = f"{'CALL OPTION' if is_call else 'PUT OPTION'} ({active_trade_type}) {'• ACTIVE POSITION' if not is_trade_closed else '• COMPLETED'}"
@@ -207,56 +208,35 @@ if active_trade_type:
             f'<b style="color:#ffb74d;">{tg_val:.1f} (₹{tg_opt:.2f})</b></div>'
         )
 
+    execution_strip_panel_html = (
+        '<div style="background:#121620; border:1px solid #2a2e39; border-radius:6px; padding:10px 14px; margin-top:8px;">'
+        '<div style="font-size:12px; font-weight:bold; color:' + header_color + '; margin-bottom:10px; letter-spacing:0.3px;">'
+        + contract_title + ' • ' + contract_symbol + f' (DELTA: {contract_delta:.2f})' +
+        '</div>'
+        '<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; border-top:1px solid #1f2430; padding-top:10px;">'
+        f'<div style="font-size:12px;"><span style="color:#90a4ae; font-weight:bold;">ENTRY :</span> <b style="color:#ffffff;">{entry_val}</b></div>'
+        f'<div style="font-size:12px;"><span style="color:#90a4ae; font-weight:bold;">INITIAL SL :</span> <b style="color:#ef5350;">{init_sl_val}</b></div>'
+        f'<div style="font-size:12px;"><span style="color:#90a4ae; font-weight:bold;">CURRENT SL :</span> <b style="color:#00e676;">{cur_sl_val}</b></div>'
+        + t_elements_html +
+        '</div>'
+        '</div>'
+    )
 else:
-    # Standby Preview Mode dynamically follows strategy setup
-    chosen_f = ce_f if is_strat_call else pe_f
-    contract_title = f"{'CALL OPTION (CE)' if is_strat_call else 'PUT OPTION (PE)'} PREVIEW"
-    contract_symbol = chosen_f.get("symbol", "NIFTY OPT")
-    contract_delta = float(chosen_f.get("delta", 0.45))
-    header_color = "#00e676" if is_strat_call else "#ff5252"
-
-    entry_spot = float(chosen_f.get("exp_entry_spot", 0.0))
-    opt_ltp_f = float(chosen_f.get("opt_ltp", 75.0))
-    sl_spot = float(chosen_f.get("exp_sl_spot", 0.0))
-    sl_opt = float(chosen_f.get("exp_sl_opt", 0.0))
-
-    entry_val = f"{entry_spot:.1f} (₹{opt_ltp_f:.2f})"
-    init_sl_val = f"{sl_spot:.1f} (₹{sl_opt:.2f})"
-    cur_sl_val = f"{sl_spot:.1f} (₹{sl_opt:.2f}) [STANDBY]"
-
-    raw_targets = chosen_f.get("targets", [])
-    t_elements_html = ""
-    for i, tg_val in enumerate(raw_targets, 1):
-        tg_diff = abs(tg_val - entry_spot)
-        tg_opt = max(0.5, round(opt_ltp_f + (tg_diff * contract_delta), 2))
-        lbl = f"TARGET {i}"
-        if i == 1:
-            lbl += " (3ATR)" if is_high_vol else " (VWAP)"
-        t_elements_html += (
-            f'<div style="font-size:12px;"><span style="color:#90a4ae; font-weight:bold;">{lbl} :</span> '
-            f'<b style="color:#b388ff;">{tg_val:.1f} (₹{tg_opt:.2f})</b></div>'
-        )
-
-execution_strip_panel_html = (
-    '<div style="background:#121620; border:1px solid #2a2e39; border-radius:6px; padding:10px 14px; margin-top:8px;">'
-    '<div style="font-size:12px; font-weight:bold; color:' + header_color + '; margin-bottom:10px; letter-spacing:0.3px;">'
-    + contract_title + ' • ' + contract_symbol + f' (DELTA: {contract_delta:.2f})' +
-    '</div>'
-    '<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; border-top:1px solid #1f2430; padding-top:10px;">'
-    f'<div style="font-size:12px;"><span style="color:#90a4ae; font-weight:bold;">ENTRY :</span> <b style="color:#ffffff;">{entry_val}</b></div>'
-    f'<div style="font-size:12px;"><span style="color:#90a4ae; font-weight:bold;">INITIAL SL :</span> <b style="color:#ef5350;">{init_sl_val}</b></div>'
-    f'<div style="font-size:12px;"><span style="color:#90a4ae; font-weight:bold;">CURRENT SL :</span> <b style="color:#00e676;">{cur_sl_val}</b></div>'
-    + t_elements_html +
-    '</div>'
-    '</div>'
-)
+    # Completely disabled/standby card with no fake/hypothetical numbers
+    execution_strip_panel_html = (
+        '<div style="background:#121620; border:1px dashed #2a2e39; border-radius:6px; padding:12px 14px; margin-top:8px; opacity:0.65;">'
+        '<span style="font-size:12px; color:#78909c; font-weight:bold; letter-spacing:0.3px;">'
+        'STANDBY — EXECUTION & STRIKE MONITOR DISABLED (AWAITING SIGNAL TRIGGER)'
+        '</span>'
+        '</div>'
+    )
 
 complete_banner_html = (
     '<div style="background:#131722; border:1px solid #2a2e39; border-radius:8px; padding:12px 16px; margin-bottom:12px;">'
     + prev_summary_html +
     '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">'
     '<span style="color:#90a4ae; font-size:13px; font-weight:bold;">SESSION LEVELS & TODAY FORECAST</span>'
-    f'<span style="color:#787b86; font-size:12px;">{status_label}</span>'
+    f'<span style="font-size:12px;">{status_label}</span>'
     '</div>'
     '<div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:10px;">'
     '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
