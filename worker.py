@@ -437,7 +437,6 @@ class DedicatedTradingWorker:
         return clean_targets[:6]
 
     def simulate_historical_trades(self):
-        """Simulates all previous historical days, placing ONLY entry/exit arrows and hover cards."""
         if not self.candles:
             return
 
@@ -454,7 +453,6 @@ class DedicatedTradingWorker:
             if len(day_bars) < 4:
                 continue
 
-            # Identify the exact 09:15 - 09:30 range bars
             ow = day_bars[(day_bars["time_only"] >= datetime.time(9, 15)) & (day_bars["time_only"] < datetime.time(9, 30))]
             if len(ow) == 0:
                 ow = day_bars.iloc[0:3]
@@ -519,7 +517,6 @@ class DedicatedTradingWorker:
                         final_inr = int(round(final_pts * sim_trade["delta"] * LOT_SIZE_QTY))
                         sign = "+" if final_pts >= 0 else ""
 
-                        # 1. Clean Exit Marker (Simple Arrow, No Clutter)
                         self.markers.append({
                             "time": t_sec,
                             "position": "aboveBar" if is_ce else "belowBar",
@@ -528,7 +525,6 @@ class DedicatedTradingWorker:
                             "text": f"EXIT {sim_trade['type']}",
                         })
 
-                        # Update Hover Card on Entry Bar with the final outcome
                         entry_key = str(sim_trade["entry_time_sec"])
                         if entry_key in self.history_cards:
                             self.history_cards[entry_key]["outcome"] = f"CLOSED: {sign}{final_pts}p (₹{sign}{final_inr})"
@@ -556,7 +552,6 @@ class DedicatedTradingWorker:
                         sim_trade = None
                         break
 
-                    # Trailing calculation (silent, no chart clutter)
                     if mode == "BREAKOUT":
                         if is_ce:
                             sim_trade["peak"] = max(sim_trade["peak"], h)
@@ -580,7 +575,6 @@ class DedicatedTradingWorker:
                                 sim_trade["current_sl"] = min(sim_trade["current_sl"], min(fib_tight_sl, min(min_guar_sl, prev_bar_sl)))
                     continue
 
-                # Signal Evaluation strictly 09:30 - 10:00 AM
                 if not trade_fired and datetime.time(9, 30) <= b_time < datetime.time(10, 0):
                     if h > p_orb_h:
                         p_pierced_h = True
@@ -644,7 +638,6 @@ class DedicatedTradingWorker:
                         est_opt = 75.0
                         risk_pts = round(abs(c - sl_val), 1)
 
-                        # Clean Buy Arrow
                         self.markers.append({
                             "time": t_sec,
                             "position": "belowBar" if is_ce else "aboveBar",
@@ -653,7 +646,6 @@ class DedicatedTradingWorker:
                             "text": f"BUY {trade_type}",
                         })
 
-                        # Full Hover Card Tooltip
                         self.history_cards[str(t_sec)] = {
                             "title": f"{mode} {trade_type} ({day_str})",
                             "time_str": time_label,
@@ -987,7 +979,6 @@ class DedicatedTradingWorker:
             tg_target_label = "3x ATR Runner Target" if current_mode == "BREAKOUT" else "Session VWAP Target"
             total_risk_inr = int(round(risk_pts * delta * LOT_SIZE_QTY))
 
-            # Clean Entry Arrow
             self.markers.append({
                 "time": last_c["time"],
                 "position": "belowBar" if is_ce else "aboveBar",
@@ -996,7 +987,6 @@ class DedicatedTradingWorker:
                 "text": f"BUY {trade_type}",
             })
 
-            # Full Hover Card Tooltip on Buy Signal
             self.history_cards[str(last_c["time"])] = {
                 "title": f"TODAY • {current_mode} {trade_type}",
                 "time_str": close_time_str,
@@ -1141,7 +1131,6 @@ class DedicatedTradingWorker:
         tr["final_inr"] = final_inr
         tr["outcome"] = outcome_str
 
-        # Clean Exit Arrow
         now_ts = int(time.time())
         self.markers.append({
             "time": now_ts,
