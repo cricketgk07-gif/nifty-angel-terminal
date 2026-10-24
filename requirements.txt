@@ -9,3 +9,4 @@ logzero
 python-dotenv
 plotly
 pyarrow
+scikit-learn
