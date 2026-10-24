@@ -10,7 +10,7 @@ import streamlit.components.v1 as components
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 
 st.set_page_config(
-    page_title="NIFTY Dual-Regime Master Terminal",
+    page_title="NIFTY ORB Master Terminal (59.2k)",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -60,9 +60,6 @@ fib_lines = state_data.get("fib_lines", {})
 prev_day_summary = state_data.get("prev_day_summary", {})
 hud = state_data.get("hud", {})
 
-daily_atr10 = float(state_data.get("daily_atr10", 0.0))
-is_high_vol = state_data.get("is_high_vol", False)
-vol_threshold = float(state_data.get("vol_threshold", 229.0))
 trades_taken = state_data.get("trades_taken_today", 0)
 
 saved_budget = read_redis_key("user_selected_budget")
@@ -73,15 +70,15 @@ current_budget = float(saved_budget) if saved_budget is not None else BUDGET_CEI
 # -------------------------------------------------------------
 col_title, col_budget, col_refresh = st.columns([3, 2, 1])
 
-regime_str = "BREAKOUT DAY" if is_high_vol else "FADE DAY"
-badge_color = "#00e676" if is_high_vol else "#2962ff"
-badge_text_color = "#000000" if is_high_vol else "#ffffff"
-regime_badge = f"<span style='background:{badge_color}; color:{badge_text_color}; padding:3px 10px; border-radius:4px; font-size:12px; font-weight:bold; margin-left:10px;'>{regime_str} (10-ATR: {daily_atr10:.1f})</span>"
+regime_str = "LOCKED ORB 59.2k"
+badge_color = "#00e676"
+badge_text_color = "#000000"
+regime_badge = f"<span style='background:{badge_color}; color:{badge_text_color}; padding:3px 10px; border-radius:4px; font-size:12px; font-weight:bold; margin-left:10px;'>{regime_str}</span>"
 
 with col_title:
     st.markdown(
         f"<h3 style='margin:0; padding:0; color:#e0e0e0; font-family:sans-serif;'>"
-        f"NIFTY Dual-Regime Master {regime_badge} "
+        f"NIFTY ORB Master Terminal {regime_badge} "
         f"<span id='live_ltp_display' style='color:#00e676; font-size:22px; font-weight:bold; margin-left:10px;'>₹{ltp:.2f}</span>"
         f"</h3>",
         unsafe_allow_html=True,
@@ -119,16 +116,15 @@ if prev_day_summary and prev_day_summary.get("type"):
     prev_summary_html = (
         '<div style="background:#181c27; border:1px solid #363a45; border-radius:6px; padding:10px 14px; margin-bottom:12px;">'
         '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; flex-wrap:wrap; gap:8px;">'
-        f'<span style="font-size:12px; font-weight:bold; color:#ffb74d;">📅 PREVIOUS DAY SESSION REPORT ({prev_day_summary.get("date")})</span>'
+        f'<span style="font-size:12px; font-weight:bold; color:#ffb74d;">📅 PREVIOUS SESSION REPORT ({prev_day_summary.get("date")})</span>'
         f'<span style="font-size:13px; font-weight:bold; color:{p_pnl_color};">NET SECURED: {p_sign}{p_pts:.1f} pts (₹{p_sign}{p_inr}) [{prev_day_summary.get("exit_reason")}]</span>'
         '</div>'
         '<div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">'
         f'<div style="background:#1f2430; padding:4px 10px; border-radius:4px;"><span style="color:#90a4ae; font-size:11px;">SETUP:</span> <b style="color:{p_color}; font-size:12px;">{prev_day_summary.get("regime")} {p_type}</b></div>'
         f'<div style="background:#1f2430; padding:4px 10px; border-radius:4px;"><span style="color:#90a4ae; font-size:11px;">ENTRY:</span> <b style="color:#fff; font-size:12px;">{prev_day_summary.get("entry_spot")}</b> <span style="color:#787b86; font-size:11px;">({prev_day_summary.get("entry_time")})</span></div>'
         f'<div style="background:#1f2430; padding:4px 10px; border-radius:4px;"><span style="color:#90a4ae; font-size:11px;">INITIAL SL:</span> <b style="color:#ef5350; font-size:12px;">{prev_day_summary.get("init_sl")}</b></div>'
-        f'<div style="background:#1f2430; padding:4px 10px; border-radius:4px;"><span style="color:#90a4ae; font-size:11px;">MAX TRAILED SL:</span> <b style="color:#00e676; font-size:12px;">{prev_day_summary.get("final_trail_sl")}</b></div>'
         f'<div style="background:#1f2430; padding:4px 10px; border-radius:4px;"><span style="color:#90a4ae; font-size:11px;">TARGET:</span> <b style="color:#ffb74d; font-size:12px;">{prev_day_summary.get("target_p")}</b></div>'
-        f'<div style="background:#1f2430; padding:4px 10px; border-radius:4px;"><span style="color:#90a4ae; font-size:11px;">EXIT PRICE:</span> <b style="color:#fff; font-size:12px;">{prev_day_summary.get("exit_spot")}</b> <span style="color:#787b86; font-size:11px;">({prev_day_summary.get("exit_time")})</span></div>'
+        f'<div style="background:#1f2430; padding:4px 10px; border-radius:4px;"><span style="color:#90a4ae; font-size:11px;">EXIT PRICE:</span> <b style="color:#fff; font-size:12px;">{prev_day_summary.get("exit_spot")}</b></div>'
         '</div>'
         '</div>'
     )
@@ -141,35 +137,23 @@ orb_l_display = orb_levels.get("orb_l", "—")
 pivot_p_display = pivots.get("P", "—")
 pdh_display = pivots.get("PDH", "—")
 pdl_display = pivots.get("PDL", "—")
-fib_dir = fib_lines.get("direction", "NEUTRAL")
-fib_50 = fib_lines.get("fib_50", "—")
-fib_100 = fib_lines.get("fib_100", "—")
-fib_161 = fib_lines.get("fib_161", "—")
-
-regime_mode_desc = f"BREAKOUT (≥{vol_threshold:.0f} ATR: 3x ATR Runner)" if is_high_vol else f"FADE (<{vol_threshold:.0f} ATR: 0.5 ATR Sweep to VWAP)"
 
 active_trade_type = hud.get("type") if (hud and hud.get("entry_spot")) else None
 is_trade_closed = hud.get("trade_closed", False) if hud else False
 
 now_ist = datetime.datetime.now(IST).time()
-t_start = datetime.time(9, 30)
-t_end   = datetime.time(10, 0)
 
 if active_trade_type and not is_trade_closed:
     status_label = f"<b style='color:#00e676;'>🟢 Active: TRIGGERED {active_trade_type} (BUY)</b>"
 elif is_trade_closed:
     status_label = f"<b style='color:#4fc3f7;'>🏁 Trade Completed for Today [{hud.get('exit_reason', 'CLOSED')}]</b>"
-elif now_ist < t_start:
-    status_label = "<span style='color:#90a4ae;'>⏳ Awaiting 09:30-10:00 Window Trigger</span>"
-elif t_start <= now_ist < t_end and trades_taken == 0:
-    status_label = "<b style='color:#ffb74d;'>⚡ Window Open: Monitoring for Trigger...</b>"
-elif now_ist >= t_end and trades_taken == 0:
-    status_label = "<b style='color:#78909c;'>🚫 No Trade Today (Window Closed without Trigger)</b>"
+elif trades_taken == 0:
+    status_label = "<b style='color:#ffb74d;'>⚡ Monitoring 15-min ORB Breakout...</b>"
 else:
-    status_label = "<span style='color:#90a4ae;'>Awaiting Trigger</span>"
+    status_label = "<b style='color:#78909c;'>🚫 No Trade Today (Limit Reached)</b>"
 
 # -------------------------------------------------------------
-# 4. Streamlined Strip Panel (Visible ONLY after Trigger)
+# 4. Streamlined Strip Panel
 # -------------------------------------------------------------
 if active_trade_type:
     is_call = (active_trade_type == "CE")
@@ -188,7 +172,6 @@ if active_trade_type:
 
     entry_val = f"{entry_spot:.1f} (₹{entry_opt:.2f})"
     init_sl_val = f"{sl_spot:.1f} (₹{sl_opt:.2f})"
-    
     trail_sign = "+" if secured_pts >= 0 else ""
     cur_sl_val = f"{cur_trail_spot:.1f} (₹{cur_trail_opt:.2f}) [{trail_sign}{secured_pts:.1f}p]"
 
@@ -200,11 +183,8 @@ if active_trade_type:
     for i, tg_val in enumerate(raw_targets, 1):
         tg_diff = abs(tg_val - entry_spot)
         tg_opt = max(0.5, round(entry_opt + (tg_diff * contract_delta), 2))
-        lbl = f"TARGET {i}"
-        if i == 1:
-            lbl += " (3ATR)" if hud.get("mode") == "BREAKOUT" else " (VWAP)"
         t_elements_html += (
-            f'<div style="font-size:12px;"><span style="color:#90a4ae; font-weight:bold;">{lbl} :</span> '
+            f'<div style="font-size:12px;"><span style="color:#90a4ae; font-weight:bold;">TARGET {i} :</span> '
             f'<b style="color:#ffb74d;">{tg_val:.1f} (₹{tg_opt:.2f})</b></div>'
         )
 
@@ -222,7 +202,6 @@ if active_trade_type:
         '</div>'
     )
 else:
-    # Completely disabled/standby card with no fake/hypothetical numbers
     execution_strip_panel_html = (
         '<div style="background:#121620; border:1px dashed #2a2e39; border-radius:6px; padding:12px 14px; margin-top:8px; opacity:0.65;">'
         '<span style="font-size:12px; color:#78909c; font-weight:bold; letter-spacing:0.3px;">'
@@ -240,12 +219,8 @@ complete_banner_html = (
     '</div>'
     '<div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:10px;">'
     '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
-    '<div style="font-size:11px; color:#90a4ae;">DAILY 10-ATR</div>'
-    f'<div style="font-size:13px; font-weight:bold; color:#ffb74d;">{daily_atr10:.1f} / {vol_threshold:.0f}</div>'
-    '</div>'
-    '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
-    '<div style="font-size:11px; color:#90a4ae;">REGIME MODE</div>'
-    f'<div style="font-size:13px; font-weight:bold; color:#42a5f5;">{regime_mode_desc}</div>'
+    '<div style="font-size:11px; color:#90a4ae;">STRATEGY</div>'
+    '<div style="font-size:13px; font-weight:bold; color:#00e676;">LOCKED ORB (59.2k)</div>'
     '</div>'
     '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
     '<div style="font-size:11px; color:#90a4ae;">ORB HIGH</div>'
@@ -262,10 +237,6 @@ complete_banner_html = (
     '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
     '<div style="font-size:11px; color:#90a4ae;">PDH / PDL</div>'
     f'<div style="font-size:13px; font-weight:bold; color:#42a5f5;">{pdh_display} / {pdl_display}</div>'
-    '</div>'
-    '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
-    f'<div style="font-size:11px; color:#90a4ae;">FIB 50% / 100% / 161% ({fib_dir})</div>'
-    f'<div style="font-size:13px; font-weight:bold; color:#b388ff;">{fib_50} / {fib_100} / {fib_161}</div>'
     '</div>'
     '</div>'
     '<div style="border-top:1px solid #2a2e39; padding-top:8px;">'
@@ -288,10 +259,6 @@ orb_json = json.dumps(orb_levels)
 fib_json = json.dumps(fib_lines)
 redis_url_str = UPSTASH_REDIS_REST_URL
 redis_token_str = UPSTASH_REDIS_REST_TOKEN
-
-chart_regime_text = f"BREAKOUT DAY (10-ATR: {daily_atr10:.0f} ≥ {vol_threshold:.0f})" if is_high_vol else f"FADE DAY (10-ATR: {daily_atr10:.0f} < {vol_threshold:.0f})"
-chart_badge_bg = "rgba(0, 230, 118, 0.2)" if is_high_vol else "rgba(41, 98, 255, 0.2)"
-chart_border_color = "#00e676" if is_high_vol else "#2962ff"
 
 html_code = f"""
 <!DOCTYPE html>
@@ -317,8 +284,8 @@ html_code = f"""
       position: absolute;
       top: 12px;
       left: 12px;
-      background: {chart_badge_bg};
-      border: 1px solid {chart_border_color};
+      background: rgba(0, 230, 118, 0.2);
+      border: 1px solid #00e676;
       color: #fff;
       font-size: 11px;
       font-weight: bold;
@@ -347,7 +314,7 @@ html_code = f"""
 </head>
 <body>
   <div id="chart_container">
-    <div id="regime_pill">⚡ REGIME: {chart_regime_text}</div>
+    <div id="regime_pill">⚡ LOCKED ORB STRATEGY (59,249 PTS)</div>
     <div id="hover_card"></div>
   </div>
 
@@ -357,7 +324,6 @@ html_code = f"""
     const historyCards = {history_cards_json} || {{}};
     const pivots = {pivots_json} || {{}};
     const orbLevels = {orb_json} || {{}};
-    const fibLines = {fib_json} || {{}};
     const IST_OFFSET = 19800;
 
     const formattedCandles = rawCandles.map(c => ({{
@@ -367,7 +333,7 @@ html_code = f"""
       low: c.low,
       close: c.close,
       vwap: c.vwap,
-      ema9: c.ema9
+      ema20: c.ema20
     }}));
 
     const formattedMarkers = rawMarkers.map(m => ({{
@@ -422,11 +388,11 @@ html_code = f"""
 
     const emaSeries = chart.addLineSeries({{
       color: '#2962ff',
-      lineWidth: 1,
+      lineWidth: 1.5,
       priceLineVisible: false,
-      title: 'EMA 9',
+      title: 'EMA 20',
     }});
-    emaSeries.setData(formattedCandles.filter(d => d.ema9).map(d => ({{ time: d.time, value: d.ema9 }})));
+    emaSeries.setData(formattedCandles.filter(d => d.ema20).map(d => ({{ time: d.time, value: d.ema20 }})));
 
     if (formattedMarkers.length > 0) {{
       candleSeries.setMarkers(formattedMarkers);
@@ -435,16 +401,6 @@ html_code = f"""
     // Classical Floor Pivots
     const visiblePivots = {{
       'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
-      'R1':  {{ color: '#ef5350', title: 'R1' }},
-      'R2':  {{ color: '#e53935', title: 'R2' }},
-      'R3':  {{ color: '#d32f2f', title: 'R3' }},
-      'R4':  {{ color: '#c62828', title: 'R4' }},
-      'R5':  {{ color: '#b71c1c', title: 'R5' }},
-      'S1':  {{ color: '#26a69a', title: 'S1' }},
-      'S2':  {{ color: '#00897b', title: 'S2' }},
-      'S3':  {{ color: '#00796b', title: 'S3' }},
-      'S4':  {{ color: '#00695c', title: 'S4' }},
-      'S5':  {{ color: '#004d40', title: 'S5' }},
       'PDH': {{ color: '#42a5f5', title: 'PDH' }},
       'PDL': {{ color: '#ab47bc', title: 'PDL' }},
     }};
@@ -485,34 +441,10 @@ html_code = f"""
       }});
     }}
 
-    // Dynamic ORB Fibonacci Lines
-    if (fibLines) {{
-      const fibTitles = {{
-        'ORB_MID': 'ORB MID',
-        'fib_50': 'FIB 50%',
-        'fib_100': 'FIB 100%',
-        'fib_161': 'FIB 161.8%'
-      }};
-      Object.entries(fibLines).forEach(([fKey, fVal]) => {{
-        const numVal = parseFloat(fVal);
-        if (!isNaN(numVal) && numVal > 0 && fibTitles[fKey]) {{
-          candleSeries.createPriceLine({{
-            price: numVal,
-            color: '#b388ff',
-            lineWidth: 1,
-            lineStyle: LightweightCharts.LineStyle.Dotted,
-            axisLabelVisible: true,
-            title: fibTitles[fKey],
-          }});
-        }}
-      }});
-    }}
-
     if (formattedCandles.length > 0) {{
       chart.timeScale().fitContent();
     }}
 
-    // Crosshair Hover Handler: Shows Tooltip on Buy Signals
     chart.subscribeCrosshairMove(param => {{
       if (!param || !param.time || !param.point) {{
         hoverCard.style.display = 'none';
@@ -566,8 +498,8 @@ html_code = f"""
                 if (latestCandle.vwap) {{
                   vwapSeries.update({{ time: shiftedCandle.time, value: latestCandle.vwap }});
                 }}
-                if (latestCandle.ema9) {{
-                  emaSeries.update({{ time: shiftedCandle.time, value: latestCandle.ema9 }});
+                if (latestCandle.ema20) {{
+                  emaSeries.update({{ time: shiftedCandle.time, value: latestCandle.ema20 }});
                 }}
               }}
               if (liveState && liveState.ltp) {{
