@@ -1,4 +1,5 @@
-import datetime
+from dotenv import load_dotenv
+load_dotenv()import datetime
 import html
 import http.server
 import json
