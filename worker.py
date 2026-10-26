@@ -1,3 +1,4 @@
+from dotenv import load_dotenv
 import datetime
 import html
 import http.server
@@ -16,6 +17,24 @@ from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import make_pipeline
+load_dotenv()
+def auto_cleanup_logs_and_cache(max_size_mb=10):
+    """Automatically trims worker.log if it grows too large and cleans pycache."""
+    try:
+        log_file = "worker.log"
+        if os.path.exists(log_file) and os.path.getsize(log_file) > (max_size_mb * 1024 * 1024):
+            with open(log_file, "w") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Log auto-trimmed to prevent bloat.\n")
+        
+        for root, dirs, files in os.walk("."):
+            for d in dirs:
+                if d == "__pycache__":
+                    cache_path = os.path.join(root, d)
+                    for file in os.listdir(cache_path):
+                        os.remove(os.path.join(cache_path, file))
+                    os.rmdir(cache_path)
+    except Exception as e:
+        print(f"Cleanup warning: {e}")
 
 INDEX_TOKEN = "99926000"
 LOT_SIZE_QTY = 65
