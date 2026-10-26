@@ -1,4 +1,4 @@
-print(f"[{time.strftime('%Y-%m-%d %H:%M:%S]'} -> STARTED LATEST DUAL-TRANCHE WORKER V2")
+
 from dotenv import load_dotenv
 import datetime
 import html
