@@ -1,5 +1,3 @@
-from dotenv import load_dotenv
-load_dotenv()
 import datetime
 import html
 import http.server
@@ -35,10 +33,13 @@ UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 BUDGET_CEILING = float(os.getenv("BUDGET_CEILING", "80.0"))
 PORT = int(os.getenv("PORT", 10000))
 
-# Strategy Parameters (Locked 59.2k Peak Configuration)
+# Strategy Parameters (Dual-Tranche 61.3k Locked Configuration)
 INITIAL_SL_PTS = 40.0
-TRAIL_TRIGGER_PTS = 150.0
-TRAIL_DIST_PTS = 15.0
+FIXED_TARGET_PTS = 130.0  # Tranche 1 Fixed Target (+130 pts)
+STAGE2_TRIGGER = 90.0     # Tranche 2 Trailing Stage 2
+STAGE2_BUFFER = 25.0
+STAGE3_TRIGGER = 150.0    # Tranche 2 Trailing Stage 3
+STAGE3_BUFFER = 12.0
 ML_QUANTILE = 0.50
 
 
@@ -163,7 +164,7 @@ def get_dynamic_budget():
 
 
 # ==========================================
-# 3. Strategy Core Engine (Locked 59.2k ORB + ML)
+# 3. Strategy Core Engine (Dual-Tranche Scale-Out + ML)
 # ==========================================
 class DedicatedTradingWorker:
     def __init__(self):
@@ -342,7 +343,7 @@ class DedicatedTradingWorker:
                         if body_frac < 0.45:
                             continue
 
-                        # Replay outcome for training target
+                        # Dual-Tranche Replay outcome for training target
                         et = entry_row['dt'].to_datetime64()
                         idx = np.where(group['dt'].to_numpy() >= et)[0]
                         sub_g = group.iloc[idx]
@@ -351,32 +352,70 @@ class DedicatedTradingWorker:
 
                         ce = side == 'CE'
                         entry_p = float(entry_row['open'])
-                        stop = entry_p - INITIAL_SL_PTS if ce else entry_p + INITIAL_SL_PTS
+                        initial_stop = entry_p - INITIAL_SL_PTS if ce else entry_p + INITIAL_SL_PTS
+
+                        # T1 state
+                        t1_exit = float(sub_g.iloc[-1]['close'])
+                        t1_hit = False
+
+                        # T2 state
+                        stop = initial_stop
                         active = False
                         best = entry_p
-                        exit_price = float(sub_g.iloc[-1]['close'])
+                        t2_exit = float(sub_g.iloc[-1]['close'])
 
                         for sub_idx, sub_row in sub_g.iterrows():
                             oi, hi, lo, cl = sub_row['open'], sub_row['high'], sub_row['low'], sub_row['close']
+                            
+                            # T1 check
+                            if not t1_hit:
+                                if ce and hi >= (entry_p + FIXED_TARGET_PTS):
+                                    t1_exit = entry_p + FIXED_TARGET_PTS
+                                    t1_hit = True
+                                elif not t1_hit and not ce and lo <= (entry_p - FIXED_TARGET_PTS):
+                                    t1_exit = entry_p - FIXED_TARGET_PTS
+                                    t1_hit = True
+                                elif ce and lo <= initial_stop:
+                                    t1_exit = initial_stop
+                                    t1_hit = True
+                                    break
+                                elif not ce and hi >= initial_stop:
+                                    t1_exit = initial_stop
+                                    t1_hit = True
+                                    break
+
+                            # T2 check
                             if ce and lo <= stop:
-                                exit_price = oi if oi < stop else stop
+                                t2_exit = oi if oi < stop else stop
                                 break
                             if not ce and hi >= stop:
-                                exit_price = oi if oi > stop else stop
+                                t2_exit = oi if oi > stop else stop
                                 break
-                            if not active:
-                                if ((hi - entry_p) >= TRAIL_TRIGGER_PTS if ce else (entry_p - lo) >= TRAIL_TRIGGER_PTS):
-                                    active = True
-                                    best = hi if ce else lo
-                                    stop = max(stop, best - TRAIL_DIST_PTS) if ce else min(stop, best + TRAIL_DIST_PTS)
-                            elif ce:
+                            
+                            favorable = (hi - entry_p) if ce else (entry_p - lo)
+                            if ce:
                                 best = max(best, hi)
-                                stop = max(stop, best - TRAIL_DIST_PTS)
                             else:
                                 best = min(best, lo)
-                                stop = min(stop, best + TRAIL_DIST_PTS)
 
-                        points = (exit_price - entry_p) if ce else (entry_p - exit_price)
+                            if not active:
+                                if favorable >= 50.0 and stop == initial_stop:
+                                    stop = (entry_p + 10.0) if ce else (entry_p - 10.0)
+                                if favorable >= STAGE2_TRIGGER:
+                                    active = True
+                                    stop = max(stop, best - STAGE2_BUFFER) if ce else min(stop, best + STAGE2_BUFFER)
+                            else:
+                                if favorable >= STAGE3_TRIGGER:
+                                    stop = max(stop, best - STAGE3_BUFFER) if ce else min(stop, best + STAGE3_BUFFER)
+                                else:
+                                    stop = max(stop, best - STAGE2_BUFFER) if ce else min(stop, best + STAGE2_BUFFER)
+
+                        if not t1_hit:
+                            t1_exit = float(sub_g.iloc[-1]['close'])
+
+                        t1_pts = (t1_exit - entry_p) if ce else (entry_p - t1_exit)
+                        t2_pts = (t2_exit - entry_p) if ce else (entry_p - t2_exit)
+                        points = (0.5 * t1_pts) + (0.5 * t2_pts)
 
                         candidates.append({
                             'side': side,
@@ -549,7 +588,6 @@ class DedicatedTradingWorker:
             h = float(r["high"])
             l = float(r["low"])
             ema_v = float(r["ema20"])
-            bar_atr = float(r.get("atr14", 14.0))
 
             side = None
             if c > p_orb_h and c > ema_v:
@@ -574,7 +612,7 @@ class DedicatedTradingWorker:
 
                     is_ce = (side == "CE")
                     sl_val = round(entry_p - INITIAL_SL_PTS if is_ce else entry_p + INITIAL_SL_PTS, 1)
-                    target_val = round(entry_p + 150.0 if is_ce else entry_p - 150.0, 1)
+                    target_val = round(entry_p + FIXED_TARGET_PTS if is_ce else entry_p - FIXED_TARGET_PTS, 1)
                     targets = self.compute_n_targets(entry_p, is_ce=is_ce, primary_t1=target_val)
 
                     self.markers.append({
@@ -600,7 +638,7 @@ class DedicatedTradingWorker:
                     }
                     self.prev_day_summary = {
                         "date": last_day_str,
-                        "regime": "ORB BREAKOUT",
+                        "regime": "DUAL-TRANCHE ORB",
                         "type": side,
                         "entry_time": time_label,
                         "entry_spot": entry_p,
@@ -629,11 +667,11 @@ class DedicatedTradingWorker:
 
         ce_entry = orb_h + 1.0
         ce_sl = ce_entry - INITIAL_SL_PTS
-        ce_t1 = ce_entry + 150.0
+        ce_t1 = ce_entry + FIXED_TARGET_PTS
 
         pe_entry = orb_l - 1.0
         pe_sl = pe_entry + INITIAL_SL_PTS
-        pe_t1 = pe_entry - 150.0
+        pe_t1 = pe_entry - FIXED_TARGET_PTS
 
         ce_targets = self.compute_n_targets(ce_entry, is_ce=True, primary_t1=ce_t1)
         pe_targets = self.compute_n_targets(pe_entry, is_ce=False, primary_t1=pe_t1)
@@ -823,7 +861,7 @@ class DedicatedTradingWorker:
                     X_input = pd.DataFrame([feat_dict])
                     pred_score = float(self.ml_model.predict(X_input)[0])
                     if pred_score <= self.ml_threshold:
-                        return  # Filtered out by ML model
+                        return
 
                 self.trades_taken_today += 1
                 is_ce = (side == "CE")
@@ -832,15 +870,15 @@ class DedicatedTradingWorker:
                 sl_val = round(close_p - INITIAL_SL_PTS if is_ce else close_p + INITIAL_SL_PTS, 1)
                 opt_sl = max(0.5, round(opt_ltp - (INITIAL_SL_PTS * delta), 2))
 
-                targets = self.compute_n_targets(close_p, is_ce=is_ce, primary_t1=close_p + 150.0 if is_ce else close_p - 150.0)
-                opt_t1 = max(0.5, round(opt_ltp + (abs(targets[0] - close_p) * delta), 2))
+                targets = self.compute_n_targets(close_p, is_ce=is_ce, primary_t1=close_p + FIXED_TARGET_PTS if is_ce else close_p - FIXED_TARGET_PTS)
+                opt_t1 = max(0.5, round(opt_ltp + (FIXED_TARGET_PTS * delta), 2))
 
                 date_readable = last_c["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)")
                 close_time_str = last_c["dt"].astimezone(IST).strftime("%H:%M:%S")
 
                 trade_dict = {
                     "type": side,
-                    "mode": "LOCKED ORB 59.2k",
+                    "mode": "DUAL-TRANCHE 61.3k",
                     "entry": close_p,
                     "init_sl": sl_val,
                     "current_sl": sl_val,
@@ -851,6 +889,8 @@ class DedicatedTradingWorker:
                     "active_trailing": False,
                     "best_price": close_p,
                     "closed": False,
+                    "t1_hit": False,
+                    "t1_exit_spot": None,
                     "symbol": sym,
                     "token": tok,
                     "delta": delta,
@@ -874,11 +914,11 @@ class DedicatedTradingWorker:
                     "position": "belowBar" if is_ce else "aboveBar",
                     "color": "#00e676" if is_ce else "#f23645",
                     "shape": "arrowUp" if is_ce else "arrowDown",
-                    "text": f"BUY {side}",
+                    "text": f"BUY {side} (Dual)",
                 })
 
                 self.history_cards[str(last_c["time"])] = {
-                    "title": f"LOCKED ORB • BUY {side}",
+                    "title": f"DUAL-TRANCHE • BUY {side}",
                     "time_str": close_time_str,
                     "entry": close_p,
                     "sl": sl_val,
@@ -888,16 +928,17 @@ class DedicatedTradingWorker:
                     "opt_entry": opt_ltp,
                     "opt_sl": opt_sl,
                     "type": side,
-                    "outcome": "ACTIVE RUNNER",
+                    "outcome": "ACTIVE DUAL RUNNER",
                 }
 
                 send_telegram_alert(
-                    f"⚡ <b>LOCKED ORB STRATEGY: BUY {side}</b>\n"
+                    f"⚡ <b>DUAL-TRANCHE STRATEGY: BUY {side}</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"📦 <b>CONTRACT:</b> {sym} (Qty: {LOT_SIZE_QTY}, Δ: {delta:.2f})\n"
                     f"• <b>ENTRY (SPOT):</b> {close_p:.1f} | <b>₹{opt_ltp:.2f}</b>\n"
                     f"• <b>INITIAL SL:</b> {sl_val:.1f} (-{INITIAL_SL_PTS} pts) | <b>₹{opt_sl:.2f}</b> (-₹{total_risk_inr})\n"
-                    f"• <b>TARGET 1:</b> {targets[0]:.1f} | <b>₹{opt_t1:.2f}</b>\n"
+                    f"• <b>TRANCHE 1 TARGET (50%):</b> {close_p + FIXED_TARGET_PTS if is_ce else close_p - FIXED_TARGET_PTS:.1f} | <b>₹{opt_t1:.2f}</b>\n"
+                    f"• <b>TRANCHE 2 (50%):</b> Zero-Negative Trailing Runner\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"⏰ <b>Trigger Time:</b> {close_time_str}"
                 )
@@ -910,35 +951,50 @@ class DedicatedTradingWorker:
         is_ce = tr["type"] == "CE"
         entry_p = tr["entry"]
 
+        # Check Tranche 1 Fixed Target (+130 pts)
+        if not tr.get("t1_hit", False):
+            if ce and live_spot >= (entry_p + FIXED_TARGET_PTS):
+                tr["t1_hit"] = True
+                tr["t1_exit_spot"] = entry_p + FIXED_TARGET_PTS
+                send_telegram_alert(f"🎯 <b>TRANCHE 1 BOOKED (+{FIXED_TARGET_PTS} pts)</b>\n50% position secured at Index: {tr['t1_exit_spot']:.1f}")
+            elif not ce and live_spot <= (entry_p - FIXED_TARGET_PTS):
+                tr["t1_hit"] = True
+                tr["t1_exit_spot"] = entry_p - FIXED_TARGET_PTS
+                send_telegram_alert(f"🎯 <b>TRANCHE 1 BOOKED (+{FIXED_TARGET_PTS} pts)</b>\n50% position secured at Index: {tr['t1_exit_spot']:.1f}")
+
+        # Check Stop Loss on Tranche 2 Runner
         stop_hit = (live_spot <= tr["current_sl"]) if is_ce else (live_spot >= tr["current_sl"])
         if stop_hit:
-            self.close_trade(tr["current_sl"], "STOP LOSS HIT")
+            t1_exit = tr.get("t1_exit_spot") if tr.get("t1_hit") else tr["current_sl"]
+            self.close_dual_trade(t1_exit, tr["current_sl"], "TRUNCATED STOP LOSS HIT")
             return
 
-        # Trailing Engine (150pt trigger, 15pt trail)
+        # Tranche 2 Trailing Engine (Stage 2 & 3)
         if not tr["active_trailing"]:
-            if is_ce and (live_spot - entry_p) >= TRAIL_TRIGGER_PTS:
+            favorable = (live_spot - entry_p) if is_ce else (entry_p - live_spot)
+            if favorable >= 50.0 and tr["current_sl"] == tr["init_sl"]:
+                tr["current_sl"] = round(entry_p + 10.0 if is_ce else entry_p - 10.0, 1)
+            if favorable >= STAGE2_TRIGGER:
                 tr["active_trailing"] = True
                 tr["best_price"] = live_spot
-                tr["current_sl"] = round(max(tr["current_sl"], tr["best_price"] - TRAIL_DIST_PTS), 1)
-                self.alert_sl_update(tr, "TRAILING ACTIVATED (+150pt TRIGGER)")
-            elif not is_ce and (entry_p - live_spot) >= TRAIL_TRIGGER_PTS:
-                tr["active_trailing"] = True
-                tr["best_price"] = live_spot
-                tr["current_sl"] = round(min(tr["current_sl"], tr["best_price"] + TRAIL_DIST_PTS), 1)
-                self.alert_sl_update(tr, "TRAILING ACTIVATED (+150pt TRIGGER)")
+                tr["current_sl"] = round(max(tr["current_sl"], tr["best_price"] - STAGE2_BUFFER) if is_ce else min(tr["current_sl"], tr["best_price"] + STAGE2_BUFFER), 1)
+                self.alert_sl_update(tr, "TRAILING ACTIVATED (+90pt TRIGGER)")
         else:
             if is_ce:
                 if live_spot > tr["best_price"]:
                     tr["best_price"] = live_spot
-                    new_sl = round(tr["best_price"] - TRAIL_DIST_PTS, 1)
+                    favorable = live_spot - entry_p
+                    buf = STAGE3_BUFFER if favorable >= STAGE3_TRIGGER else STAGE2_BUFFER
+                    new_sl = round(tr["best_price"] - buf, 1)
                     if new_sl > tr["current_sl"]:
                         tr["current_sl"] = new_sl
                         self.alert_sl_update(tr, "TRAIL TIGHTENED")
             else:
                 if live_spot < tr["best_price"]:
                     tr["best_price"] = live_spot
-                    new_sl = round(tr["best_price"] + TRAIL_DIST_PTS, 1)
+                    favorable = entry_p - live_spot
+                    buf = STAGE3_BUFFER if favorable >= STAGE3_TRIGGER else STAGE2_BUFFER
+                    new_sl = round(tr["best_price"] + buf, 1)
                     if new_sl < tr["current_sl"]:
                         tr["current_sl"] = new_sl
                         self.alert_sl_update(tr, "TRAIL TIGHTENED")
@@ -954,29 +1010,30 @@ class DedicatedTradingWorker:
         opt_entry = tr.get("opt_entry_ltp", 75.0)
 
         locked_pts = round((cur_sl - entry_p) if is_ce else (entry_p - cur_sl), 1)
-        locked_inr = int(round(locked_pts * delta_v * LOT_SIZE_QTY))
+        locked_inr = int(round(locked_pts * delta_v * LOT_SIZE_QTY * 0.5))  # 50% tranche weight
         gtt_opt = max(0.5, round(opt_entry + (locked_pts * delta_v), 2))
         sign = "+" if locked_pts >= 0 else ""
         t_now = datetime.datetime.now(IST).strftime("%H:%M:%S")
 
         send_telegram_alert(
-            f"🔔 <b>NIFTY {tr['type']} TRAILING SL UPDATED</b>\n"
+            f"🔔 <b>NIFTY {tr['type']} RUNNER SL UPDATED</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"<b>STAGE:</b> {reason}\n"
             f"<b>CONTRACT:</b> {tr['symbol']}\n"
-            f"🛡 <b>UPDATE STOP LOSS TO:</b>\n"
-            f"• <b>INDEX (SPOT):</b> {cur_sl:.1f}\n"
-            f"• <b>OPTION (GTT ₹):</b> ₹{gtt_opt:.2f}\n"
-            f"🔒 <b>LOCKED PROFIT:</b> {sign}{locked_pts:.1f} pts (₹{sign}{locked_inr})\n"
+            f"🛡 <b>RUNNER STOP LOSS:</b> {cur_sl:.1f}\n"
+            f"🔒 <b>LOCKED RUNNER PROFIT:</b> {sign}{locked_pts:.1f} pts (₹{sign}{locked_inr})\n"
             f"⏰ <b>Time:</b> {t_now}"
         )
 
-    def close_trade(self, exit_spot, reason):
+    def close_dual_trade(self, t1_exit_spot, t2_exit_spot, reason):
         tr = self.locked_trade
         is_ce = tr["type"] == "CE"
         entry_p = tr["entry"]
         delta_v = tr.get("delta", 0.50)
-        final_pts = round((exit_spot - entry_p) if is_ce else (entry_p - exit_spot), 1)
+
+        t1_pts = (t1_exit_spot - entry_p) if is_ce else (entry_p - t1_exit_spot)
+        t2_pts = (t2_exit_spot - entry_p) if is_ce else (entry_p - t2_exit_spot)
+        final_pts = round((0.5 * t1_pts) + (0.5 * t2_pts), 2)
         final_inr = int(round(final_pts * delta_v * LOT_SIZE_QTY))
         sign = "+" if final_pts >= 0 else ""
         outcome_str = "PROFIT" if final_pts > 0 else "LOSS"
@@ -984,7 +1041,7 @@ class DedicatedTradingWorker:
         t_now = datetime.datetime.now(IST).strftime("%H:%M:%S")
 
         tr["closed"] = True
-        tr["exit_spot"] = exit_spot
+        tr["exit_spot"] = t2_exit_spot
         tr["exit_reason"] = reason
         tr["exit_time"] = t_now
         tr["final_pts"] = final_pts
@@ -997,29 +1054,31 @@ class DedicatedTradingWorker:
             "position": "aboveBar" if is_ce else "belowBar",
             "color": "#ef5350" if is_ce else "#00e676",
             "shape": "arrowDown" if is_ce else "arrowUp",
-            "text": f"EXIT {tr['type']}",
+            "text": f"EXIT DUAL {tr['type']}",
         })
 
         e_key = str(tr["time"])
         if e_key in self.history_cards:
             self.history_cards[e_key]["outcome"] = f"CLOSED: {sign}{final_pts}p (₹{sign}{final_inr})"
-            self.history_cards[e_key]["exit_price"] = exit_spot
+            self.history_cards[e_key]["exit_price"] = t2_exit_spot
             self.history_cards[e_key]["exit_reason"] = reason
 
         self.today_trade_record = tr.copy()
         self.locked_trade = None
 
         send_telegram_alert(
-            f"🏁 <b>TRADE CLOSED ({reason})</b>\n"
+            f"🏁 <b>DUAL-TRANCHE TRADE CLOSED ({reason})</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🚪 <b>Exit Price (Spot):</b> {exit_spot:.1f}\n"
-            f"💰 <b>Net PnL:</b> {sign}{final_pts:.1f} pts (₹{sign}{final_inr})\n"
+            f"🚪 <b>T1 Exit:</b> {t1_exit_spot:.1f} | <b>T2 Exit:</b> {t2_exit_spot:.1f}\n"
+            f"💰 <b>Blended Net PnL:</b> {sign}{final_pts:.2f} pts (₹{sign}{final_inr})\n"
             f"📋 <b>Daily Limit:</b> 1/1 Trade Completed for Today.\n"
             f"⏰ <b>Exit Time:</b> {t_now}"
         )
 
     def execute_eod_exit(self, ltp):
-        self.close_trade(ltp, "MANDATORY 15:15 EOD SQUARE-OFF")
+        tr = self.locked_trade
+        t1_exit = tr.get("t1_exit_spot") if tr.get("t1_hit") else ltp
+        self.close_dual_trade(t1_exit, ltp, "MANDATORY 15:15 EOD SQUARE-OFF")
 
     def sync_state(self, live_ltp, force=False):
         now_ts = time.time()
@@ -1028,7 +1087,6 @@ class DedicatedTradingWorker:
         self.last_push_time = now_ts
 
         tr_source = self.locked_trade or self.today_trade_record
-
         opt_ltp = 0.0
         hud_payload = {}
 
