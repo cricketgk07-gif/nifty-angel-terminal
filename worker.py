@@ -1,4 +1,3 @@
-
 from dotenv import load_dotenv
 import datetime
 import html
@@ -53,7 +52,7 @@ UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 BUDGET_CEILING = float(os.getenv("BUDGET_CEILING", "80.0"))
 PORT = int(os.getenv("PORT", 10000))
 
-# Strategy Parameters (Dual-Tranche 61.3k Locked Configuration)
+# Strategy Parameters (Dual-Tranche Locked Configuration)
 INITIAL_SL_PTS = 40.0
 FIXED_TARGET_PTS = 130.0  # Tranche 1 Fixed Target (+130 pts)
 STAGE2_TRIGGER = 90.0     # Tranche 2 Trailing Stage 2
@@ -360,7 +359,7 @@ class DedicatedTradingWorker:
                         loc = (close_v - low_v) / rng
                         body_frac = abs(close_v - open_v) / rng
 
-                        if body_frac < 0.45:
+                        if body_frac < 0.40:
                             continue
 
                         # Dual-Tranche Replay outcome for training target
@@ -623,7 +622,7 @@ class DedicatedTradingWorker:
                     if rng == 0:
                         continue
                     body_frac = abs(c - o) / rng
-                    if body_frac < 0.45:
+                    if body_frac < 0.40:
                         continue
 
                     entry_p = float(entry_r["open"])
@@ -859,7 +858,7 @@ class DedicatedTradingWorker:
                 if rng == 0:
                     return
                 body_frac = abs(close_p - open_p) / rng
-                if body_frac < 0.45:
+                if body_frac < 0.40:
                     return
 
                 # ML Pruning Filter Check
@@ -973,11 +972,11 @@ class DedicatedTradingWorker:
 
         # Check Tranche 1 Fixed Target (+130 pts)
         if not tr.get("t1_hit", False):
-            if ce and live_spot >= (entry_p + FIXED_TARGET_PTS):
+            if is_ce and live_spot >= (entry_p + FIXED_TARGET_PTS):
                 tr["t1_hit"] = True
                 tr["t1_exit_spot"] = entry_p + FIXED_TARGET_PTS
                 send_telegram_alert(f"🎯 <b>TRANCHE 1 BOOKED (+{FIXED_TARGET_PTS} pts)</b>\n50% position secured at Index: {tr['t1_exit_spot']:.1f}")
-            elif not ce and live_spot <= (entry_p - FIXED_TARGET_PTS):
+            elif not is_ce and live_spot <= (entry_p - FIXED_TARGET_PTS):
                 tr["t1_hit"] = True
                 tr["t1_exit_spot"] = entry_p - FIXED_TARGET_PTS
                 send_telegram_alert(f"🎯 <b>TRANCHE 1 BOOKED (+{FIXED_TARGET_PTS} pts)</b>\n50% position secured at Index: {tr['t1_exit_spot']:.1f}")
