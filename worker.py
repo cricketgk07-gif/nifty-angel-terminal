@@ -44,15 +44,15 @@ API_KEY = os.getenv("API_KEY", "")
 CLIENT_CODE = os.getenv("CLIENT_CODE", "")
 PIN = os.getenv("PIN", "")
 TOTP_SECRET = os.getenv("TOTP_SECRET", "")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8925956740:AAHHo18Gp-rwlsGlnsyS5mz40RbvIN_tXqw")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "6898891302")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 BUDGET_CEILING = float(os.getenv("BUDGET_CEILING", "80.0"))
 PORT = int(os.getenv("PORT", 10000))
 
-# Strategy Parameters (Dual-Tranche Locked Configuration)
+# Strategy Parameters (Dual-Tranche 61.3k Locked Configuration)
 INITIAL_SL_PTS = 40.0
 FIXED_TARGET_PTS = 130.0  # Tranche 1 Fixed Target (+130 pts)
 STAGE2_TRIGGER = 90.0     # Tranche 2 Trailing Stage 2
