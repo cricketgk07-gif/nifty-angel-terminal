@@ -260,10 +260,16 @@ class DedicatedTradingWorker:
             print(f"[Auth Error]: Session generation failed: {e}")
 
     def load_scrip_master(self):
+        print("[Scrip Master]: Downloading NFO scrip master from Angel One...")
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
         try:
-            r = requests.get(url, timeout=15)
+            r = requests.get(url, timeout=12)
+            if r.status_code != 200:
+                print(f"[Scrip Master Warning]: Failed to download (Status {r.status_code}). Using fallback.")
+                return pd.DataFrame()
+            
             data = r.json()
+            print(f"[Scrip Master]: Parsed {len(data)} total instruments. Filtering NFO NIFTY options...")
             nfo_items = [
                 x for x in data
                 if x.get("exch_seg") == "NFO"
@@ -274,11 +280,14 @@ class DedicatedTradingWorker:
             if not df.empty:
                 df["strike_num"] = pd.to_numeric(df["strike"], errors="coerce") / 100.0
                 df["exp_dt"] = pd.to_datetime(df["expiry"], format="%d%b%Y", errors="coerce")
+            print(f"[Scrip Master]: Successfully loaded {len(df)} Nifty option contracts.")
             return df
-        except Exception:
+        except Exception as e:
+            print(f"[Scrip Master Error]: {e}. Using empty fallback to prevent freezing.")
             return pd.DataFrame()
 
     def init_historical_candles(self):
+        print("[Historical Candles]: Fetching multi-day 5-minute candles from Angel One...")
         now = datetime.datetime.now(IST)
         for days_back in [15, 7, 5]:
             from_dt = now - datetime.timedelta(days=days_back)
@@ -316,6 +325,7 @@ class DedicatedTradingWorker:
         if not self.candles:
             return
 
+        print("[ML Model]: Training Random Forest model on historical candle features...")
         df = pd.DataFrame(self.candles)
         df['dt'] = pd.to_datetime(df['dt'])
         df['day_key'] = df['dt'].apply(lambda d: (d.tz_localize(IST) if d.tzinfo is None else d.astimezone(IST)).strftime('%Y-%m-%d'))
