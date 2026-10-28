@@ -13,6 +13,7 @@ import os
 import socketserver
 import threading
 import time
+import numpy as np
 import pandas as pd
 import pyotp
 import requests
@@ -26,7 +27,6 @@ from sklearn.pipeline import make_pipeline
 load_dotenv()
 
 def auto_cleanup_logs_and_cache(max_size_mb=10):
-    """Automatically trims worker.log if it grows too large and cleans pycache."""
     try:
         log_file = "worker.log"
         if os.path.exists(log_file) and os.path.getsize(log_file) > (max_size_mb * 1024 * 1024):
@@ -317,7 +317,8 @@ class DedicatedTradingWorker:
             return
 
         df = pd.DataFrame(self.candles)
-        df['day_key'] = df['dt'].dt.strftime('%Y-%m-%d')
+        df['dt'] = pd.to_datetime(df['dt'])
+        df['day_key'] = df['dt'].apply(lambda d: (d.tz_localize(IST) if d.tzinfo is None else d.astimezone(IST)).strftime('%Y-%m-%d'))
         df['prev_close'] = df['close'].shift(1)
         df['tr'] = np.maximum(
             df['high'] - df['low'],
@@ -332,7 +333,9 @@ class DedicatedTradingWorker:
         for day_key, group in byday.items():
             if len(group) < 6:
                 continue
-            if group.iloc[0]['dt'].time() != datetime.time(9, 15):
+            dt_first = pd.to_datetime(group.iloc[0]['dt'])
+            dt_first_ist = dt_first.tz_localize(IST) if dt_first.tzinfo is None else dt_first.astimezone(IST)
+            if dt_first_ist.time() != datetime.time(9, 15):
                 continue
 
             orb_window = group.iloc[0:3]
@@ -345,7 +348,9 @@ class DedicatedTradingWorker:
 
             for i in range(3, len(group) - 2):
                 row = group.iloc[i]
-                t = row['dt'].time()
+                dt_row = pd.to_datetime(row['dt'])
+                dt_row_ist = dt_row.tz_localize(IST) if dt_row.tzinfo is None else dt_row.astimezone(IST)
+                t = dt_row_ist.time()
                 if t > datetime.time(14, 30) or t < datetime.time(9, 30):
                     continue
 
@@ -373,8 +378,9 @@ class DedicatedTradingWorker:
                         if body_frac < 0.30:
                             continue
 
-                        et = entry_row['dt'].to_datetime64()
-                        idx = np.where(group['dt'].to_numpy() >= et)[0]
+                        et = pd.to_datetime(entry_row['dt'])
+                        group_dt = pd.to_datetime(group['dt'])
+                        idx = np.where(group_dt >= et)[0]
                         sub_g = group.iloc[idx]
                         if len(sub_g) == 0:
                             continue
@@ -554,8 +560,9 @@ class DedicatedTradingWorker:
             return
 
         df_h = pd.DataFrame(self.candles)
-        df_h["date_str"] = df_h["dt"].apply(lambda d: d.astimezone(IST).strftime("%Y-%m-%d"))
-        df_h["time_only"] = df_h["dt"].apply(lambda d: d.astimezone(IST).time())
+        df_h['dt'] = pd.to_datetime(df_h['dt'])
+        df_h["date_str"] = df_h["dt"].apply(lambda d: (d.tz_localize(IST) if d.tzinfo is None else d.astimezone(IST)).strftime("%Y-%m-%d"))
+        df_h["time_only"] = df_h["dt"].apply(lambda d: (d.tz_localize(IST) if d.tzinfo is None else d.astimezone(IST)).time())
         unique_days = list(df_h["date_str"].unique())
 
         today_str = self.today.strftime("%Y-%m-%d")
@@ -608,7 +615,9 @@ class DedicatedTradingWorker:
 
                     entry_p = float(entry_r["open"])
                     t_sec = int(entry_r["time"])
-                    time_label = (entry_r["dt"].astimezone(IST)).strftime("%H:%M")
+                    dt_entry_r = pd.to_datetime(entry_r['dt'])
+                    dt_entry_r_ist = dt_entry_r.tz_localize(IST) if dt_entry_r.tzinfo is None else dt_entry_r.astimezone(IST)
+                    time_label = dt_entry_r_ist.strftime("%H:%M")
 
                     is_ce = (side == "CE")
                     sl_val = round(entry_p - INITIAL_SL_PTS if is_ce else entry_p + INITIAL_SL_PTS, 1)
@@ -702,7 +711,8 @@ class DedicatedTradingWorker:
             return
 
         df_h = pd.DataFrame(self.candles)
-        df_h["date_str"] = df_h["dt"].apply(lambda d: d.astimezone(IST).strftime("%Y-%m-%d"))
+        df_h['dt'] = pd.to_datetime(df_h['dt'])
+        df_h["date_str"] = df_h["dt"].apply(lambda d: (d.tz_localize(IST) if d.tzinfo is None else d.astimezone(IST)).strftime("%Y-%m-%d"))
 
         df_h["hlc3"] = (df_h["high"] + df_h["low"] + df_h["close"]) / 3.0
         candle_spread = (df_h["high"] - df_h["low"]) + (df_h["close"] - df_h["open"]).abs()
@@ -802,17 +812,15 @@ class DedicatedTradingWorker:
         self.sync_state(ltp)
 
     def evaluate_locked_orb_entry(self):
-        """Strict Backtest Parity Entry Logic:
-        Requires checking break_row (candles[-2]) and conf_row (candles[-1]), 
-        entering on the open of the current active bar.
-        """
         if not is_market_hours() or self.locked_trade or self.trades_taken_today >= 1 or len(self.candles) < 5:
             return
 
         break_row = self.candles[-2]
         conf_row = self.candles[-1]
 
-        t_open = break_row["dt"].astimezone(IST).time()
+        break_dt = pd.to_datetime(break_row["dt"])
+        break_dt_ist = break_dt.tz_localize(IST) if break_dt.tzinfo is None else break_dt.astimezone(IST)
+        t_open = break_dt_ist.time()
         if t_open > datetime.time(14, 30) or t_open < datetime.time(9, 30):
             return
 
@@ -847,7 +855,6 @@ class DedicatedTradingWorker:
                 if body_frac < 0.30:
                     return
 
-                # ML Pruning Filter Check (Quantile 0.52)
                 if self.ml_model is not None:
                     feat_dict = {
                         'side': 1 if side == 'CE' else -1,
@@ -889,8 +896,10 @@ class DedicatedTradingWorker:
                 targets = self.compute_n_targets(entry_p, is_ce=is_ce, primary_t1=entry_p + 100.0 if is_ce else entry_p - 100.0)
                 opt_t1 = max(0.5, round(opt_ltp + (100.0 * delta), 2))
 
-                date_readable = conf_row["dt"].astimezone(IST).strftime("%d-%b-%Y (%A)")
-                close_time_str = conf_row["dt"].astimezone(IST).strftime("%H:%M:%S")
+                conf_dt = pd.to_datetime(conf_row["dt"])
+                conf_dt_ist = conf_dt.tz_localize(IST) if conf_dt.tzinfo is None else conf_dt.astimezone(IST)
+                date_readable = conf_dt_ist.strftime("%d-%b-%Y (%A)")
+                close_time_str = conf_dt_ist.strftime("%H:%M:%S")
 
                 trade_dict = {
                     "type": side,
