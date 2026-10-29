@@ -1064,7 +1064,7 @@ class DedicatedTradingWorker:
 
     def sync_state(self, live_ltp, force=False):
         now_ts = time.time()
-        if not force and (now_ts - self.last_push_time < 1.0):
+        if not force and (now_ts - self.last_push_time < 5.0):
             return
         self.last_push_time = now_ts
 
