@@ -162,7 +162,7 @@ def push_to_redis(key, data_obj):
     url = f"{UPSTASH_REDIS_REST_URL}/set/{key}"
     headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
     try:
-        requests.post(url, headers=headers, data=json.dumps(data_obj), timeout=3)
+        requests.post(url, headers=headers, data=json.dumps(data_obj, default=str), timeout=3)
     except Exception as e:
         print(f"[Redis Push Error]: {e}")
 
@@ -293,7 +293,7 @@ class DedicatedTradingWorker:
     def init_historical_candles(self):
         print("[Historical Candles]: Fetching multi-day 5-minute candles from Angel One...")
         now = datetime.datetime.now(IST)
-        for days_back in [30, 15, 7, 5]:
+        for days_back in [60, 45, 30, 15]:
             from_dt = now - datetime.timedelta(days=days_back)
             try:
                 resp = self.api.getCandleData({
