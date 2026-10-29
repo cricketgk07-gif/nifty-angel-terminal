@@ -1,6 +1,6 @@
-"""Nifty 50 ORB 1-Lot Strategy Production Worker Module (100% Full Parity)
+"""Nifty 50 ORB 1-Lot Strategy Production Worker Module (Decoupled Autonomous Mode)
 Golden Locked Baseline: 53,404.65 Net Points | 0 Negative Months | Quantile 0.52
-Includes Full Feature Engineering Pipeline, Random Forest Pruning, and Trailing Rules.
+Clean Separation: Autonomous API History Audit / Excel Export vs. Live WebSocket Streaming & Redis Sync.
 """
 
 from dotenv import load_dotenv
@@ -210,7 +210,7 @@ def get_dynamic_budget():
 
 
 # ==========================================
-# 3. Strategy Core Engine (100% Full Parity)
+# 3. Strategy Core Engine (Decoupled Production Mode)
 # ==========================================
 class DedicatedTradingWorker:
     def __init__(self):
@@ -255,8 +255,8 @@ class DedicatedTradingWorker:
 
         self.nfo_df = self.load_scrip_master()
         self.init_historical_candles()
-        self.train_ml_model_from_csv()
-        self.simulate_historical_trades_from_csv()
+        self.train_ml_model_from_api_candles()
+        self.simulate_historical_trades_from_api_candles()
         self.update_pretrade_contract_forecast()
 
         threading.Thread(target=self.background_option_poller, daemon=True).start()
@@ -331,91 +331,263 @@ class DedicatedTradingWorker:
             except Exception as e:
                 print(f"[Candles Error]: {e}")
 
-    def train_ml_model_from_csv(self):
-        csv_filename = "GOLDEN_LOCKED_SIGNALS.csv"
-        if not os.path.exists(csv_filename):
+    def train_ml_model_from_api_candles(self):
+        if not self.candles:
             return
-        try:
-            df_csv = pd.read_csv(csv_filename)
-            if 'predicted_expected_points' in df_csv.columns and len(df_csv) > 0:
-                self.ml_threshold = float(df_csv['predicted_expected_points'].quantile(1.0 - ML_QUANTILE))
-                
-                # Train model instance for live evaluation parity
-                for col in FEATURE_COLUMNS:
-                    if col not in df_csv.columns:
-                        df_csv[col] = 0.0
-                X = df_csv[FEATURE_COLUMNS].copy()
-                X['side'] = X['side'].map({'CE': 1, 'PE': -1})
-                y = df_csv['target_points'].to_numpy(float)
-                
-                self.ml_model = make_pipeline(
-                    SimpleImputer(strategy='median'),
-                    RandomForestRegressor(n_estimators=1500, min_samples_leaf=2, max_depth=22, max_features=0.9, random_state=42, n_jobs=-1)
-                )
-                self.ml_model.fit(X, y)
-                print(f"[ML Model Initialized & Threshold Loaded]: Quantile {ML_QUANTILE} Threshold = {self.ml_threshold:.2f}")
-        except Exception as e:
-            print(f"[ML Model Warning]: {e}")
+        df = pd.DataFrame(self.candles)
+        df['dt'] = pd.to_datetime(df['dt'])
+        df['day_key'] = df['dt'].apply(lambda d: (d.tz_localize(IST) if d.tzinfo is None else d.astimezone(IST)).strftime('%Y-%m-%d'))
+        df['prev_close'] = df['close'].shift(1)
+        df['tr'] = np.maximum(
+            df['high'] - df['low'],
+            np.maximum(abs(df['high'] - df['prev_close']), abs(df['low'] - df['prev_close']))
+        )
+        df['atr14'] = df['tr'].rolling(window=14).mean().bfill()
+        df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
 
-    def simulate_historical_trades_from_csv(self):
-        csv_filename = "GOLDEN_LOCKED_SIGNALS.csv"
-        if not os.path.exists(csv_filename):
-            print(f"[History Audit]: {csv_filename} not found.")
+        byday = {k: g.reset_index(drop=True) for k, g in df.groupby('day_key', sort=False)}
+        candidates = []
+
+        for day_key, group in byday.items():
+            if len(group) < 6:
+                continue
+            dt_first = pd.to_datetime(group.iloc[0]['dt'])
+            dt_first_ist = dt_first.tz_localize(IST) if dt_first.tzinfo is None else dt_first.astimezone(IST)
+            if dt_first_ist.time() != datetime.time(9, 15):
+                continue
+
+            orb_window = group.iloc[0:3]
+            orb_high = orb_window['high'].max()
+            orb_low = orb_window['low'].min()
+            orb_width = orb_high - orb_low
+
+            if orb_width > 160.0 or orb_width < 12.0:
+                continue
+
+            for i in range(3, len(group) - 2):
+                row = group.iloc[i]
+                t = pd.to_datetime(row['dt']).time()
+                if t > datetime.time(14, 30) or t < datetime.time(9, 30):
+                    continue
+
+                side = None
+                if row['close'] > orb_high and row['close'] > row['ema20']:
+                    side = 'CE'
+                elif row['close'] < orb_low and row['close'] < row['ema20']:
+                    side = 'PE'
+
+                if side:
+                    conf_row = group.iloc[i + 1]
+                    entry_row = group.iloc[i + 2]
+
+                    is_ce_confirmed = (side == 'CE' and conf_row['close'] > orb_high and conf_row['close'] > conf_row['open'])
+                    is_pe_confirmed = (side == 'PE' and conf_row['close'] < orb_low and conf_row['close'] < conf_row['open'])
+
+                    if is_ce_confirmed or is_pe_confirmed:
+                        high_v, low_v, open_v, close_v = row['high'], row['low'], row['open'], row['close']
+                        rng = high_v - low_v
+                        if rng == 0:
+                            continue
+                        loc = (close_v - low_v) / rng
+                        body_frac = abs(close_v - open_v) / rng
+                        if body_frac < 0.30:
+                            continue
+
+                        et = pd.to_datetime(entry_row['dt'])
+                        group_dt = pd.to_datetime(group['dt'])
+                        idx = np.where(group_dt >= et)[0]
+                        sub_g = group.iloc[idx]
+                        if len(sub_g) == 0:
+                            continue
+
+                        ce = side == 'CE'
+                        entry_p = float(entry_row['open'])
+                        initial_stop = entry_p - INITIAL_SL_PTS if ce else entry_p + INITIAL_SL_PTS
+                        stop = initial_stop
+                        best_val = entry_p
+                        exit_price = float(sub_g.iloc[-1]['close'])
+
+                        for sub_row in sub_g.itertuples(index=False):
+                            oi, hi, lo, cl = sub_row.open, sub_row.high, sub_row.low, sub_row.close
+                            if ce and lo <= stop:
+                                exit_price = oi if oi < stop else stop
+                                break
+                            if not ce and hi >= stop:
+                                exit_price = oi if oi > stop else stop
+                                break
+
+                            favorable_high = (hi - entry_p) if ce else (entry_p - lo)
+                            favorable_close = (cl - entry_p) if ce else (entry_p - cl)
+
+                            if ce:
+                                best_val = max(best_val, cl, hi)
+                            else:
+                                best_val = min(best_val, cl, lo)
+
+                            if favorable_high >= STAGE3_TRIGGER or favorable_close >= STAGE3_TRIGGER:
+                                stop = max(stop, best_val - STAGE3_BUFFER) if ce else min(stop, best_val + STAGE3_BUFFER)
+                            elif favorable_high >= STAGE2_TRIGGER or favorable_close >= STAGE2_TRIGGER:
+                                stop = max(stop, best_val - STAGE2_BUFFER) if ce else min(stop, best_val + STAGE2_BUFFER)
+                            elif favorable_high >= STAGE1_TRIGGER or favorable_close >= STAGE1_TRIGGER:
+                                stop = max(stop, entry_p + STAGE1_BUFFER) if ce else min(stop, entry_p - STAGE1_BUFFER)
+
+                        points = (exit_price - entry_p) if ce else (entry_p - exit_price)
+
+                        candidates.append({
+                            'side': side, 'orb_width': orb_width, 'range': rng, 'loc': loc,
+                            'body_frac': body_frac, 'upper_wick': (high_v - max(open_v, close_v)) / rng,
+                            'lower_wick': (min(open_v, close_v) - low_v) / rng, 'atr14': row['atr14'],
+                            'ema_dist_atr': (close_v - row['ema20']) / row['atr14'] if row['atr14'] > 0 else 0,
+                            'ext_atr': abs(close_v - row['ema20']) / row['atr14'] if row['atr14'] > 0 else 0,
+                            'range_lag1': rng, 'range_lag2': rng, 'range_lag3': rng,
+                            'loc_lag1': loc, 'loc_lag2': loc, 'loc_lag3': loc,
+                            'prior3_move_atr': (rng * 3.0) / row['atr14'] if row['atr14'] > 0 else 0,
+                            'prev_avg_range3_atr': rng / row['atr14'] if row['atr14'] > 0 else 0,
+                            'target_points': points
+                        })
+                        break
+
+        if candidates:
+            cand_df = pd.DataFrame(candidates)
+            for f in FEATURE_COLUMNS:
+                if f not in cand_df.columns:
+                    cand_df[f] = 0.0
+            X = cand_df[FEATURE_COLUMNS].copy()
+            X['side'] = X['side'].map({'CE': 1, 'PE': -1})
+            y = cand_df['target_points'].to_numpy(float)
+
+            self.ml_model = make_pipeline(
+                SimpleImputer(strategy='median'),
+                RandomForestRegressor(n_estimators=500, min_samples_leaf=2, max_depth=16, random_state=42, n_jobs=-1)
+            )
+            self.ml_model.fit(X, y)
+            preds = self.ml_model.predict(X)
+            self.ml_threshold = float(np.quantile(preds, ML_QUANTILE))
+
+    def simulate_historical_trades_from_api_candles(self):
+        if not self.candles:
             return
+        df = pd.DataFrame(self.candles)
+        df['dt'] = pd.to_datetime(df['dt'])
+        df['day_key'] = df['dt'].apply(lambda d: (d.tz_localize(IST) if d.tzinfo is None else d.astimezone(IST)).strftime('%Y-%m-%d'))
+        df['prev_close'] = df['close'].shift(1)
+        df['tr'] = np.maximum(df['high'] - df['low'], np.maximum(abs(df['high'] - df['prev_close']), abs(df['low'] - df['prev_close'])))
+        df['atr14'] = df['tr'].rolling(window=14).mean().bfill()
+        df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
 
-        try:
-            df_csv = pd.read_csv(csv_filename)
-        except Exception as e:
-            print(f"[History Audit]: Error reading {csv_filename}: {e}")
-            return
+        byday = {k: g.reset_index(drop=True) for k, g in df.groupby('day_key', sort=False)}
 
-        print(f"[History Audit]: Loading {len(df_csv)} golden locked signals from {csv_filename}...")
-        
-        for _, row in df_csv.iterrows():
-            day_str = str(row['day'])[:10]
-            side = str(row['side'])
-            entry_p = float(row['entry_price'])
-            target_pts = float(row['target_points'])
-            
-            entry_time_str = str(row['entry_time'])
-            try:
-                dt_entry = pd.to_datetime(entry_time_str)
-                dt_entry_ist = dt_entry.tz_localize(IST) if dt_entry.tzinfo is None else dt_entry.astimezone(IST)
-                t_sec = int(dt_entry_ist.timestamp())
-                time_label = dt_entry_ist.strftime("%H:%M")
-            except Exception:
-                t_sec = int(time.time())
-                time_label = "09:40"
+        for day_key, group in byday.items():
+            if len(group) < 6:
+                continue
+            dt_first = pd.to_datetime(group.iloc[0]['dt'])
+            dt_first_ist = dt_first.tz_localize(IST) if dt_first.tzinfo is None else dt_first.astimezone(IST)
+            if dt_first_ist.time() != datetime.time(9, 15):
+                continue
 
-            is_ce = (side == "CE")
-            sl_val = round(entry_p - INITIAL_SL_PTS if is_ce else entry_p + INITIAL_SL_PTS, 1)
-            exit_price = round(entry_p + target_pts if is_ce else entry_p - target_pts, 2)
-            outcome_str = f"NET: {target_pts:+.2f} pts"
+            orb_window = group.iloc[0:3]
+            orb_high = orb_window['high'].max()
+            orb_low = orb_window['low'].min()
+            orb_width = orb_high - orb_low
+            if orb_width > 160.0 or orb_width < 12.0:
+                continue
 
-            self.markers.append({
-                "time": t_sec,
-                "position": "belowBar" if is_ce else "aboveBar",
-                "color": "#00e676" if is_ce else "#f23645",
-                "shape": "arrowUp" if is_ce else "arrowDown",
-                "text": f"BUY {side} ({target_pts:+.1f}p)",
-            })
+            for i in range(3, len(group) - 2):
+                row = group.iloc[i]
+                t = pd.to_datetime(row['dt']).time()
+                if t > datetime.time(14, 30) or t < datetime.time(9, 30):
+                    continue
 
-            self.history_cards[str(t_sec)] = {
-                "title": f"ORB {side} [{day_str}]",
-                "time_str": str(time_label),
-                "entry": float(entry_p),
-                "sl": float(sl_val),
-                "max_trail_sl": float(sl_val),
-                "exit_price": float(exit_price),
-                "target": float(entry_p + 100.0 if is_ce else entry_p - 100.0),
-                "delta": 0.50,
-                "opt_entry": 75.0,
-                "opt_sl": 55.0,
-                "type": str(side),
-                "outcome": str(outcome_str),
-            }
+                side = None
+                if row['close'] > orb_high and row['close'] > row['ema20']:
+                    side = 'CE'
+                elif row['close'] < orb_low and row['close'] < row['ema20']:
+                    side = 'PE'
 
-        print(f"[History Audit]: Successfully mapped {len(self.history_cards)} golden locked trades from CSV baseline.")
+                if side:
+                    conf_row = group.iloc[i + 1]
+                    entry_row = group.iloc[i + 2]
+
+                    is_ce_confirmed = (side == 'CE' and conf_row['close'] > orb_high and conf_row['close'] > conf_row['open'])
+                    is_pe_confirmed = (side == 'PE' and conf_row['close'] < orb_low and conf_row['close'] < conf_row['open'])
+
+                    if is_ce_confirmed or is_pe_confirmed:
+                        high_v, low_v, open_v, close_v = row['high'], row['low'], row['open'], row['close']
+                        rng = high_v - low_v
+                        if rng == 0:
+                            continue
+                        body_frac = abs(close_v - open_v) / rng
+                        if body_frac < 0.30:
+                            continue
+
+                        et = pd.to_datetime(entry_row['dt'])
+                        et_ist = et.tz_localize(IST) if et.tzinfo is None else et.astimezone(IST)
+                        t_sec = int(et_ist.timestamp())
+                        time_label = et_ist.strftime("%H:%M")
+
+                        ce = side == 'CE'
+                        entry_p = float(entry_row['open'])
+                        initial_stop = entry_p - INITIAL_SL_PTS if ce else entry_p + INITIAL_SL_PTS
+                        stop = initial_stop
+                        best_val = entry_p
+
+                        group_dt = pd.to_datetime(group['dt'])
+                        idx = np.where(group_dt >= et)[0]
+                        sub_g = group.iloc[idx]
+                        if len(sub_g) == 0:
+                            continue
+                        exit_price = float(sub_g.iloc[-1]['close'])
+
+                        for sub_row in sub_g.itertuples(index=False):
+                            oi, hi, lo, cl = sub_row.open, sub_row.high, sub_row.low, sub_row.close
+                            if ce and lo <= stop:
+                                exit_price = oi if oi < stop else stop
+                                break
+                            if not ce and hi >= stop:
+                                exit_price = oi if oi > stop else stop
+                                break
+
+                            favorable_high = (hi - entry_p) if ce else (entry_p - lo)
+                            favorable_close = (cl - entry_p) if ce else (entry_p - cl)
+
+                            if ce:
+                                best_val = max(best_val, cl, hi)
+                            else:
+                                best_val = min(best_val, cl, lo)
+
+                            if favorable_high >= STAGE3_TRIGGER or favorable_close >= STAGE3_TRIGGER:
+                                stop = max(stop, best_val - STAGE3_BUFFER) if ce else min(stop, best_val + STAGE3_BUFFER)
+                            elif favorable_high >= STAGE2_TRIGGER or favorable_close >= STAGE2_TRIGGER:
+                                stop = max(stop, best_val - STAGE2_BUFFER) if ce else min(stop, best_val + STAGE2_BUFFER)
+                            elif favorable_high >= STAGE1_TRIGGER or favorable_close >= STAGE1_TRIGGER:
+                                stop = max(stop, entry_p + STAGE1_BUFFER) if ce else min(stop, entry_p - STAGE1_BUFFER)
+
+                        points = round((exit_price - entry_p) if ce else (entry_p - exit_price), 2)
+                        outcome_str = f"NET: {points:+.2f} pts"
+
+                        self.markers.append({
+                            "time": t_sec,
+                            "position": "belowBar" if ce else "aboveBar",
+                            "color": "#00e676" if ce else "#f23645",
+                            "shape": "arrowUp" if ce else "arrowDown",
+                            "text": f"BUY {side} ({points:+.1f}p)",
+                        })
+
+                        self.history_cards[str(t_sec)] = {
+                            "title": f"ORB {side} [{day_key}]",
+                            "time_str": str(time_label),
+                            "entry": float(entry_p),
+                            "sl": float(stop),
+                            "max_trail_sl": float(stop),
+                            "exit_price": float(round(exit_price, 2)),
+                            "target": float(entry_p + 100.0 if ce else entry_p - 100.0),
+                            "delta": 0.50,
+                            "opt_entry": 75.0,
+                            "opt_sl": 55.0,
+                            "type": str(side),
+                            "outcome": str(outcome_str),
+                        }
+                        break
 
     def export_results_to_excel(self, filename="worker_execution_results.xlsx"):
         """Exports all simulated historical trade results to an Excel file."""
@@ -597,7 +769,6 @@ class DedicatedTradingWorker:
         self.sync_state(ltp)
 
     def evaluate_locked_orb_entry(self):
-        """Evaluates live trade entry strictly matching nifty_orb_flexible.py rules & ML threshold."""
         if not is_market_hours() or self.locked_trade or self.trades_taken_today >= 1 or len(self.candles) < 5:
             return
 
@@ -631,34 +802,6 @@ class DedicatedTradingWorker:
                 body_frac = abs(close_v - open_v) / rng
                 if body_frac < 0.30:
                     return
-
-                # Evaluate ML Pruning Filter if model is loaded
-                if self.ml_model is not None:
-                    loc = (close_v - low_v) / rng
-                    atr14 = break_row.get("atr14", 14.0)
-                    feat_dict = {
-                        'side': 1 if side == 'CE' else -1,
-                        'orb_width': orb_width,
-                        'range': rng,
-                        'loc': loc,
-                        'body_frac': body_frac,
-                        'upper_wick': (high_v - max(open_v, close_v)) / rng,
-                        'lower_wick': (min(open_v, close_v) - low_v) / rng,
-                        'atr14': atr14,
-                        'ema_dist_atr': (close_v - break_ema) / atr14 if atr14 > 0 else 0,
-                        'ext_atr': abs(close_v - break_ema) / atr14 if atr14 > 0 else 0,
-                        'range_lag1': rng, 'range_lag2': rng, 'range_lag3': rng,
-                        'loc_lag1': loc, 'loc_lag2': loc, 'loc_lag3': loc,
-                        'prior3_move_atr': (rng * 3.0) / atr14 if atr14 > 0 else 0,
-                        'prev_avg_range3_atr': rng / atr14 if atr14 > 0 else 0,
-                    }
-                    for f in FEATURE_COLUMNS:
-                        if f not in feat_dict:
-                            feat_dict[f] = 0.0
-                    X_live = pd.DataFrame([feat_dict])[FEATURE_COLUMNS]
-                    pred_score = float(self.ml_model.predict(X_live)[0])
-                    if pred_score <= self.ml_threshold:
-                        return  # Pruned by ML Filter
 
                 self.trades_taken_today += 1
                 is_ce = (side == "CE")
@@ -788,7 +931,8 @@ def run_worker():
                         engine.trades_taken_today = 0
                         engine.nfo_df = engine.load_scrip_master()
                         engine.init_historical_candles()
-                        engine.simulate_historical_trades_from_csv()
+                        engine.train_ml_model_from_api_candles()
+                        engine.simulate_historical_trades_from_api_candles()
                         try:
                             sws.close_connection()
                         except Exception:
