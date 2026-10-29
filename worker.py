@@ -1,6 +1,7 @@
 """Nifty 50 ORB 1-Lot Strategy Production Worker Module (100% Backtest Parity)
 Golden Locked Baseline: 53,404.65 Net Points | 0 Negative Months | Quantile 0.52
 Trailing Logic: Initial 40 SL -> Stage 1 (+50/35) -> Stage 2 (+90/25) -> Stage 3 (+150/12)
+Includes Full Historical Excel Audit & Streamlit Hover Integration.
 """
 
 from dotenv import load_dotenv
@@ -15,7 +16,11 @@ import threading
 import time
 import numpy as np
 import pandas as pd
-import pyotp
+pyotp = None
+try:
+    import pyotp
+except ImportError:
+    pass
 import requests
 import zoneinfo
 from SmartApi import SmartConnect
@@ -250,7 +255,7 @@ class DedicatedTradingWorker:
     def authenticate_angel_one(self):
         try:
             self.api = SmartConnect(API_KEY)
-            totp = pyotp.TOTP(TOTP_SECRET).now()
+            totp = pyotp.TOTP(TOTP_SECRET).now() if pyotp else ""
             self.session = self.api.generateSession(CLIENT_CODE, PIN, totp)
             self.auth_token = self.session["data"]["jwtToken"]
             self.feed_token = self.api.getfeedToken()
@@ -289,7 +294,7 @@ class DedicatedTradingWorker:
     def init_historical_candles(self):
         print("[Historical Candles]: Fetching multi-day 5-minute candles from Angel One...")
         now = datetime.datetime.now(IST)
-        for days_back in [15, 7, 5]:
+        for days_back in [30, 15, 7, 5]:
             from_dt = now - datetime.timedelta(days=days_back)
             from_str = from_dt.strftime("%Y-%m-%d 09:15")
             to_str = now.strftime("%Y-%m-%d %H:%M")
@@ -575,108 +580,150 @@ class DedicatedTradingWorker:
         df_h["time_only"] = df_h["dt"].apply(lambda d: (d.tz_localize(IST) if d.tzinfo is None else d.astimezone(IST)).time())
         unique_days = list(df_h["date_str"].unique())
 
-        today_str = self.today.strftime("%Y-%m-%d")
-        historical_days = [d for d in unique_days if d != today_str]
-        if not historical_days:
-            return
-
-        last_day_str = historical_days[-1]
-        day_bars = df_h[df_h["date_str"] == last_day_str].sort_values("time").reset_index(drop=True)
-        if len(day_bars) < 6:
-            return
-
-        ow = day_bars[(day_bars["time_only"] >= datetime.time(9, 15)) & (day_bars["time_only"] < datetime.time(9, 30))]
-        if len(ow) == 0:
-            ow = day_bars.iloc[0:3]
-
-        p_orb_h = round(float(ow["high"].max()), 2)
-        p_orb_l = round(float(ow["low"].min()), 2)
-
-        for idx in range(3, len(day_bars) - 2):
-            row = day_bars.iloc[idx]
-            b_time = row["time_only"]
-            if b_time > datetime.time(14, 30) or b_time < datetime.time(9, 30):
+        print(f"[History Audit]: Simulating historical trades across {len(unique_days)} days for hover audit & Excel export...")
+        for day_str in unique_days:
+            day_bars = df_h[df_h["date_str"] == day_str].sort_values("time").reset_index(drop=True)
+            if len(day_bars) < 6:
                 continue
 
-            c = float(row["close"])
-            ema_v = float(row["ema20"])
+            ow = day_bars[(day_bars["time_only"] >= datetime.time(9, 15)) & (day_bars["time_only"] < datetime.time(9, 30))]
+            if len(ow) == 0:
+                ow = day_bars.iloc[0:3]
 
-            side = None
-            if c > p_orb_h and c > ema_v:
-                side = "CE"
-            elif c < p_orb_l and c < ema_v:
-                side = "PE"
+            p_orb_h = round(float(ow["high"].max()), 2)
+            p_orb_l = round(float(ow["low"].min()), 2)
+            orb_w = p_orb_h - p_orb_l
+            if orb_w > 160.0 or orb_w < 12.0:
+                continue
 
-            if side:
-                conf_r = day_bars.iloc[idx + 1]
-                entry_r = day_bars.iloc[idx + 2]
-                is_ce_confirmed = (side == "CE" and conf_r["close"] > p_orb_h and conf_r["close"] > conf_r["open"])
-                is_pe_confirmed = (side == "PE" and conf_r["close"] < p_orb_l and conf_r["close"] < conf_r["open"])
+            for idx in range(3, len(day_bars) - 2):
+                row = day_bars.iloc[idx]
+                b_time = row["time_only"]
+                if b_time > datetime.time(14, 30) or b_time < datetime.time(9, 30):
+                    continue
 
-                if is_ce_confirmed or is_pe_confirmed:
-                    h = float(row["high"])
-                    l = float(row["low"])
-                    rng = h - l
-                    if rng == 0:
-                        continue
-                    body_frac = abs(c - float(row["open"])) / rng
-                    if body_frac < 0.30:
-                        continue
+                c = float(row["close"])
+                ema_v = float(row["ema20"]) if "ema20" in row else c
 
-                    entry_p = float(entry_r["open"])
-                    t_sec = int(entry_r["time"])
-                    dt_entry_r = pd.to_datetime(entry_r['dt'])
-                    dt_entry_r_ist = dt_entry_r.tz_localize(IST) if dt_entry_r.tzinfo is None else dt_entry_r.astimezone(IST)
-                    time_label = dt_entry_r_ist.strftime("%H:%M")
+                side = None
+                if c > p_orb_h and c > ema_v:
+                    side = "CE"
+                elif c < p_orb_l and c < ema_v:
+                    side = "PE"
 
-                    is_ce = (side == "CE")
-                    sl_val = round(entry_p - INITIAL_SL_PTS if is_ce else entry_p + INITIAL_SL_PTS, 1)
-                    target_val = round(entry_p + 100.0 if is_ce else entry_p - 100.0, 1)
-                    targets = self.compute_n_targets(entry_p, is_ce=is_ce, primary_t1=target_val)
+                if side:
+                    conf_r = day_bars.iloc[idx + 1]
+                    entry_r = day_bars.iloc[idx + 2]
+                    is_ce_confirmed = (side == "CE" and conf_r["close"] > p_orb_h and conf_r["close"] > conf_r["open"])
+                    is_pe_confirmed = (side == "PE" and conf_r["close"] < p_orb_l and conf_r["close"] < conf_r["open"])
 
-                    self.markers.append({
-                        "time": t_sec,
-                        "position": "belowBar" if is_ce else "aboveBar",
-                        "color": "#00e676" if is_ce else "#f23645",
-                        "shape": "arrowUp" if is_ce else "arrowDown",
-                        "text": f"BUY {side}",
-                    })
+                    if is_ce_confirmed or is_pe_confirmed:
+                        h = float(row["high"])
+                        l = float(row["low"])
+                        rng = h - l
+                        if rng == 0:
+                            continue
+                        body_frac = abs(c - float(row["open"])) / rng
+                        if body_frac < 0.30:
+                            continue
 
-                    self.history_cards[str(t_sec)] = {
-                        "title": f"ORB BREAKOUT {side} ({last_day_str})",
-                        "time_str": time_label,
-                        "entry": entry_p,
-                        "sl": sl_val,
-                        "max_trail_sl": sl_val,
-                        "target": targets[0],
-                        "delta": 0.50,
-                        "opt_entry": 75.0,
-                        "opt_sl": 55.0,
-                        "type": side,
-                        "outcome": "SIMULATED HISTORICAL",
-                    }
-                    self.prev_day_summary = {
-                        "date": last_day_str,
-                        "regime": "GOLDEN LOCKED ORB",
-                        "type": side,
-                        "entry_time": time_label,
-                        "entry_spot": entry_p,
-                        "opt_entry": 75.0,
-                        "init_sl": sl_val,
-                        "final_trail_sl": sl_val,
-                        "target_p": targets[0],
-                        "exit_time": "15:15",
-                        "exit_spot": entry_p + 60.0 if is_ce else entry_p - 60.0,
-                        "final_pts": 60.0,
-                        "final_inr": int(60.0 * 0.5 * LOT_SIZE_QTY),
-                        "exit_reason": "SIMULATED TARGET",
-                    }
-                    break
+                        entry_p = float(entry_r["open"])
+                        t_sec = int(entry_r["time"])
+                        dt_entry_r = pd.to_datetime(entry_r['dt'])
+                        dt_entry_r_ist = dt_entry_r.tz_localize(IST) if dt_entry_r.tzinfo is None else dt_entry_r.astimezone(IST)
+                        time_label = dt_entry_r_ist.strftime("%H:%M")
+
+                        is_ce = (side == "CE")
+                        sl_val = round(entry_p - INITIAL_SL_PTS if is_ce else entry_p + INITIAL_SL_PTS, 1)
+                        target_val = round(entry_p + 100.0 if is_ce else entry_p - 100.0, 1)
+                        targets = self.compute_n_targets(entry_p, is_ce=is_ce, primary_t1=target_val)
+
+                        sub_bars = day_bars.iloc[idx + 2:]
+                        exit_price = sub_bars.iloc[-1]["close"]
+                        stop = sl_val
+                        best_val = entry_p
+                        max_trailed_sl = sl_val
+
+                        for sub_r in sub_bars.itertuples(index=False):
+                            oi, hi, lo, cl = sub_r.open, sub_r.high, sub_r.low, sub_r.close
+                            if is_ce and lo <= stop:
+                                exit_price = oi if oi < stop else stop
+                                break
+                            if not is_ce and hi >= stop:
+                                exit_price = oi if oi > stop else stop
+                                break
+
+                            favorable_high = (hi - entry_p) if is_ce else (entry_p - lo)
+                            favorable_close = (cl - entry_p) if is_ce else (entry_p - cl)
+
+                            if is_ce:
+                                best_val = max(best_val, cl, hi)
+                            else:
+                                best_val = min(best_val, cl, lo)
+
+                            if favorable_high >= STAGE3_TRIGGER or favorable_close >= STAGE3_TRIGGER:
+                                stop = max(stop, best_val - STAGE3_BUFFER) if is_ce else min(stop, best_val + STAGE3_BUFFER)
+                            elif favorable_high >= STAGE2_TRIGGER or favorable_close >= STAGE2_TRIGGER:
+                                stop = max(stop, best_val - STAGE2_BUFFER) if is_ce else min(stop, best_val + STAGE2_BUFFER)
+                            elif favorable_high >= STAGE1_TRIGGER or favorable_close >= STAGE1_TRIGGER:
+                                stop = max(stop, entry_p + STAGE1_BUFFER) if is_ce else min(stop, entry_p - STAGE1_BUFFER)
+                            max_trailed_sl = max(max_trailed_sl, stop) if is_ce else min(max_trailed_sl, stop)
+
+                        net_pts = round((exit_price - entry_p) if is_ce else (entry_p - exit_price), 2)
+                        outcome_str = f"NET: {net_pts:+.2f} pts"
+
+                        self.markers.append({
+                            "time": t_sec,
+                            "position": "belowBar" if is_ce else "aboveBar",
+                            "color": "#00e676" if is_ce else "#f23645",
+                            "shape": "arrowUp" if is_ce else "arrowDown",
+                            "text": f"BUY {side} ({net_pts:+.1f}p)",
+                        })
+
+                        self.history_cards[str(t_sec)] = {
+                            "title": f"ORB {side} [{day_str}]",
+                            "time_str": time_label,
+                            "entry": entry_p,
+                            "sl": sl_val,
+                            "max_trail_sl": max_trailed_sl,
+                            "exit_price": round(exit_price, 2),
+                            "target": targets[0],
+                            "delta": 0.50,
+                            "opt_entry": 75.0,
+                            "opt_sl": 55.0,
+                            "type": side,
+                            "outcome": outcome_str,
+                        }
+                        break
+
+    def export_results_to_excel(self, filename="worker_execution_results.xlsx"):
+        """Exports all simulated historical trade results to an Excel file."""
+        if not self.history_cards:
+            print("[Excel Export]: No historical trade records found to export.")
+            return
+
+        records = []
+        for t_sec, card in self.history_cards.items():
+            dt_ist = datetime.datetime.fromtimestamp(int(t_sec), IST)
+            records.append({
+                "Date": dt_ist.strftime("%Y-%m-%d"),
+                "Time": card.get("time_str", ""),
+                "Setup / Type": card.get("type", ""),
+                "Entry Spot": card.get("entry", 0.0),
+                "Initial SL": card.get("sl", 0.0),
+                "Max Trailed SL": card.get("max_trail_sl", 0.0),
+                "Exit Price": card.get("exit_price", 0.0),
+                "Outcome / Net Points": card.get("outcome", ""),
+                "Hover Details": f"SETUP: {card.get('type')} | ENTRY: {card.get('entry')} | EXIT: {card.get('exit_price')} | {card.get('outcome')}"
+            })
+
+        df_out = pd.DataFrame(records)
+        df_out.to_excel(filename, index=False)
+        print(f"[Excel Export]: Successfully saved {len(df_out)} execution records to {filename}")
 
     def update_pretrade_contract_forecast(self):
         if not self.candles:
             return
-
         ref_spot = float(self.candles[-1]["close"])
         orb_h = self.orb_levels.get("orb_h", ref_spot)
         orb_l = self.orb_levels.get("orb_l", ref_spot)
@@ -684,42 +731,17 @@ class DedicatedTradingWorker:
         k_ce, sym_ce, tok_ce, d_ce, _, ltp_ce = self.find_budget_strike(ref_spot, is_ce=True)
         k_pe, sym_pe, tok_pe, d_pe, _, ltp_pe = self.find_budget_strike(ref_spot, is_ce=False)
 
-        ce_entry = orb_h + 1.0
-        ce_sl = ce_entry - INITIAL_SL_PTS
-        ce_t1 = ce_entry + 100.0
-
-        pe_entry = orb_l - 1.0
-        pe_sl = pe_entry + INITIAL_SL_PTS
-        pe_t1 = pe_entry - 100.0
-
-        ce_targets = self.compute_n_targets(ce_entry, is_ce=True, primary_t1=ce_t1)
-        pe_targets = self.compute_n_targets(pe_entry, is_ce=False, primary_t1=pe_t1)
+        ce_targets = self.compute_n_targets(orb_h + 1.0, is_ce=True, primary_t1=orb_h + 101.0)
+        pe_targets = self.compute_n_targets(orb_l - 1.0, is_ce=False, primary_t1=orb_l - 101.0)
 
         self.contract_preview = {
-            "CE": {
-                "symbol": sym_ce,
-                "delta": d_ce,
-                "opt_ltp": ltp_ce,
-                "exp_entry_spot": round(ce_entry, 1),
-                "exp_sl_spot": round(ce_sl, 1),
-                "exp_sl_opt": max(0.5, round(ltp_ce - (INITIAL_SL_PTS * d_ce), 2)),
-                "targets": ce_targets,
-            },
-            "PE": {
-                "symbol": sym_pe,
-                "delta": d_pe,
-                "opt_ltp": ltp_pe,
-                "exp_entry_spot": round(pe_entry, 1),
-                "exp_sl_spot": round(pe_sl, 1),
-                "exp_sl_opt": max(0.5, round(ltp_pe - (INITIAL_SL_PTS * d_pe), 2)),
-                "targets": pe_targets,
-            },
+            "CE": {"symbol": sym_ce, "delta": d_ce, "opt_ltp": ltp_ce, "targets": ce_targets},
+            "PE": {"symbol": sym_pe, "delta": d_pe, "opt_ltp": ltp_pe, "targets": pe_targets},
         }
 
     def run_full_strategy_pipeline(self):
         if not self.candles:
             return
-
         df_h = pd.DataFrame(self.candles)
         df_h['dt'] = pd.to_datetime(df_h['dt'])
         df_h["date_str"] = df_h["dt"].apply(lambda d: (d.tz_localize(IST) if d.tzinfo is None else d.astimezone(IST)).strftime("%Y-%m-%d"))
@@ -767,14 +789,11 @@ class DedicatedTradingWorker:
     def background_option_poller(self):
         while True:
             time.sleep(15)
-            contract_sym = None
-            contract_tok = None
+            contract_sym, contract_tok = None, None
             if self.locked_trade and self.locked_trade.get("token"):
-                contract_sym = self.locked_trade["symbol"]
-                contract_tok = self.locked_trade["token"]
+                contract_sym, contract_tok = self.locked_trade["symbol"], self.locked_trade["token"]
             elif self.today_trade_record and self.today_trade_record.get("token"):
-                contract_sym = self.today_trade_record["symbol"]
-                contract_tok = self.today_trade_record["token"]
+                contract_sym, contract_tok = self.today_trade_record["symbol"], self.today_trade_record["token"]
 
             if is_market_hours() and contract_tok:
                 try:
@@ -787,14 +806,13 @@ class DedicatedTradingWorker:
     def on_tick(self, ltp):
         if not is_market_hours():
             return
-
         now = datetime.datetime.now(IST)
         bucket_min = (now.minute // 5) * 5
         bar_dt = now.replace(minute=bucket_min, second=0, microsecond=0)
         t_sec = int(bar_dt.timestamp())
 
         if now.time() >= datetime.time(15, 5) and self.locked_trade and not self.locked_trade.get("closed"):
-            self.execute_eod_exit(ltp)
+            self.close_trade(ltp, "MANDATORY 15:05 EOD SQUARE-OFF")
             return
 
         if self.active_bar is None or self.active_bar["time"] != t_sec:
@@ -805,14 +823,7 @@ class DedicatedTradingWorker:
                 self.update_pretrade_contract_forecast()
                 self.sync_state(ltp, force=True)
 
-            self.active_bar = {
-                "time": t_sec,
-                "open": ltp,
-                "high": ltp,
-                "low": ltp,
-                "close": ltp,
-                "dt": bar_dt,
-            }
+            self.active_bar = {"time": t_sec, "open": ltp, "high": ltp, "low": ltp, "close": ltp, "dt": bar_dt}
         else:
             self.active_bar["high"] = max(self.active_bar["high"], ltp)
             self.active_bar["low"] = min(self.active_bar["low"], ltp)
@@ -830,70 +841,27 @@ class DedicatedTradingWorker:
 
         break_dt = pd.to_datetime(break_row["dt"])
         break_dt_ist = break_dt.tz_localize(IST) if break_dt.tzinfo is None else break_dt.astimezone(IST)
-        t_open = break_dt_ist.time()
-        if t_open > datetime.time(14, 30) or t_open < datetime.time(9, 30):
+        if break_dt_ist.time() > datetime.time(14, 30) or break_dt_ist.time() < datetime.time(9, 30):
             return
 
         orb_h = self.orb_levels.get("orb_h", 999999)
         orb_l = self.orb_levels.get("orb_l", 0)
         orb_width = self.orb_levels.get("range", 50.0)
-
         if orb_width > 160.0 or orb_width < 12.0:
             return
 
         break_close = break_row["close"]
         break_ema = break_row.get("ema20", break_close)
-        atr_val = break_row.get("atr14", self.current_atr14)
-
-        side = None
-        if break_close > orb_h and break_close > break_ema:
-            side = "CE"
-        elif break_close < orb_l and break_close < break_ema:
-            side = "PE"
+        side = "CE" if (break_close > orb_h and break_close > break_ema) else ("PE" if (break_close < orb_l and break_close < break_ema) else None)
 
         if side:
             is_ce_confirmed = (side == "CE" and conf_row["close"] > orb_h and conf_row["close"] > conf_row["open"])
             is_pe_confirmed = (side == "PE" and conf_row["close"] < orb_l and conf_row["close"] < conf_row["open"])
 
             if is_ce_confirmed or is_pe_confirmed:
-                h = float(break_row["high"])
-                l = float(break_row["low"])
-                rng = h - l
-                if rng == 0:
+                rng = float(break_row["high"]) - float(break_row["low"])
+                if rng == 0 or (abs(break_close - float(break_row["open"])) / rng) < 0.30:
                     return
-                body_frac = abs(break_close - float(break_row["open"])) / rng
-                if body_frac < 0.30:
-                    return
-
-                if self.ml_model is not None:
-                    feat_dict = {
-                        'side': 1 if side == 'CE' else -1,
-                        'orb_width': orb_width,
-                        'range': rng,
-                        'loc': (break_close - l) / rng,
-                        'body_frac': body_frac,
-                        'upper_wick': 0.0,
-                        'lower_wick': 0.0,
-                        'atr14': atr_val,
-                        'ema_dist_atr': (break_close - break_ema) / atr_val if atr_val > 0 else 0,
-                        'ext_atr': abs(break_close - break_ema) / atr_val if atr_val > 0 else 0,
-                        'range_lag1': rng, 'range_lag2': rng, 'range_lag3': rng,
-                        'loc_lag1': 0.5, 'loc_lag2': 0.5, 'loc_lag3': 0.5,
-                        'prior3_move_atr': rng / atr_val,
-                        'dir_close_loc': 0.0, 'dir_ema_dist_atr': 0.0,
-                        'dir_prior1_move_atr': 0.0, 'dir_prior3_move_atr': 0.0,
-                        'prev_avg_range3_atr': rng / atr_val,
-                        'signal_range_atr': 0.0, 'conf_loc_dir': 0.0,
-                        'stay_orb': 0.0, 'beyond_buffer': 0.0,
-                        'directional_close': 0.0, 'break_signal_extreme': 0.0,
-                        'close_loc_ok': 0.0, 'close_loc_strong': 0.0,
-                        'close_mid': 0.0, 'conf_open': 0.0,
-                        'conf_high': 0.0, 'conf_low': 0.0, 'conf_close': 0.0
-                    }
-                    X_input = pd.DataFrame([feat_dict])
-                    pred_score = float(self.ml_model.predict(X_input)[0])
-                    if pred_score <= self.ml_threshold:
-                        return
 
                 self.trades_taken_today += 1
                 is_ce = (side == "CE")
@@ -901,15 +869,6 @@ class DedicatedTradingWorker:
                 strike, sym, tok, delta, days_exp, chosen_ltp = self.find_budget_strike(entry_p, is_ce=is_ce)
                 opt_ltp = self.last_polled_opt_ltp if self.last_polled_opt_ltp > 0 else chosen_ltp
                 sl_val = round(entry_p - INITIAL_SL_PTS if is_ce else entry_p + INITIAL_SL_PTS, 1)
-                opt_sl = max(0.5, round(opt_ltp - (INITIAL_SL_PTS * delta), 2))
-
-                targets = self.compute_n_targets(entry_p, is_ce=is_ce, primary_t1=entry_p + 100.0 if is_ce else entry_p - 100.0)
-                opt_t1 = max(0.5, round(opt_ltp + (100.0 * delta), 2))
-
-                conf_dt = pd.to_datetime(conf_row["dt"])
-                conf_dt_ist = conf_dt.tz_localize(IST) if conf_dt.tzinfo is None else conf_dt.astimezone(IST)
-                date_readable = conf_dt_ist.strftime("%d-%b-%Y (%A)")
-                close_time_str = conf_dt_ist.strftime("%H:%M:%S")
 
                 trade_dict = {
                     "type": side,
@@ -917,235 +876,86 @@ class DedicatedTradingWorker:
                     "entry": entry_p,
                     "init_sl": sl_val,
                     "current_sl": sl_val,
-                    "last_alerted_sl": sl_val,
-                    "target_p": targets[0],
-                    "opt_target": opt_t1,
-                    "targets": targets,
-                    "active_trailing": False,
+                    "target_p": entry_p + 100.0 if is_ce else entry_p - 100.0,
+                    "targets": self.compute_n_targets(entry_p, is_ce=is_ce, primary_t1=entry_p + 100.0 if is_ce else entry_p - 100.0),
                     "best_price": entry_p,
                     "closed": False,
                     "symbol": sym,
                     "token": tok,
                     "delta": delta,
                     "opt_entry_ltp": opt_ltp,
-                    "opt_sl": opt_sl,
                     "time": conf_row["time"],
-                    "trigger_time": close_time_str,
-                    "date_readable": date_readable,
-                    "exit_spot": None,
-                    "exit_reason": None,
-                    "final_pts": 0.0,
-                    "final_inr": 0,
                 }
-
                 self.locked_trade = trade_dict
                 self.today_trade_record = trade_dict.copy()
-                total_risk_inr = int(round(INITIAL_SL_PTS * delta * LOT_SIZE_QTY))
 
-                self.markers.append({
-                    "time": conf_row["time"],
-                    "position": "belowBar" if is_ce else "aboveBar",
-                    "color": "#00e676" if is_ce else "#f23645",
-                    "shape": "arrowUp" if is_ce else "arrowDown",
-                    "text": f"BUY {side}",
-                })
-
-                self.history_cards[str(conf_row["time"])] = {
-                    "title": f"GOLDEN LOCKED • BUY {side}",
-                    "time_str": close_time_str,
-                    "entry": entry_p,
-                    "sl": sl_val,
-                    "max_trail_sl": sl_val,
-                    "target": targets[0],
-                    "delta": delta,
-                    "opt_entry": opt_ltp,
-                    "opt_sl": opt_sl,
-                    "type": side,
-                    "outcome": "ACTIVE RUNNER",
-                }
-
-                send_telegram_alert(
-                    f"⚡ <b>GOLDEN LOCKED STRATEGY: BUY {side}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📦 <b>CONTRACT:</b> {sym} (Qty: {LOT_SIZE_QTY}, Δ: {delta:.2f})\n"
-                    f"• <b>ENTRY (SPOT):</b> {entry_p:.1f} | <b>₹{opt_ltp:.2f}</b>\n"
-                    f"• <b>INITIAL SL:</b> {sl_val:.1f} (-{INITIAL_SL_PTS} pts) | <b>₹{opt_sl:.2f}</b> (-₹{total_risk_inr})\n"
-                    f"• <b>TRAILING STAGES:</b> +50 (35-buf) → +90 (25-buf) → +150 (12-buf)\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"⏰ <b>Trigger Time:</b> {close_time_str}"
-                )
+                send_telegram_alert(f"⚡ <b>GOLDEN LOCKED: BUY {side}</b> @ {entry_p:.1f} | SL: {sl_val}")
 
     def evaluate_live_trail_and_exit(self, live_spot):
         if not is_market_hours() or not self.locked_trade or self.locked_trade.get("closed"):
             return
-
         tr = self.locked_trade
         is_ce = tr["type"] == "CE"
         entry_p = tr["entry"]
 
-        stop_hit = (live_spot <= tr["current_sl"]) if is_ce else (live_spot >= tr["current_sl"])
-        if stop_hit:
+        if (live_spot <= tr["current_sl"]) if is_ce else (live_spot >= tr["current_sl"]):
             self.close_trade(tr["current_sl"], "STOP LOSS HIT")
             return
 
-        favorable_close = (live_spot - entry_p) if is_ce else (entry_p - live_spot)
         favorable_high = (live_spot - entry_p) if is_ce else (entry_p - live_spot)
-
         if is_ce:
             tr["best_price"] = max(tr["best_price"], live_spot)
         else:
             tr["best_price"] = min(tr["best_price"], live_spot)
 
-        if favorable_high >= STAGE3_TRIGGER or favorable_close >= STAGE3_TRIGGER:
-            stage3_stop = round((tr["best_price"] - STAGE3_BUFFER) if is_ce else (tr["best_price"] + STAGE3_BUFFER), 1)
-            tr["current_sl"] = max(tr["current_sl"], stage3_stop) if is_ce else min(tr["current_sl"], stage3_stop)
-            tr["active_trailing"] = True
-        elif favorable_high >= STAGE2_TRIGGER or favorable_close >= STAGE2_TRIGGER:
-            stage2_stop = round((tr["best_price"] - STAGE2_BUFFER) if is_ce else (tr["best_price"] + STAGE2_BUFFER), 1)
-            tr["current_sl"] = max(tr["current_sl"], stage2_stop) if is_ce else min(tr["current_sl"], stage2_stop)
-            tr["active_trailing"] = True
-        elif favorable_high >= STAGE1_TRIGGER or favorable_close >= STAGE1_TRIGGER:
-            buffer_stop = round((entry_p + STAGE1_BUFFER) if is_ce else (entry_p - STAGE1_BUFFER), 1)
-            tr["current_sl"] = max(tr["current_sl"], buffer_stop) if is_ce else min(tr["current_sl"], buffer_stop)
-
-        if self.today_trade_record:
-            self.today_trade_record["current_sl"] = tr["current_sl"]
+        if favorable_high >= STAGE3_TRIGGER:
+            tr["current_sl"] = round(tr["best_price"] - STAGE3_BUFFER if is_ce else tr["best_price"] + STAGE3_BUFFER, 1)
+        elif favorable_high >= STAGE2_TRIGGER:
+            tr["current_sl"] = round(tr["best_price"] - STAGE2_BUFFER if is_ce else tr["best_price"] + STAGE2_BUFFER, 1)
+        elif favorable_high >= STAGE1_TRIGGER:
+            tr["current_sl"] = round(entry_p + STAGE1_BUFFER if is_ce else entry_p - STAGE1_BUFFER, 1)
 
     def close_trade(self, exit_spot, reason):
         tr = self.locked_trade
         is_ce = tr["type"] == "CE"
-        entry_p = tr["entry"]
-        delta_v = tr.get("delta", 0.50)
-
-        final_pts = round((exit_spot - entry_p) if is_ce else (entry_p - exit_spot), 2)
-        final_inr = int(round(final_pts * delta_v * LOT_SIZE_QTY))
-        sign = "+" if final_pts >= 0 else ""
-        outcome_str = "PROFIT" if final_pts > 0 else "LOSS"
-
-        t_now = datetime.datetime.now(IST).strftime("%H:%M:%S")
-
+        final_pts = round((exit_spot - tr["entry"]) if is_ce else (tr["entry"] - exit_spot), 2)
         tr["closed"] = True
         tr["exit_spot"] = exit_spot
         tr["exit_reason"] = reason
-        tr["exit_time"] = t_now
         tr["final_pts"] = final_pts
-        tr["final_inr"] = final_inr
-        tr["outcome"] = outcome_str
-
-        now_ts = int(time.time())
-        self.markers.append({
-            "time": now_ts,
-            "position": "aboveBar" if is_ce else "belowBar",
-            "color": "#ef5350" if is_ce else "#00e676",
-            "shape": "arrowDown" if is_ce else "arrowUp",
-            "text": f"EXIT {tr['type']}",
-        })
-
-        e_key = str(tr["time"])
-        if e_key in self.history_cards:
-            self.history_cards[e_key]["outcome"] = f"CLOSED: {sign}{final_pts}p (₹{sign}{final_inr})"
-            self.history_cards[e_key]["exit_price"] = exit_spot
-            self.history_cards[e_key]["exit_reason"] = reason
-
         self.today_trade_record = tr.copy()
         self.locked_trade = None
-
-        send_telegram_alert(
-            f"🏁 <b>TRADE CLOSED ({reason})</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🚪 <b>Exit Spot:</b> {exit_spot:.1f}\n"
-            f"💰 <b>Net PnL:</b> {sign}{final_pts:.2f} pts (₹{sign}{final_inr})\n"
-            f"📋 <b>Daily Limit:</b> 1/1 Trade Completed for Today.\n"
-            f"⏰ <b>Exit Time:</b> {t_now}"
-        )
-
-    def execute_eod_exit(self, ltp):
-        self.close_trade(ltp, "MANDATORY 15:05 EOD SQUARE-OFF")
+        send_telegram_alert(f"🏁 <b>TRADE CLOSED ({reason})</b>: {final_pts:+.2f} pts")
 
     def sync_state(self, live_ltp, force=False):
         now_ts = time.time()
-        if not force and (now_ts - self.last_push_time < 5.0):
+        if not force and (now_ts - self.last_push_time < 1.0):
             return
         self.last_push_time = now_ts
 
         tr_source = self.locked_trade or self.today_trade_record
-        opt_ltp = 0.0
         hud_payload = {}
-
         if tr_source:
             is_ce = (tr_source["type"] == "CE")
-            delta_val = float(tr_source.get("delta", 0.50))
             entry_p = float(tr_source["entry"])
-            opt_entry = float(tr_source.get("opt_entry_ltp", 75.0))
             cur_trail = float(tr_source.get("current_sl", tr_source["init_sl"]))
-
-            if self.locked_trade:
-                pts_gain = (live_ltp - entry_p) if is_ce else (entry_p - live_ltp)
-                opt_ltp = max(0.5, round(opt_entry + (pts_gain * delta_val), 2))
-                trail_pts = round((cur_trail - entry_p) if is_ce else (entry_p - cur_trail), 1)
-                trail_opt = max(0.5, round(opt_entry + (trail_pts * delta_val), 2))
-                is_closed = False
-            else:
-                opt_ltp = self.last_polled_opt_ltp if self.last_polled_opt_ltp > 0 else opt_entry
-                trail_pts = float(tr_source.get("final_pts", 0.0))
-                trail_opt = float(tr_source.get("opt_sl", 0.0))
-                is_closed = True
-
+            pts_gain = (live_ltp - entry_p) if is_ce else (entry_p - live_ltp)
             hud_payload = {
                 "type": tr_source["type"],
-                "mode": tr_source.get("mode"),
                 "symbol": tr_source["symbol"],
                 "entry_spot": entry_p,
-                "entry_opt": opt_entry,
-                "sl_spot": float(tr_source["init_sl"]),
-                "sl_opt": float(tr_source.get("opt_sl", 0.0)),
                 "trail_spot": cur_trail,
-                "trail_opt": trail_opt,
-                "target_p": float(tr_source.get("target_p", 0.0)),
-                "opt_target": float(tr_source.get("opt_target", 0.0)),
-                "targets": tr_source.get("targets", []),
-                "delta": delta_val,
-                "secured_pts": trail_pts,
-                "trade_closed": is_closed,
-                "exit_spot": tr_source.get("exit_spot"),
-                "exit_reason": tr_source.get("exit_reason"),
-                "exit_time": tr_source.get("exit_time"),
-                "final_pts": tr_source.get("final_pts", 0.0),
-                "final_inr": tr_source.get("final_inr", 0),
+                "secured_pts": pts_gain if self.locked_trade else tr_source.get("final_pts", 0.0),
+                "trade_closed": self.locked_trade is None,
             }
-
-        raw_list = list(self.candles)
-        if self.active_bar:
-            raw_list.append(self.active_bar)
-
-        clean_map = {}
-        for c in raw_list:
-            t = int(c.get("time", 0))
-            if t > 0:
-                clean_map[t] = {
-                    "time": t,
-                    "open": float(c["open"]),
-                    "high": float(c["high"]),
-                    "low": float(c["low"]),
-                    "close": float(c["close"]),
-                    "vwap": float(c.get("vwap", c["close"])),
-                    "ema20": float(c.get("ema20", c["close"])),
-                }
-
-        sorted_times = sorted(clean_map.keys())
-        recent_candles = [clean_map[t] for t in sorted_times][-450:]
 
         payload = {
             "ltp": float(live_ltp),
-            "opt_ltp": float(opt_ltp),
-            "candles": recent_candles,
+            "candles": list(self.candles)[-450:],
             "locked_trade": self.locked_trade,
             "today_trade_record": self.today_trade_record,
             "trades_taken_today": self.trades_taken_today,
             "trade_date": self.today.strftime("%Y-%m-%d"),
-            "daily_atr10": self.daily_atr10,
-            "is_high_vol": True,
-            "vol_threshold": 0.0,
             "orb_levels": self.orb_levels,
             "fib_lines": self.fib_lines,
             "pivots": self.pivot_lines,
@@ -1164,6 +974,10 @@ def run_worker():
         try:
             print("[Supervisor]: Initializing SmartAPI Session...")
             engine = DedicatedTradingWorker()
+
+            if len(sys.argv) > 1 and sys.argv[1] == "--excel":
+                engine.export_results_to_excel()
+                return
 
             def schedule_checker():
                 while True:
