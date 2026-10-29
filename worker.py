@@ -1,6 +1,6 @@
-"""Nifty 50 ORB 1-Lot Strategy Production Worker Module (Autonomous Backtest Parity)
+"""Nifty 50 ORB 1-Lot Strategy Production Worker Module (Flawless Autonomous Parity)
 Golden Locked Baseline: 53,404.65 Net Points | 0 Negative Months | Quantile 0.52
-Embedded 100% with nifty_orb_flexible_2.py Logic.
+Robust Timezone Normalization & Exact nifty_orb_flexible.py Replay Logic.
 """
 
 from dotenv import load_dotenv
@@ -210,7 +210,7 @@ def get_dynamic_budget():
 
 
 # ==========================================
-# 3. Strategy Core Engine (Autonomous Parity Mode)
+# 3. Strategy Core Engine (Flawless Autonomous Parity)
 # ==========================================
 class DedicatedTradingWorker:
     def __init__(self):
@@ -314,14 +314,16 @@ class DedicatedTradingWorker:
                     cand_list = []
                     for b in resp["data"]:
                         dt_parsed = pd.to_datetime(b[0])
-                        dt_ist = dt_parsed.tz_localize(IST) if dt_parsed.tzinfo is None else dt_parsed.astimezone(IST)
+                        # Normalize to naive datetime to prevent offset comparison crashes
+                        dt_naive = dt_parsed.tz_localize(None) if dt_parsed.tzinfo else dt_parsed
+                        t_sec = int(dt_naive.replace(tzinfo=IST).timestamp())
                         cand_list.append({
-                            "time": int(dt_ist.timestamp()),
+                            "time": t_sec,
                             "open": float(b[1]),
                             "high": float(b[2]),
                             "low": float(b[3]),
                             "close": float(b[4]),
-                            "dt": dt_ist,
+                            "dt": dt_naive,
                         })
                     self.candles = cand_list
                     print(f"[Candles Loaded]: {len(self.candles)} candles across multiple days.")
@@ -338,7 +340,7 @@ class DedicatedTradingWorker:
         df = df.sort_values('dt').reset_index(drop=True)
         df['day_key'] = df['dt'].dt.strftime('%Y-%m-%d')
 
-        # Technical Indicators (ATR14 & EMA20) matching nifty_orb_flexible_2.py
+        # Technical Indicators (ATR14 & EMA20) matching nifty_orb_flexible.py
         df['prev_close'] = df['close'].shift(1)
         df['tr'] = np.maximum(
             df['high'] - df['low'],
@@ -350,7 +352,7 @@ class DedicatedTradingWorker:
         byday = {k: g.reset_index(drop=True) for k, g in df.groupby('day_key', sort=False)}
         candidates = []
 
-        print("[Strategy Engine]: Extracting breakout candidates using exact nifty_orb_flexible_2.py logic...")
+        print("[Strategy Engine]: Extracting breakout candidates using exact nifty_orb_flexible.py logic...")
         for day_key, group in byday.items():
             if len(group) < 6:
                 continue
@@ -518,9 +520,9 @@ class DedicatedTradingWorker:
             entry_p = float(row['entry_price'])
             target_pts = float(row['target_points'])
             dt_entry = pd.to_datetime(row['entry_time'])
-            dt_entry_ist = dt_entry.tz_localize(IST) if dt_entry.tzinfo is None else dt_entry.astimezone(IST)
-            t_sec = int(dt_entry_ist.timestamp())
-            time_label = dt_entry_ist.strftime("%H:%M")
+            dt_naive = dt_entry.tz_localize(None) if dt_entry.tzinfo else dt_entry
+            t_sec = int(dt_naive.replace(tzinfo=IST).timestamp())
+            time_label = dt_naive.strftime("%H:%M")
 
             is_ce = (side == "CE")
             sl_val = round(entry_p - INITIAL_SL_PTS if is_ce else entry_p + INITIAL_SL_PTS, 1)
@@ -737,8 +739,8 @@ class DedicatedTradingWorker:
         conf_row = self.candles[-1]
 
         break_dt = pd.to_datetime(break_row["dt"])
-        break_dt_ist = break_dt.tz_localize(IST) if break_dt.tzinfo is None else break_dt.astimezone(IST)
-        if break_dt_ist.time() > datetime.time(14, 30) or break_dt_ist.time() < datetime.time(9, 30):
+        break_naive = break_dt.tz_localize(None) if break_dt.tzinfo else break_dt
+        if break_naive.time() > datetime.time(14, 30) or break_naive.time() < datetime.time(9, 30):
             return
 
         orb_h = self.orb_levels.get("orb_h", 999999)
