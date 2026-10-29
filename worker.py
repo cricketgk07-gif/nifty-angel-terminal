@@ -11,6 +11,7 @@ import http.server
 import json
 import math
 import os
+import sys
 import socketserver
 import threading
 import time
@@ -95,8 +96,11 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
 
 
 def run_ping_server():
-    with socketserver.TCPServer(("0.0.0.0", PORT), HealthHandler) as httpd:
-        httpd.serve_forever()
+    try:
+        with socketserver.TCPServer(("0.0.0.0", PORT), HealthHandler) as httpd:
+            httpd.serve_forever()
+    except Exception:
+        pass
 
 
 threading.Thread(target=run_ping_server, daemon=True).start()
@@ -270,11 +274,8 @@ class DedicatedTradingWorker:
         try:
             r = requests.get(url, timeout=12)
             if r.status_code != 200:
-                print(f"[Scrip Master Warning]: Failed to download (Status {r.status_code}). Using fallback.")
                 return pd.DataFrame()
-            
             data = r.json()
-            print(f"[Scrip Master]: Parsed {len(data)} total instruments. Filtering NFO NIFTY options...")
             nfo_items = [
                 x for x in data
                 if x.get("exch_seg") == "NFO"
@@ -285,10 +286,8 @@ class DedicatedTradingWorker:
             if not df.empty:
                 df["strike_num"] = pd.to_numeric(df["strike"], errors="coerce") / 100.0
                 df["exp_dt"] = pd.to_datetime(df["expiry"], format="%d%b%Y", errors="coerce")
-            print(f"[Scrip Master]: Successfully loaded {len(df)} Nifty option contracts.")
             return df
-        except Exception as e:
-            print(f"[Scrip Master Error]: {e}. Using empty fallback to prevent freezing.")
+        except Exception:
             return pd.DataFrame()
 
     def init_historical_candles(self):
@@ -296,15 +295,13 @@ class DedicatedTradingWorker:
         now = datetime.datetime.now(IST)
         for days_back in [30, 15, 7, 5]:
             from_dt = now - datetime.timedelta(days=days_back)
-            from_str = from_dt.strftime("%Y-%m-%d 09:15")
-            to_str = now.strftime("%Y-%m-%d %H:%M")
             try:
                 resp = self.api.getCandleData({
                     "exchange": "NSE",
                     "symboltoken": INDEX_TOKEN,
                     "interval": "FIVE_MINUTE",
-                    "fromdate": from_str,
-                    "todate": to_str,
+                    "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
+                    "todate": now.strftime("%Y-%m-%d %H:%M"),
                 })
                 if resp and resp.get("status") and resp.get("data") and len(resp["data"]) > 10:
                     cand_list = []
@@ -682,17 +679,17 @@ class DedicatedTradingWorker:
 
                         self.history_cards[str(t_sec)] = {
                             "title": f"ORB {side} [{day_str}]",
-                            "time_str": time_label,
-                            "entry": entry_p,
-                            "sl": sl_val,
-                            "max_trail_sl": max_trailed_sl,
-                            "exit_price": round(exit_price, 2),
-                            "target": targets[0],
+                            "time_str": str(time_label),
+                            "entry": float(entry_p),
+                            "sl": float(sl_val),
+                            "max_trail_sl": float(max_trailed_sl),
+                            "exit_price": float(round(exit_price, 2)),
+                            "target": float(targets[0]),
                             "delta": 0.50,
                             "opt_entry": 75.0,
                             "opt_sl": 55.0,
-                            "type": side,
-                            "outcome": outcome_str,
+                            "type": str(side),
+                            "outcome": str(outcome_str),
                         }
                         break
 
