@@ -1,6 +1,6 @@
-"""Nifty 50 ORB 1-Lot Strategy Production Worker Module (Decoupled Autonomous Mode)
+"""Nifty 50 ORB 1-Lot Strategy Production Worker Module (Fully Autonomous API Mode)
 Golden Locked Baseline: 53,404.65 Net Points | 0 Negative Months | Quantile 0.52
-Clean Separation: Autonomous API History Audit / Excel Export vs. Live WebSocket Streaming & Redis Sync.
+Autonomous API Candle Fetching, ML Training, Strategy Simulation, and Excel Audit.
 """
 
 from dotenv import load_dotenv
@@ -210,7 +210,7 @@ def get_dynamic_budget():
 
 
 # ==========================================
-# 3. Strategy Core Engine (Decoupled Production Mode)
+# 3. Strategy Core Engine (Autonomous API Mode)
 # ==========================================
 class DedicatedTradingWorker:
     def __init__(self):
@@ -802,6 +802,34 @@ class DedicatedTradingWorker:
                 body_frac = abs(close_v - open_v) / rng
                 if body_frac < 0.30:
                     return
+
+                # ML Pruning Filter Check
+                if self.ml_model is not None:
+                    loc = (close_v - low_v) / rng
+                    atr14 = break_row.get("atr14", 14.0)
+                    feat_dict = {
+                        'side': 1 if side == 'CE' else -1,
+                        'orb_width': orb_width,
+                        'range': rng,
+                        'loc': loc,
+                        'body_frac': body_frac,
+                        'upper_wick': (high_v - max(open_v, close_v)) / rng,
+                        'lower_wick': (min(open_v, close_v) - low_v) / rng,
+                        'atr14': atr14,
+                        'ema_dist_atr': (close_v - break_ema) / atr14 if atr14 > 0 else 0,
+                        'ext_atr': abs(close_v - break_ema) / atr14 if atr14 > 0 else 0,
+                        'range_lag1': rng, 'range_lag2': rng, 'range_lag3': rng,
+                        'loc_lag1': loc, 'loc_lag2': loc, 'loc_lag3': loc,
+                        'prior3_move_atr': (rng * 3.0) / atr14 if atr14 > 0 else 0,
+                        'prev_avg_range3_atr': rng / atr14 if atr14 > 0 else 0,
+                    }
+                    for f in FEATURE_COLUMNS:
+                        if f not in feat_dict:
+                            feat_dict[f] = 0.0
+                    X_live = pd.DataFrame([feat_dict])[FEATURE_COLUMNS]
+                    pred_score = float(self.ml_model.predict(X_live)[0])
+                    if pred_score <= self.ml_threshold:
+                        return
 
                 self.trades_taken_today += 1
                 is_ce = (side == "CE")
