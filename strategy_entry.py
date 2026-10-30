@@ -1,0 +1,110 @@
+# strategy_entry.py
+from datetime import time as dtime
+import numpy as np
+import pandas as pd
+
+
+def calculate_indicators(df):
+  """Calculates ATR14 and EMA20 across the dataframe."""
+  df['prev_close'] = df['close'].shift(1)
+  df['tr'] = np.maximum(
+      df['high'] - df['low'],
+      np.maximum(
+          abs(df['high'] - df['prev_close']),
+          abs(df['low'] - df['prev_close']),
+      ),
+  )
+  df['atr14'] = df['tr'].rolling(window=14).mean().bfill()
+  df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
+  return df
+
+
+def extract_entry_candidates(byday):
+  """Scans daily groups for valid ORB breakouts meeting confirmation and body fraction filters."""
+  candidates = []
+
+  for day_key, group in byday.items():
+    if len(group) < 6:
+      continue
+    if group.iloc[0]['dt'].time() != dtime(9, 15):
+      continue
+
+    orb_window = group.iloc[0:3]
+    orb_high = orb_window['high'].max()
+    orb_low = orb_window['low'].min()
+    orb_width = orb_high - orb_low
+
+    if orb_width > 160.0 or orb_width < 12.0:
+      continue
+
+    for i in range(3, len(group) - 2):
+      row = group.iloc[i]
+      t = row['dt'].time()
+
+      if t > dtime(14, 30) or t < dtime(9, 30):
+        continue
+
+      side = None
+      if row['close'] > orb_high and row['close'] > row['ema20']:
+        side = 'CE'
+      elif row['close'] < orb_low and row['close'] < row['ema20']:
+        side = 'PE'
+
+      if side:
+        conf_row = group.iloc[i + 1]
+        entry_row = group.iloc[i + 2]
+
+        is_ce_confirmed = (
+            side == 'CE'
+            and conf_row['close'] > orb_high
+            and conf_row['close'] > conf_row['open']
+        )
+        is_pe_confirmed = (
+            side == 'PE'
+            and conf_row['close'] < orb_low
+            and conf_row['close'] < conf_row['open']
+        )
+
+        if is_ce_confirmed or is_pe_confirmed:
+          high_v, low_v, open_v, close_v = (
+              row['high'],
+              row['low'],
+              row['open'],
+              row['close'],
+          )
+          rng = high_v - low_v
+          if rng == 0:
+            continue
+
+          loc = (close_v - low_v) / rng
+          body_frac = abs(close_v - open_v) / rng
+
+          if body_frac < 0.30:
+            continue
+
+          candidates.append({
+              'day': day_key,
+              'month_num': row['dt'].strftime('%Y-%m'),
+              'side': side,
+              'signal_time': row['dt'],
+              'entry_time': entry_row['dt'],
+              'entry_price': entry_row['open'],
+              'orb_width': orb_width,
+              'range': rng,
+              'loc': loc,
+              'body_frac': body_frac,
+              'atr14': row['atr14'],
+              'ema_dist_atr': (
+                  (close_v - row['ema20']) / row['atr14']
+                  if row['atr14'] > 0
+                  else 0
+              ),
+              'ext_atr': (
+                  abs(close_v - row['ema20']) / row['atr14']
+                  if row['atr14'] > 0
+                  else 0
+              ),
+          })
+          break
+
+  return candidates
