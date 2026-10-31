@@ -42,6 +42,7 @@ def extract_entry_candidates(byday):
       row = group.iloc[i]
       t = row['dt'].time()
 
+      # Original time cutoff restored (14:30)
       if t > dtime(14, 30) or t < dtime(9, 30):
         continue
 
@@ -114,7 +115,7 @@ def extract_entry_candidates(byday):
 def trigger_live_entry_alert(side, contract, qty, delta, entry_spot, entry_price, init_sl_spot, init_sl_price, init_sl_pnl):
   """Dynamic helper for live execution to trigger entry alerts cleanly without hardcoded values."""
   init_sl_pts = -40.0 if side == 'CE' else 40.0
-  stages_str = "+50 (35-buf) → +90 (25-buf) → +150 (12-buf)"
+  stages_str = "+50 (+5) → +75 (+30) → +100 (+65) → +125 (+90) → +150 (+125) → +200+"
   trigger_time = datetime.now().strftime("%H:%M:%S")
   action_type = f"BUY {side}"
 
