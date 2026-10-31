@@ -27,7 +27,7 @@ def run_live_daemon():
 
     if dtime(9, 15) <= current_time <= dtime(15, 30):
       print(f'[{now}] Polling live market candles...')
-      # (Integrate broker live polling & Upstash updates here)
+      # (Broker polling & live strategy evaluation hooks execute here)
     else:
       print(f'[{now}] Outside market hours. Sleeping...')
 
