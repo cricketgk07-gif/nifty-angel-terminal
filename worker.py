@@ -31,7 +31,7 @@ def run_live_daemon():
     else:
       print(f'[{now}] Outside market hours. Sleeping...')
 
-    time.sleep(300)
+    time.sleep(5)
 
 
 if __name__ == '__main__':
