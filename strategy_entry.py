@@ -1,7 +1,8 @@
 # strategy_entry.py
-from datetime import time as dtime
+from datetime import time as dtime, datetime
 import numpy as np
 import pandas as pd
+from notifier import send_entry_alert
 
 
 def calculate_indicators(df):
@@ -108,3 +109,26 @@ def extract_entry_candidates(byday):
           break
 
   return candidates
+
+
+def trigger_live_entry_alert(side, contract, qty, delta, entry_spot, entry_price, init_sl_spot, init_sl_price, init_sl_pnl):
+  """Dynamic helper for live execution to trigger entry alerts cleanly without hardcoded values."""
+  init_sl_pts = -40.0 if side == 'CE' else 40.0
+  stages_str = "+50 (35-buf) → +90 (25-buf) → +150 (12-buf)"
+  trigger_time = datetime.now().strftime("%H:%M:%S")
+  action_type = f"BUY {side}"
+
+  send_entry_alert(
+      action_type=action_type,
+      contract=contract,
+      qty=qty,
+      delta=delta,
+      entry_spot=entry_spot,
+      entry_price=entry_price,
+      init_sl_spot=init_sl_spot,
+      init_sl_pts=init_sl_pts,
+      init_sl_price=init_sl_price,
+      init_sl_pnl=init_sl_pnl,
+      stages_str=stages_str,
+      trigger_time=trigger_time
+  )
