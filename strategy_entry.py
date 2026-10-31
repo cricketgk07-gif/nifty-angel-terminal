@@ -35,14 +35,14 @@ def extract_entry_candidates(byday):
     orb_low = orb_window['low'].min()
     orb_width = orb_high - orb_low
 
-    if orb_width > 160.0 or orb_width < 12.0:
+    if orb_width > 160.0 or orb_width < 12:
       continue
 
     for i in range(3, len(group) - 2):
       row = group.iloc[i]
       t = row['dt'].time()
 
-      # Original time cutoff restored (14:30)
+      # Original session hours restored (up to 14:30)
       if t > dtime(14, 30) or t < dtime(9, 30):
         continue
 
@@ -81,7 +81,8 @@ def extract_entry_candidates(byday):
           loc = (close_v - low_v) / rng
           body_frac = abs(close_v - open_v) / rng
 
-          if body_frac < 0.30:
+          # Optimized body fraction for higher profit capture
+          if body_frac < 0.12:
             continue
 
           candidates.append({
