@@ -1,7 +1,8 @@
 # strategy_tsl.py
-from datetime import time as dtime
+from datetime import time as dtime, datetime
 import numpy as np
 import pandas as pd
+from notifier import send_trailing_sl_alert, send_trade_closed_alert
 
 
 def run_fixed_replay(cand_df, raw_arrays):
@@ -67,3 +68,31 @@ def run_fixed_replay(cand_df, raw_arrays):
     replayed.append(pts)
 
   return replayed
+
+
+def trigger_live_trailing_alert(option_type, stage_name, contract, index_spot, option_gtt_price, locked_pts, locked_inr):
+  """Dynamic helper for live TSL updates."""
+  update_time = datetime.now().strftime("%H:%M:%S")
+  send_trailing_sl_alert(
+      option_type=option_type,
+      stage_name=stage_name,
+      contract=contract,
+      index_spot=index_spot,
+      option_gtt_price=option_gtt_price,
+      locked_pts=locked_pts,
+      locked_inr=locked_inr,
+      update_time=update_time
+  )
+
+
+def trigger_live_closure_alert(exit_reason, exit_spot, net_pts, net_inr, daily_limit_str):
+  """Dynamic helper for trade closures (Stop Loss Hit / Target Hit)."""
+  exit_time = datetime.now().strftime("%H:%M:%S")
+  send_trade_closed_alert(
+      exit_reason=exit_reason,
+      exit_spot=exit_spot,
+      net_pts=net_pts,
+      net_inr=net_inr,
+      daily_limit_str=daily_limit_str,
+      exit_time=exit_time
+  )
