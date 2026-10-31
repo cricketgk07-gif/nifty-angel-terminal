@@ -7,7 +7,7 @@ from tkinter import filedialog, simpledialog
 
 from strategy_entry import calculate_indicators, extract_entry_candidates
 from strategy_ml import train_and_save_model
-from strategy_tsl import run_fixed_replay
+from strategy_tsl import run_detailed_replay
 
 
 def run_backtest():
@@ -83,8 +83,12 @@ def run_backtest():
       for k, g in byday.items()
   }
 
-  print('[4/5] Running replay simulation...')
-  cand_df['target_points'] = run_fixed_replay(cand_df, raw_arrays)
+  print('[4/5] Running detailed replay simulation (Exit Prices & Times)...')
+  detailed_res = run_detailed_replay(cand_df, raw_arrays)
+  cand_df['target_points'] = detailed_res['target_points']
+  cand_df['exit_price'] = detailed_res['exit_price']
+  cand_df['exit_time'] = detailed_res['exit_time']
+  cand_df['exit_reason'] = detailed_res['exit_reason']
 
   print('[5/5] Training ML Model & applying 0.52 Quantile Filter...')
   model, cutoff = train_and_save_model(cand_df)
