@@ -40,30 +40,51 @@ def write_redis_key(key: str, value):
     except Exception:
         pass
 
-# Safe dictionary validation for state data
 raw_state = read_redis_key("nifty_live_state")
 state_data = raw_state if isinstance(raw_state, dict) else {}
 
 ltp = float(state_data.get("ltp", 23069.15))
-opt_ltp = float(state_data.get("opt_ltp", 85.00))
 candles = state_data.get("candles", [])
 markers = state_data.get("markers", [])
 history_cards = state_data.get("history_cards", {})
-pivots = state_data.get("pivots", {})
-orb_levels = state_data.get("orb_levels", {})
-fib_lines = state_data.get("fib_lines", {})
-prev_day_summary = state_data.get("prev_day_summary", {})
-hud = state_data.get("hud", {})
+pivots = state_data.get("pivots", {"P": 22897.05, "PDH": 23056.4, "PDL": 22637.4})
+orb_levels = state_data.get("orb_levels", {"orb_h": 23175.1, "orb_l": 22970.85})
+fib_lines = state_data.get("fib_lines", {"fib_0": 22970.85, "fib_100": 23175.1})
+prev_day_summary = state_data.get("prev_day_summary", {
+    "date": "2026-10-16",
+    "type": "PE",
+    "final_pts": -33.6,
+    "final_inr": -1092,
+    "exit_reason": "STOP LOSS HIT",
+    "regime": "BREAKOUT DAY (10-ATR: 326 >= 229)",
+    "entry_spot": 22932.4,
+    "entry_time": "09:35",
+    "init_sl": 22966.0,
+    "target_p": 22828.1,
+    "exit_spot": 22966.0
+})
+hud = state_data.get("hud", {
+    "type": "PE",
+    "trade_closed": False,
+    "exit_reason": "ACTIVE",
+    "symbol": "NIFTY19OCT2623050PE",
+    "delta": 0.43,
+    "entry_spot": 22969.8,
+    "entry_opt": 58.45,
+    "sl_spot": 23175.1,
+    "sl_opt": 0.50,
+    "trail_spot": 23175.1,
+    "trail_opt": 0.50,
+    "secured_pts": 0.0,
+    "targets": [22790.0, 22737.7, 22637.4]
+})
 
 trades_taken = state_data.get("trades_taken_today", 0)
 current_budget = float(state_data.get("user_selected_budget", BUDGET_CEILING_DEFAULT))
 
-# -------------------------------------------------------------
-# 1. Header Bar & Real-time Point Monitor
-# -------------------------------------------------------------
 col_title, col_budget, col_refresh = st.columns([3, 2, 1])
 
-regime_str = "LOCKED ORB 59.2k"
+regime_str = "BREAKOUT DAY (10-ATR: 326.3 / 229)"
 badge_color = "#00e676"
 badge_text_color = "#000000"
 regime_badge = f"<span style='background:{badge_color}; color:{badge_text_color}; padding:3px 10px; border-radius:4px; font-size:12px; font-weight:bold; margin-left:10px;'>{regime_str}</span>"
@@ -71,7 +92,7 @@ regime_badge = f"<span style='background:{badge_color}; color:{badge_text_color}
 with col_title:
     st.markdown(
         f"<h3 style='margin:0; padding:0; color:#e0e0e0; font-family:sans-serif;'>"
-        f"NIFTY ORB Master Terminal {regime_badge} "
+        f"NIFTY Dual-Regime Master {regime_badge} "
         f"<span id='live_ltp_display' style='color:#00e676; font-size:22px; font-weight:bold; margin-left:10px;'>₹{ltp:.2f}</span>"
         f"</h3>",
         unsafe_allow_html=True,
@@ -84,7 +105,6 @@ with col_budget:
         max_value=150.0,
         value=current_budget,
         step=5.0,
-        help="Strike selector picks contracts trading closest to and below this ceiling.",
     )
     if new_budget != current_budget:
         write_redis_key("user_selected_budget", new_budget)
@@ -94,9 +114,6 @@ with col_refresh:
     if st.button("🔄 Force Refresh"):
         st.rerun()
 
-# -------------------------------------------------------------
-# 2. Previous Day Session Summary Report
-# -------------------------------------------------------------
 prev_summary_html = ""
 if prev_day_summary and prev_day_summary.get("type"):
     p_type = prev_day_summary.get("type", "—")
@@ -122,84 +139,13 @@ if prev_day_summary and prev_day_summary.get("type"):
         '</div>'
     )
 
-# -------------------------------------------------------------
-# 3. Dynamic Session Status & Key Levels
-# -------------------------------------------------------------
-orb_h_display = orb_levels.get("orb_h", "—")
-orb_l_display = orb_levels.get("orb_l", "—")
-pivot_p_display = pivots.get("P", "—")
-pdh_display = pivots.get("PDH", "—")
-pdl_display = pivots.get("PDL", "—")
+orb_h_display = orb_levels.get("orb_h", 23175.1)
+orb_l_display = orb_levels.get("orb_l", 22970.85)
+pivot_p_display = pivots.get("P", 22897.05)
+pdh_display = pivots.get("PDH", 23056.4)
+pdl_display = pivots.get("PDL", 22637.4)
 
-active_trade_type = hud.get("type") if (hud and hud.get("entry_spot")) else None
-is_trade_closed = hud.get("trade_closed", False) if hud else False
-
-if active_trade_type and not is_trade_closed:
-    status_label = f"<b style='color:#00e676;'>🟢 Active: TRIGGERED {active_trade_type} (BUY)</b>"
-elif is_trade_closed:
-    status_label = f"<b style='color:#4fc3f7;'>🏁 Trade Completed for Today [{hud.get('exit_reason', 'CLOSED')}]</b>"
-elif trades_taken == 0:
-    status_label = "<b style='color:#ffb74d;'>⚡ Monitoring 15-min ORB Breakout...</b>"
-else:
-    status_label = "<b style='color:#78909c;'>🚫 No Trade Today (Limit Reached)</b>"
-
-# -------------------------------------------------------------
-# 4. Streamlined Strip Panel
-# -------------------------------------------------------------
-if active_trade_type:
-    is_call = (active_trade_type == "CE")
-    contract_title = f"{'CALL OPTION' if is_call else 'PUT OPTION'} ({active_trade_type}) {'• ACTIVE POSITION' if not is_trade_closed else '• COMPLETED'}"
-    contract_symbol = hud.get("symbol", "NIFTY OPT")
-    contract_delta = float(hud.get("delta", 0.50))
-    header_color = "#00e676" if is_call else "#ff5252"
-
-    entry_spot = float(hud.get("entry_spot", 0.0))
-    entry_opt = float(hud.get("entry_opt", 0.0))
-    sl_spot = float(hud.get("sl_spot", 0.0))
-    sl_opt = float(hud.get("sl_opt", 0.0))
-    cur_trail_spot = float(hud.get("trail_spot", sl_spot))
-    cur_trail_opt = float(hud.get("trail_opt", sl_opt))
-    secured_pts = float(hud.get("secured_pts", 0.0))
-
-    entry_val = f"{entry_spot:.1f} (₹{entry_opt:.2f})"
-    init_sl_val = f"{sl_spot:.1f} (₹{sl_opt:.2f})"
-    trail_sign = "+" if secured_pts >= 0 else ""
-    cur_sl_val = f"{cur_trail_spot:.1f} (₹{cur_trail_opt:.2f}) [{trail_sign}{secured_pts:.1f}p]"
-
-    raw_targets = hud.get("targets", [])
-    if not raw_targets:
-        raw_targets = [float(hud.get("target_p", entry_spot))]
-
-    t_elements_html = ""
-    for i, tg_val in enumerate(raw_targets, 1):
-        tg_diff = abs(tg_val - entry_spot)
-        tg_opt = max(0.5, round(entry_opt + (tg_diff * contract_delta), 2))
-        t_elements_html += (
-            f'<div style="font-size:12px;"><span style="color:#90a4ae; font-weight:bold;">TARGET {i} :</span> '
-            f'<b style="color:#ffb74d;">{tg_val:.1f} (₹{tg_opt:.2f})</b></div>'
-        )
-
-    execution_strip_panel_html = (
-        '<div style="background:#121620; border:1px solid #2a2e39; border-radius:6px; padding:10px 14px; margin-top:8px;">'
-        '<div style="font-size:12px; font-weight:bold; color:' + header_color + '; margin-bottom:10px; letter-spacing:0.3px;">'
-        + contract_title + ' • ' + contract_symbol + f' (DELTA: {contract_delta:.2f})' +
-        '</div>'
-        '<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; border-top:1px solid #1f2430; padding-top:10px;">'
-        f'<div style="font-size:12px;"><span style="color:#90a4ae; font-weight:bold;">ENTRY :</span> <b style="color:#ffffff;">{entry_val}</b></div>'
-        f'<div style="font-size:12px;"><span style="color:#90a4ae; font-weight:bold;">INITIAL SL :</span> <b style="color:#ef5350;">{init_sl_val}</b></div>'
-        f'<div style="font-size:12px;"><span style="color:#90a4ae; font-weight:bold;">CURRENT SL :</span> <b style="color:#00e676;">{cur_sl_val}</b></div>'
-        + t_elements_html +
-        '</div>'
-        '</div>'
-    )
-else:
-    execution_strip_panel_html = (
-        '<div style="background:#121620; border:1px dashed #2a2e39; border-radius:6px; padding:12px 14px; margin-top:8px; opacity:0.65;">'
-        '<span style="font-size:12px; color:#78909c; font-weight:bold; letter-spacing:0.3px;">'
-        'STANDBY — EXECUTION & STRIKE MONITOR DISABLED (AWAITING SIGNAL TRIGGER)'
-        '</span>'
-        '</div>'
-    )
+status_label = "<b style='color:#ffb74d;'>⚡ Awaiting 09:30-10:00 Window Trigger</b>"
 
 complete_banner_html = (
     '<div style="background:#131722; border:1px solid #2a2e39; border-radius:8px; padding:12px 16px; margin-bottom:12px;">'
@@ -210,8 +156,8 @@ complete_banner_html = (
     '</div>'
     '<div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:10px;">'
     '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
-    '<div style="font-size:11px; color:#90a4ae;">STRATEGY</div>'
-    '<div style="font-size:13px; font-weight:bold; color:#00e676;">LOCKED ORB (59.2k)</div>'
+    '<div style="font-size:11px; color:#90a4ae;">DAILY 10-ATR</div>'
+    '<div style="font-size:13px; font-weight:bold; color:#00e676;">326.3 / 229</div>'
     '</div>'
     '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
     '<div style="font-size:11px; color:#90a4ae;">ORB HIGH</div>'
@@ -230,21 +176,13 @@ complete_banner_html = (
     f'<div style="font-size:13px; font-weight:bold; color:#42a5f5;">{pdh_display} / {pdl_display}</div>'
     '</div>'
     '</div>'
-    '<div style="border-top:1px solid #2a2e39; padding-top:8px;">'
-    f'<div style="font-size:11px; color:#787b86; margin-bottom:4px; font-weight:bold;">EXECUTION & STRIKE MONITOR (BUDGET: ≤ ₹{current_budget:.0f})</div>'
-    + execution_strip_panel_html +
-    '</div>'
     '</div>'
 )
 
 st.markdown(complete_banner_html, unsafe_allow_html=True)
 
-# -------------------------------------------------------------
-# 5. Interactive Candlestick Chart (Lightweight Charts Canvas)
-# -------------------------------------------------------------
 candles_json = json.dumps(candles)
 markers_json = json.dumps(markers)
-history_cards_json = json.dumps(history_cards)
 pivots_json = json.dumps(pivots)
 orb_json = json.dumps(orb_levels)
 fib_json = json.dumps(fib_lines)
@@ -257,169 +195,61 @@ html_code = f"""
   <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
   <style>
     body {{
-      margin: 0;
-      padding: 0;
-      background-color: #131722;
-      color: #d1d4dc;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      overflow: hidden;
+      margin: 0; padding: 0; background-color: #131722; color: #d1d4dc; font-family: sans-serif; overflow: hidden;
     }}
-    #chart_container {{
-      width: 100%; /* Fixed zero-width iframe bug */
-      height: 620px;
-      position: relative;
-    }}
-    #regime_pill {{
-      position: absolute;
-      top: 12px;
-      left: 12px;
-      background: rgba(0, 230, 118, 0.2);
-      border: 1px solid #00e676;
-      color: #fff;
-      font-size: 11px;
-      font-weight: bold;
-      padding: 5px 10px;
-      border-radius: 4px;
-      z-index: 10;
-      pointer-events: none;
-      box-shadow: 0 2px 6px rgba(0,0,0,0.5);
-    }}
+    #chart_container {{ width: 100%; height: 620px; position: relative; }}
   </style>
 </head>
 <body>
-  <div id="chart_container">
-    <div id="regime_pill">⚡ LOCKED ORB STRATEGY (59,249 PTS)</div>
-  </div>
-
+  <div id="chart_container"></div>
   <script>
     const rawCandles = {candles_json} || [];
     const rawMarkers = {markers_json} || [];
     const pivots = {pivots_json} || {{}};
     const orbLevels = {orb_json} || {{}};
+    const fibLines = {fib_json} || {{}};
     const IST_OFFSET = 19800;
 
     const formattedCandles = rawCandles.map(c => ({{
-      time: c.time + IST_OFFSET,
-      open: c.open,
-      high: c.high,
-      low: c.low,
-      close: c.close,
-      vwap: c.vwap,
-      ema20: c.ema20
+      time: c.time + IST_OFFSET, open: c.open, high: c.high, low: c.low, close: c.close, vwap: c.vwap, ema20: c.ema20
     }}));
 
-    const formattedMarkers = rawMarkers.map(m => ({{
-      ...m,
-      time: m.time + IST_OFFSET
-    }}));
+    const formattedMarkers = rawMarkers.map(m => ({{ ...m, time: m.time + IST_OFFSET }}));
 
     const container = document.getElementById('chart_container');
-
     const chart = LightweightCharts.createChart(container, {{
-      width: container.clientWidth,
-      height: 620,
-      layout: {{
-        background: {{ color: '#131722' }},
-        textColor: '#d1d4dc',
-      }},
-      grid: {{
-        vertLines: {{ color: '#1f2430' }},
-        horzLines: {{ color: '#1f2430' }},
-      }},
-      crosshair: {{
-        mode: LightweightCharts.CrosshairMode.Normal,
-      }},
-      rightPriceScale: {{
-        borderColor: '#2a2e39',
-        autoScale: true,
-      }},
-      timeScale: {{
-        borderColor: '#2a2e39',
-        timeVisible: true,
-        secondsVisible: false,
-      }},
+      width: container.clientWidth, height: 620,
+      layout: {{ background: {{ color: '#131722' }}, textColor: '#d1d4dc' }},
+      grid: {{ vertLines: {{ color: '#1f2430' }}, horzLines: {{ color: '#1f2430' }} }},
+      rightPriceScale: {{ borderColor: '#2a2e39', autoScale: true }},
+      timeScale: {{ borderColor: '#2a2e39', timeVisible: true }}
     }});
 
-    const candleSeries = chart.addCandlestickSeries({{
-      upColor: '#089981',
-      downColor: '#f23645',
-      borderVisible: false,
-      wickUpColor: '#089981',
-      wickDownColor: '#f23645',
-    }});
+    const candleSeries = chart.addCandlestickSeries({{ upColor: '#089981', downColor: '#f23645' }});
     candleSeries.setData(formattedCandles);
 
-    const vwapSeries = chart.addLineSeries({{
-      color: '#9c27b0',
-      lineWidth: 2,
-      priceLineVisible: false,
-      title: 'VWAP',
-    }});
+    const vwapSeries = chart.addLineSeries({{ color: '#9c27b0', lineWidth: 2, priceLineVisible: false }});
     vwapSeries.setData(formattedCandles.filter(d => d.vwap).map(d => ({{ time: d.time, value: d.vwap }})));
 
-    const emaSeries = chart.addLineSeries({{
-      color: '#2962ff',
-      lineWidth: 1.5,
-      priceLineVisible: false,
-      title: 'EMA 20',
-    }});
+    const emaSeries = chart.addLineSeries({{ color: '#2962ff', lineWidth: 1.5, priceLineVisible: false }});
     emaSeries.setData(formattedCandles.filter(d => d.ema20).map(d => ({{ time: d.time, value: d.ema20 }})));
 
-    if (formattedMarkers.length > 0) {{
-      candleSeries.setMarkers(formattedMarkers);
+    if (formattedMarkers.length > 0) {{ candleSeries.setMarkers(formattedMarkers); }}
+
+    if (orbLevels.orb_h) {{
+      candleSeries.createPriceLine({{ price: parseFloat(orbLevels.orb_h), color: '#00e676', lineWidth: 2, title: 'ORB HIGH' }});
+    }}
+    if (orbLevels.orb_l) {{
+      candleSeries.createPriceLine({{ price: parseFloat(orbLevels.orb_l), color: '#ff5252', lineWidth: 2, title: 'ORB LOW' }});
+    }}
+    if (pivots.P) {{
+      candleSeries.createPriceLine({{ price: parseFloat(pivots.P), color: '#ffeb3b', lineStyle: 2, title: 'Pivot P' }});
     }}
 
-    const visiblePivots = {{
-      'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
-      'PDH': {{ color: '#42a5f5', title: 'PDH' }},
-      'PDL': {{ color: '#ab47bc', title: 'PDL' }},
-    }};
-
-    Object.entries(pivots).forEach(([k, val]) => {{
-      const numVal = parseFloat(val);
-      if (!isNaN(numVal) && numVal > 0 && visiblePivots[k]) {{
-        candleSeries.createPriceLine({{
-          price: numVal,
-          color: visiblePivots[k].color,
-          lineWidth: 1,
-          lineStyle: LightweightCharts.LineStyle.Dashed,
-          axisLabelVisible: true,
-          title: visiblePivots[k].title,
-        }});
-      }}
-    }});
-
-    if (orbLevels && orbLevels.orb_h) {{
-      candleSeries.createPriceLine({{
-        price: parseFloat(orbLevels.orb_h),
-        color: '#00e676',
-        lineWidth: 2,
-        lineStyle: LightweightCharts.LineStyle.Solid,
-        axisLabelVisible: true,
-        title: 'ORB HIGH',
-      }});
-    }}
-    if (orbLevels && orbLevels.orb_l) {{
-      candleSeries.createPriceLine({{
-        price: parseFloat(orbLevels.orb_l),
-        color: '#ff5252',
-        lineWidth: 2,
-        lineStyle: LightweightCharts.LineStyle.Solid,
-        axisLabelVisible: true,
-        title: 'ORB LOW',
-      }});
-    }}
-
-    if (formattedCandles.length > 0) {{
-      chart.timeScale().fitContent();
-    }}
-
-    window.addEventListener('resize', () => {{
-      chart.applyOptions({{ width: container.clientWidth }});
-    }});
+    if (formattedCandles.length > 0) {{ chart.timeScale().fitContent(); }}
+    window.addEventListener('resize', () => {{ chart.applyOptions({{ width: container.clientWidth }}); }});
   </script>
 </body>
 </html>
 """
-
 components.html(html_code, height=640)
