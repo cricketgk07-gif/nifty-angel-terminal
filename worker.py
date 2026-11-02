@@ -5,7 +5,6 @@ import os
 import json
 import joblib
 import pandas as pd
-import requests
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -15,11 +14,10 @@ from strategy_tsl import trigger_live_trailing_alert, trigger_live_closure_alert
 import notifier
 
 print('==================================================')
-print('      ORACLE LIVE TRADER DAEMON INITIALIZED       ')
+print('      ORACLE LOCAL TRADER DAEMON INITIALIZED      ')
 print('==================================================')
 
-UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
-UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+STATE_FILE = "nifty_live_state.json"
 
 # Load trained ML model and cutoff
 try:
@@ -32,37 +30,27 @@ except Exception as e:
   print(f'[INIT WARNING] Model files not loaded yet: {e}')
 
 def update_redis_state(state_dict):
-  """Pushes live state updates to Upstash Redis for Streamlit dashboard rendering."""
-  if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
-    return
-  url = f"{UPSTASH_REDIS_REST_URL}/set/nifty_live_state"
-  headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
+  """Pushes live state updates locally for Streamlit dashboard rendering."""
   try:
-    requests.post(url, headers=headers, data=json.dumps(json.dumps(state_dict)), timeout=3)
+    with open(STATE_FILE, "w") as f:
+      json.dump(state_dict, f)
   except Exception as e:
-    print(f"[REDIS ERROR] {e}")
+    print(f"[LOCAL WRITE ERROR]: {e}")
 
 def read_redis_state():
-  """Reads and safely decodes current live state from Upstash Redis."""
-  if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
-    return {}
-  url = f"{UPSTASH_REDIS_REST_URL}/get/nifty_live_state"
-  headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
+  """Reads current live state from local file storage."""
   try:
-    r = requests.get(url, headers=headers, timeout=3)
-    if r.status_code == 200:
-      val = r.json().get("result")
-      if val:
+    if os.path.exists(STATE_FILE):
+      with open(STATE_FILE, "r") as f:
+        val = json.load(f)
         if isinstance(val, dict):
           return val
-        if isinstance(val, str):
-          return json.loads(val)
   except Exception:
     pass
   return {}
 
 def poll_live_market():
-  """Polls live market feed, evaluates ORB triggers, updates Redis, and fires alerts via notifier."""
+  """Polls live market feed, evaluates ORB triggers, updates local state, and fires alerts."""
   try:
     now_str = datetime.now().strftime('%H:%M:%S')
     print(f"[{now_str}] Polling live Nifty spot & evaluating ORB triggers...")
