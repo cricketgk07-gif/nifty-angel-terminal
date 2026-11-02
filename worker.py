@@ -43,7 +43,7 @@ def update_redis_state(state_dict):
     print(f"[REDIS ERROR] {e}")
 
 def read_redis_state():
-  """Reads current live state from Upstash Redis."""
+  """Reads and safely decodes current live state from Upstash Redis."""
   if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
     return {}
   url = f"{UPSTASH_REDIS_REST_URL}/get/nifty_live_state"
@@ -53,7 +53,10 @@ def read_redis_state():
     if r.status_code == 200:
       val = r.json().get("result")
       if val:
-        return json.loads(val)
+        if isinstance(val, dict):
+          return val
+        if isinstance(val, str):
+          return json.loads(val)
   except Exception:
     pass
   return {}
@@ -65,6 +68,8 @@ def poll_live_market():
     print(f"[{now_str}] Polling live Nifty spot & evaluating ORB triggers...")
     
     current_state = read_redis_state()
+    if not isinstance(current_state, dict):
+      current_state = {}
     
     # Ensure baseline candles and LTP exist so Streamlit never shows empty data
     if not current_state.get('candles'):
