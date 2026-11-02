@@ -6,6 +6,7 @@ import json
 import joblib
 import pandas as pd
 from dotenv import load_dotenv
+from upstash_redis import Redis
 
 load_dotenv()
 
@@ -17,7 +18,13 @@ print('==================================================')
 print('      ORACLE LOCAL TRADER DAEMON INITIALIZED      ')
 print('==================================================')
 
-STATE_FILE = "nifty_live_state.json"
+# -------------------------------------------------------------
+# Upstash Redis Initialization
+# -------------------------------------------------------------
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+
+redis_client = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN) if UPSTASH_URL and UPSTASH_TOKEN else None
 
 # Load trained ML model and cutoff
 try:
@@ -30,27 +37,26 @@ except Exception as e:
   print(f'[INIT WARNING] Model files not loaded yet: {e}')
 
 def update_redis_state(state_dict):
-  """Pushes live state updates locally for Streamlit dashboard rendering."""
+  """Pushes live state updates to Upstash Redis."""
   try:
-    with open(STATE_FILE, "w") as f:
-      json.dump(state_dict, f)
+    if redis_client:
+      redis_client.set("nifty_live_state", json.dumps(state_dict))
   except Exception as e:
-    print(f"[LOCAL WRITE ERROR]: {e}")
+    print(f"[UPSTASH WRITE ERROR]: {e}")
 
 def read_redis_state():
-  """Reads current live state from local file storage."""
+  """Reads current live state from Upstash Redis."""
   try:
-    if os.path.exists(STATE_FILE):
-      with open(STATE_FILE, "r") as f:
-        val = json.load(f)
-        if isinstance(val, dict):
-          return val
-  except Exception:
-    pass
+    if redis_client:
+      val = redis_client.get("nifty_live_state")
+      if val:
+        return json.loads(val) if isinstance(val, str) else val
+  except Exception as e:
+    print(f"[UPSTASH READ ERROR]: {e}")
   return {}
 
 def poll_live_market():
-  """Polls live market feed, evaluates ORB triggers, updates local state, and fires alerts."""
+  """Polls live market feed, evaluates ORB triggers, updates Upstash state, and fires alerts."""
   try:
     now_str = datetime.now().strftime('%H:%M:%S')
     print(f"[{now_str}] Polling live Nifty spot & evaluating ORB triggers...")
