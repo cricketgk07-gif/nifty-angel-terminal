@@ -21,11 +21,14 @@ print('==================================================')
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
+# Load trained ML model and cutoff
 try:
   model = joblib.load('trained_orb_model.pkl')
   cutoff = joblib.load('model_cutoff.pkl')
   print('[INIT] Loaded trained model and cutoff successfully.')
 except Exception as e:
+  model = None
+  cutoff = 0.0
   print(f'[INIT WARNING] Model files not loaded yet: {e}')
 
 def update_redis_state(state_dict):
@@ -56,15 +59,27 @@ def read_redis_state():
   return {}
 
 def poll_live_market():
-  """Polls live market feed, updates LTP, evaluates ORB triggers, and fires alerts."""
+  """Polls live market feed, evaluates ORB triggers, updates Redis, and fires alerts via notifier."""
   try:
     now_str = datetime.now().strftime('%H:%M:%S')
     print(f"[{now_str}] Polling live Nifty spot & evaluating ORB triggers...")
     
-    # Fetch live Nifty Spot & Option LTP (integrate your broker LTP fetch or Upstox feed here)
-    # Example live state update structure for Streamlit & Redis:
     current_state = read_redis_state()
     
+    # --- STRATEGY EVALUATION & NOTIFIER HOOKS ---
+    # Example: When your breakout condition evaluates and triggers an entry:
+    # trigger_live_entry_alert(
+    #     side="CE",
+    #     contract="NIFTY 24000 CE",
+    #     qty=50,
+    #     delta=0.55,
+    #     entry_spot=24050.0,
+    #     entry_price=85.50,
+    #     init_sl_spot=24010.0,
+    #     init_sl_price=63.0,
+    #     init_sl_pnl=-1125.0
+    # )
+
     # Keep dashboard responsive with live timestamp update
     current_state['last_poll'] = now_str
     update_redis_state(current_state)
