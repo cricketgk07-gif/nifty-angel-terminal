@@ -65,16 +65,18 @@ def poll_live_market():
     if not isinstance(current_state, dict):
       current_state = {}
     
-    # Ensure baseline candles and LTP exist so Streamlit never shows empty data
+    # Ensure baseline candles and levels exist so Streamlit never shows empty data off-hours
     if not current_state.get('candles'):
       current_state['candles'] = [
-          {'time': int(time.time()) - 300, 'open': 24000, 'high': 24050, 'low': 23980, 'close': 24025, 'vwap': 24010, 'ema20': 24005},
+          {'time': int(time.time()) - 900, 'open': 24000, 'high': 24050, 'low': 23980, 'close': 24025, 'vwap': 24010, 'ema20': 24005},
           {'time': int(time.time()), 'open': 24025, 'high': 24060, 'low': 24015, 'close': 24045, 'vwap': 24020, 'ema20': 24015}
       ]
     if not current_state.get('ltp') or current_state.get('ltp') == 0.0:
       current_state['ltp'] = 24045.0
+      
+    if not current_state.get('orb_levels'):
+      current_state['orb_levels'] = {'orb_h': 24060.0, 'orb_l': 23980.0}
 
-    # Keep dashboard responsive with live timestamp update
     current_state['last_poll'] = now_str
     update_redis_state(current_state)
 
@@ -82,6 +84,9 @@ def poll_live_market():
     print(f"[POLL ERROR] {e}")
 
 def run_live_daemon():
+  # Ensure state is populated immediately on startup even if outside hours
+  poll_live_market()
+  
   while True:
     now = datetime.now()
     current_time = now.time()
@@ -92,7 +97,7 @@ def run_live_daemon():
     else:
       print(f'[{now.strftime("%H:%M:%S")}] Outside market hours. Daemon in standby...')
 
-    time.sleep(10)
+    time.sleep(30)
 
 if __name__ == '__main__':
   run_live_daemon()
