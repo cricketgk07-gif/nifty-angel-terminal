@@ -47,7 +47,8 @@ def write_redis_key(key: str, value):
         pass
 
 
-state_data = read_redis_key("nifty_live_state") or {}
+raw_state = read_redis_key("nifty_live_state")
+state_data = raw_state if isinstance(raw_state, dict) else {}
 
 ltp = float(state_data.get("ltp", 0.0))
 opt_ltp = float(state_data.get("opt_ltp", 0.0))
