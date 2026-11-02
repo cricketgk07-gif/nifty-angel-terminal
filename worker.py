@@ -22,7 +22,6 @@ print('      ORACLE WORKER & UPSTASH SYNC INITIALIZED    ')
 print('==================================================')
 
 def push_to_upstash(state_dict):
-    """Pushes strategy state to Upstash Redis cloud cache."""
     try:
         if redis_client:
             redis_client.set("nifty_live_state", json.dumps(state_dict))
@@ -31,29 +30,31 @@ def push_to_upstash(state_dict):
         print(f"[UPSTASH WRITE ERROR]: {e}")
 
 def run_strategy_engine():
-    # Generate today's real market session timestamps (15-min intervals starting 09:15)
     now = datetime.now()
     market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
     
+    # Cap current time strictly to market hours (09:15 to 15:30)
+    effective_now = min(now, market_close)
+    if effective_now < market_open:
+        effective_now = market_open + timedelta(minutes=15)
+
     timestamps = []
     current_t = market_open
-    while current_t <= now and len(timestamps) < 35:
+    while current_t <= effective_now and len(timestamps) < 30:
         timestamps.append(int(current_t.timestamp()))
         current_t += timedelta(minutes=15)
     
-    if not timestamps:
-        timestamps = [int(now.timestamp()) - (i * 900) for i in range(20)][::-1]
-
     n_candles = len(timestamps)
     np.random.seed(42)
     base_price = 23950.0
-    closes = base_price + np.cumsum(np.random.randn(n_candles) * 10)
+    closes = base_price + np.cumsum(np.random.randn(n_candles) * 8)
     
     df = pd.DataFrame({
         'time': timestamps,
-        'open': closes - np.random.rand(n_candles) * 6,
-        'high': closes + np.random.rand(n_candles) * 12,
-        'low': closes - np.random.rand(n_candles) * 12,
+        'open': closes - np.random.rand(n_candles) * 5,
+        'high': closes + np.random.rand(n_candles) * 10,
+        'low': closes - np.random.rand(n_candles) * 10,
         'close': closes,
         'volume': np.random.randint(100000, 300000, n_candles)
     })
@@ -85,7 +86,6 @@ def run_strategy_engine():
     orb_l = round(float(df.iloc[:3]['low'].min()), 2) if len(df) >= 3 else round(current_ltp - 30, 2)
 
     entry_idx = min(4, len(candles) - 1)
-    exit_idx = min(12, len(candles) - 1)
 
     markers = [
         {
