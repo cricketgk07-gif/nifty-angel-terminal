@@ -14,7 +14,7 @@ load_dotenv()
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 
 st.set_page_config(
-    page_title="NIFTY ORB Master Terminal (59.2k)",
+    page_title="NIFTY ORB Master Terminal (55.7k)",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -307,7 +307,7 @@ html_code = f"""
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
       z-index: 1000;
       pointer-events: none;
-      min-width: 230px;
+      min-width: 220px;
     }}
   </style>
 </head>
@@ -320,10 +320,8 @@ html_code = f"""
   <script>
     const rawCandles = {candles_json} || [];
     const rawMarkers = {markers_json} || [];
-    const historyCards = {history_cards_json} || {{}};
     const pivots = {pivots_json} || {{}};
     const orbLevels = {orb_json} || {{}};
-    const fibLines = {fib_json} || {{}};
     const IST_OFFSET = 19800;
 
     const formattedCandles = rawCandles.map(c => ({{
@@ -334,11 +332,6 @@ html_code = f"""
       close: c.close,
       vwap: c.vwap,
       ema20: c.ema20
-    }}));
-
-    const formattedMarkers = rawMarkers.map(m => ({{
-      ...m,
-      time: m.time + IST_OFFSET
     }}));
 
     const container = document.getElementById('chart_container');
@@ -394,8 +387,8 @@ html_code = f"""
     }});
     emaSeries.setData(formattedCandles.filter(d => d.ema20).map(d => ({{ time: d.time, value: d.ema20 }})));
 
-    if (formattedMarkers.length > 0) {{
-      candleSeries.setMarkers(formattedMarkers);
+    if (rawMarkers.length > 0) {{
+      candleSeries.setMarkers(rawMarkers.map(m => ({{ ...m, time: m.time + IST_OFFSET }})));
     }}
 
     const visiblePivots = {{
@@ -442,6 +435,28 @@ html_code = f"""
     if (formattedCandles.length > 0) {{
       chart.timeScale().fitContent();
     }}
+
+    chart.subscribeCrosshairMove(param => {{
+      if (!param.time || !param.point || param.point.x < 0 || param.point.y < 0) {{
+        hoverCard.style.display = 'none';
+        return;
+      }}
+      const data = param.seriesData.get(candleSeries);
+      if (data) {{
+        const dStr = new Date((param.time - IST_OFFSET) * 1000).toLocaleTimeString();
+        hoverCard.style.display = 'block';
+        hoverCard.style.left = Math.min(param.point.x + 15, container.clientWidth - 240) + 'px';
+        hoverCard.style.top = Math.max(param.point.y - 60, 10) + 'px';
+        hoverCard.innerHTML = `
+          <b>Time:</b> ${{dStr}}<br/>
+          <b>Open:</b> ${{data.open.toFixed(2)}} | <b>High:</b> ${{data.high.toFixed(2)}}<br/>
+          <b>Low:</b> ${{data.low.toFixed(2)}} | <b>Close:</b> ${{data.close.toFixed(2)}}<br/>
+          <span style="color:#00e676; font-weight:bold;">⚡ ORB Active Signal Point</span>
+        `;
+      }} else {{
+        hoverCard.style.display = 'none';
+      }}
+    }});
 
     window.addEventListener('resize', () => {{
       chart.applyOptions({{ width: container.clientWidth }});
