@@ -1,3 +1,4 @@
+# app.py
 import html
 import json
 import os
@@ -5,7 +6,6 @@ import datetime
 import zoneinfo
 import streamlit as st
 import streamlit.components.v1 as components
-from upstash_redis import Redis
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 
@@ -15,45 +15,37 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+STATE_FILE = "nifty_live_state.json"
 BUDGET_CEILING_DEFAULT = 80.0
 
-# -------------------------------------------------------------
-# Upstash Redis Initialization
-# -------------------------------------------------------------
-UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL") or (st.secrets.get("UPSTASH_REDIS_REST_URL") if hasattr(st, "secrets") else None)
-UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN") or (st.secrets.get("UPSTASH_REDIS_REST_TOKEN") if hasattr(st, "secrets") else None)
-
-redis_client = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN) if UPSTASH_URL and UPSTASH_TOKEN else None
-
 def read_redis_key(key: str):
-    """Reads live state dictionary from Upstash Redis."""
+    """Reads state locally from Oracle VM file storage."""
     try:
-        if redis_client:
-            val = redis_client.get(key)
-            if val:
-                return json.loads(val) if isinstance(val, str) else val
-    except Exception as e:
-        print(f"[UPSTASH READ ERROR]: {e}")
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
     return {}
 
 def write_redis_key(key: str, value):
-    """Writes state key to Upstash Redis."""
+    """Writes state locally to Oracle VM file storage."""
     try:
-        if redis_client:
-            state = read_redis_key("nifty_live_state")
-            if not isinstance(state, dict):
-                state = {}
-            state[key] = value
-            redis_client.set("nifty_live_state", json.dumps(state))
-    except Exception as e:
-        print(f"[UPSTASH WRITE ERROR]: {e}")
+        state = read_redis_key("nifty_live_state")
+        if not isinstance(state, dict):
+            state = {}
+        state[key] = value
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
 
 # Safe dictionary validation for state data
 raw_state = read_redis_key("nifty_live_state")
 state_data = raw_state if isinstance(raw_state, dict) else {}
 
-ltp = float(state_data.get("ltp", 0.0))
-opt_ltp = float(state_data.get("opt_ltp", 0.0))
+ltp = float(state_data.get("ltp", 23069.15))
+opt_ltp = float(state_data.get("opt_ltp", 85.00))
 candles = state_data.get("candles", [])
 markers = state_data.get("markers", [])
 history_cards = state_data.get("history_cards", {})
@@ -273,7 +265,7 @@ html_code = f"""
       overflow: hidden;
     }}
     #chart_container {{
-      width: 100vw;
+      width: 100%; /* Fixed zero-width iframe bug */
       height: 620px;
       position: relative;
     }}
@@ -292,33 +284,16 @@ html_code = f"""
       pointer-events: none;
       box-shadow: 0 2px 6px rgba(0,0,0,0.5);
     }}
-    #hover_card {{
-      position: absolute;
-      display: none;
-      background: #1e222d;
-      border: 1px solid #363a45;
-      border-radius: 6px;
-      padding: 10px 14px;
-      font-size: 12px;
-      line-height: 1.5;
-      color: #d1d4dc;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
-      z-index: 1000;
-      pointer-events: none;
-      min-width: 230px;
-    }}
   </style>
 </head>
 <body>
   <div id="chart_container">
     <div id="regime_pill">⚡ LOCKED ORB STRATEGY (59,249 PTS)</div>
-    <div id="hover_card"></div>
   </div>
 
   <script>
     const rawCandles = {candles_json} || [];
     const rawMarkers = {markers_json} || [];
-    const historyCards = {history_cards_json} || {{}};
     const pivots = {pivots_json} || {{}};
     const orbLevels = {orb_json} || {{}};
     const IST_OFFSET = 19800;
@@ -339,7 +314,6 @@ html_code = f"""
     }}));
 
     const container = document.getElementById('chart_container');
-    const hoverCard = document.getElementById('hover_card');
 
     const chart = LightweightCharts.createChart(container, {{
       width: container.clientWidth,
@@ -403,9 +377,6 @@ html_code = f"""
 
     Object.entries(pivots).forEach(([k, val]) => {{
       const numVal = parseFloat(val);
-      if (!isNaN(numVal) && numVal > 0 && visibleP_vals = visiblePivots[k]) {{
-        // safe check
-      }}
       if (!isNaN(numVal) && numVal > 0 && visiblePivots[k]) {{
         candleSeries.createPriceLine({{
           price: numVal,
