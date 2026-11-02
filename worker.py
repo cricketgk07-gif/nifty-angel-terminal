@@ -1,5 +1,5 @@
 # worker.py
-from datetime import datetime
+from datetime import datetime, time as dtime, timedelta
 import time
 import os
 import json
@@ -10,7 +10,6 @@ from upstash_redis import Redis
 
 load_dotenv()
 
-# Importing your existing untouched modules cleanly
 from strategy_entry import calculate_indicators
 import notifier
 
@@ -32,27 +31,36 @@ def push_to_upstash(state_dict):
         print(f"[UPSTASH WRITE ERROR]: {e}")
 
 def run_strategy_engine():
-    now_ts = int(time.time())
-    base = now_ts - 21600
-    times = [base + (i * 900) for i in range(30)]
+    # Generate today's real market session timestamps (15-min intervals starting 09:15)
+    now = datetime.now()
+    market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
     
+    timestamps = []
+    current_t = market_open
+    while current_t <= now and len(timestamps) < 35:
+        timestamps.append(int(current_t.timestamp()))
+        current_t += timedelta(minutes=15)
+    
+    if not timestamps:
+        timestamps = [int(now.timestamp()) - (i * 900) for i in range(20)][::-1]
+
+    n_candles = len(timestamps)
     np.random.seed(42)
-    closes = 24045.0 + np.cumsum(np.random.randn(30) * 12)
+    base_price = 23950.0
+    closes = base_price + np.cumsum(np.random.randn(n_candles) * 10)
     
     df = pd.DataFrame({
-        'time': times,
-        'open': closes - np.random.rand(30) * 8,
-        'high': closes + np.random.rand(30) * 15,
-        'low': closes - np.random.rand(30) * 15,
+        'time': timestamps,
+        'open': closes - np.random.rand(n_candles) * 6,
+        'high': closes + np.random.rand(n_candles) * 12,
+        'low': closes - np.random.rand(n_candles) * 12,
         'close': closes,
-        'volume': np.random.randint(100000, 300000, 30)
+        'volume': np.random.randint(100000, 300000, n_candles)
     })
     
     df['cum_vol'] = df['volume'].cumsum()
     df['tp'] = (df['high'] + df['low'] + df['close']) / 3
     df['vwap'] = (df['tp'] * df['volume']).cumsum() / df['cum_vol']
-    
-    # Utilizing your strategy_entry module function
     df = calculate_indicators(df)
 
     candles = []
@@ -67,12 +75,53 @@ def run_strategy_engine():
             'ema20': float(row.get('ema20', row['close']))
         })
 
+    current_ltp = candles[-1]['close']
+
+    pdh = float(df['high'].max())
+    pdl = float(df['low'].min())
+    pivot_p = round((pdh + pdl + current_ltp) / 3, 2)
+    
+    orb_h = round(float(df.iloc[:3]['high'].max()), 2) if len(df) >= 3 else round(current_ltp + 30, 2)
+    orb_l = round(float(df.iloc[:3]['low'].min()), 2) if len(df) >= 3 else round(current_ltp - 30, 2)
+
+    entry_idx = min(4, len(candles) - 1)
+    exit_idx = min(12, len(candles) - 1)
+
+    markers = [
+        {
+            'time': candles[entry_idx]['time'],
+            'position': 'belowBar',
+            'color': '#00e676',
+            'shape': 'arrowUp',
+            'text': f'BUY CE @ {candles[entry_idx]["close"]:.2f}'
+        }
+    ]
+
+    hud = {
+        'type': 'CE',
+        'trade_closed': False,
+        'exit_reason': 'ACTIVE',
+        'symbol': 'NIFTY 24000 CE',
+        'delta': 0.55,
+        'entry_spot': round(candles[entry_idx]['close'], 2),
+        'entry_opt': 65.0,
+        'sl_spot': orb_l,
+        'sl_opt': 35.0,
+        'trail_spot': round(current_ltp, 2),
+        'trail_opt': 95.0,
+        'secured_pts': round(current_ltp - candles[entry_idx]['close'], 2),
+        'targets': [orb_h, orb_h + 50]
+    }
+
     payload = {
-        'ltp': float(candles[-1]['close']),
+        'ltp': current_ltp,
+        'opt_ltp': 95.00,
         'candles': candles,
-        'markers': [{'time': candles[4]['time'], 'position': 'belowBar', 'color': '#00e676', 'shape': 'arrowUp', 'text': 'CE BUY'}],
-        'pivots': {'P': 24010.0, 'PDH': 24120.0, 'PDL': 23950.0},
-        'orb_levels': {'orb_h': 24060.0, 'orb_l': 23980.0},
+        'markers': markers,
+        'pivots': {'P': pivot_p, 'PDH': round(pdh, 2), 'PDL': round(pdl, 2)},
+        'orb_levels': {'orb_h': orb_h, 'orb_l': orb_l},
+        'hud': hud,
+        'trades_taken_today': 1,
         'last_poll': datetime.now().strftime('%H:%M:%S')
     }
 
