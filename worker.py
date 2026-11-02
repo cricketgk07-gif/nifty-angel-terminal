@@ -1,5 +1,5 @@
 # worker.py
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime
 import time
 import os
 import json
@@ -9,18 +9,21 @@ from dotenv import load_dotenv
 from upstash_redis import Redis
 
 load_dotenv()
+
+# Importing your existing untouched modules cleanly
 from strategy_entry import calculate_indicators
+import notifier
 
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 redis_client = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN) if UPSTASH_URL and UPSTASH_TOKEN else None
 
 print('==================================================')
-print('      UPSTASH CLOUD SYNC DAEMON INITIALIZED       ')
+print('      ORACLE WORKER & UPSTASH SYNC INITIALIZED    ')
 print('==================================================')
 
 def push_to_upstash(state_dict):
-    """Pushes strategy state directly to Upstash Redis cloud cache."""
+    """Pushes strategy state to Upstash Redis cloud cache."""
     try:
         if redis_client:
             redis_client.set("nifty_live_state", json.dumps(state_dict))
@@ -48,6 +51,8 @@ def run_strategy_engine():
     df['cum_vol'] = df['volume'].cumsum()
     df['tp'] = (df['high'] + df['low'] + df['close']) / 3
     df['vwap'] = (df['tp'] * df['volume']).cumsum() / df['cum_vol']
+    
+    # Utilizing your strategy_entry module function
     df = calculate_indicators(df)
 
     candles = []
