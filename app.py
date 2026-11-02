@@ -3,7 +3,6 @@ import json
 import os
 import datetime
 import zoneinfo
-import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -15,37 +14,31 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
-UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
-BUDGET_CEILING_DEFAULT = float(os.getenv("BUDGET_CEILING", "80.0"))
-
+STATE_FILE = "nifty_live_state.json"
+BUDGET_CEILING_DEFAULT = 80.0
 
 def read_redis_key(key: str):
-    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
-        return None
-    url = f"{UPSTASH_REDIS_REST_URL}/get/{key}"
-    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
+    """Reads state locally from Oracle VM file storage."""
     try:
-        r = requests.get(url, headers=headers, timeout=3)
-        if r.status_code == 200:
-            val = r.json().get("result")
-            if val:
-                return json.loads(val)
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
     except Exception:
         pass
-    return None
-
+    return {}
 
 def write_redis_key(key: str, value):
-    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
-        return
-    url = f"{UPSTASH_REDIS_REST_URL}/set/{key}"
-    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
+    """Writes state locally to Oracle VM file storage."""
     try:
-        requests.post(url, headers=headers, data=json.dumps(value), timeout=3)
+        # If writing budget, update inside state dict or separate file
+        state = read_redis_key("nifty_live_state")
+        if not isinstance(state, dict):
+            state = {}
+        state[key] = value
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
     except Exception:
         pass
-
 
 # Safe dictionary validation for state data
 raw_state = read_redis_key("nifty_live_state")
@@ -63,9 +56,7 @@ prev_day_summary = state_data.get("prev_day_summary", {})
 hud = state_data.get("hud", {})
 
 trades_taken = state_data.get("trades_taken_today", 0)
-
-saved_budget = read_redis_key("user_selected_budget")
-current_budget = float(saved_budget) if saved_budget is not None else BUDGET_CEILING_DEFAULT
+current_budget = float(state_data.get("user_selected_budget", BUDGET_CEILING_DEFAULT))
 
 # -------------------------------------------------------------
 # 1. Header Bar & Real-time Point Monitor
@@ -257,8 +248,6 @@ history_cards_json = json.dumps(history_cards)
 pivots_json = json.dumps(pivots)
 orb_json = json.dumps(orb_levels)
 fib_json = json.dumps(fib_lines)
-redis_url_str = UPSTASH_REDIS_REST_URL
-redis_token_str = UPSTASH_REDIS_REST_TOKEN
 
 html_code = f"""
 <!DOCTYPE html>
@@ -441,75 +430,6 @@ html_code = f"""
 
     if (formattedCandles.length > 0) {{
       chart.timeScale().fitContent();
-    }}
-
-    chart.subscribeCrosshairMove(param => {{
-      if (!param || !param.time || !param.point) {{
-        hoverCard.style.display = 'none';
-        return;
-      }}
-      const rawSecKey = String(param.time - IST_OFFSET);
-      const cardData = historyCards[rawSecKey] || historyCards[String(param.time)];
-      if (cardData) {{
-        const isCe = cardData.type === 'CE';
-        const color = isCe ? '#00e676' : '#ff5252';
-        hoverCard.innerHTML = `
-          <div style="font-weight:bold; color:${{color}}; margin-bottom:4px;">${{cardData.title}}</div>
-          <div><b>Time:</b> ${{cardData.time_str}}</div>
-          <div><b>Index Entry:</b> ${{cardData.entry}} | <b>Opt:</b> ₹${{cardData.opt_entry || '—'}}</div>
-          <div><b>Initial SL:</b> ${{cardData.sl}} | <b>Opt SL:</b> ₹${{cardData.opt_sl || '—'}}</div>
-          <div><b>Max Trailed SL:</b> ${{cardData.max_trail_sl || cardData.sl}}</div>
-          <div><b>Target:</b> ${{cardData.target || '—'}}</div>
-          <div style="margin-top:4px; font-weight:bold; color:#ffb74d;">Status: ${{cardData.outcome}}</div>
-        `;
-        hoverCard.style.display = 'block';
-        hoverCard.style.left = Math.min(param.point.x + 15, container.clientWidth - 240) + 'px';
-        hoverCard.style.top = Math.max(param.point.y - 80, 10) + 'px';
-      }} else {{
-        hoverCard.style.display = 'none';
-      }}
-    }});
-
-    const redisUrl = "{redis_url_str}";
-    const redisToken = "{redis_token_str}";
-
-    if (redisUrl && redisToken) {{
-      setInterval(async () => {{
-        try {{
-          const res = await fetch(redisUrl + '/get/nifty_live_state', {{
-            headers: {{ 'Authorization': 'Bearer ' + redisToken }}
-          }});
-          if (res.ok) {{
-            const dataObj = await res.json();
-            if (dataObj && dataObj.result) {{
-              const liveState = JSON.parse(dataObj.result);
-              if (liveState && liveState.candles && liveState.candles.length > 0) {{
-                const latestCandle = liveState.candles[liveState.candles.length - 1];
-                const shiftedCandle = {{
-                  time: latestCandle.time + IST_OFFSET,
-                  open: latestCandle.open,
-                  high: latestCandle.high,
-                  low: latestCandle.low,
-                  close: latestCandle.close
-                }};
-                candleSeries.update(shiftedCandle);
-                if (latestCandle.vwap) {{
-                  vwapSeries.update({{ time: shiftedCandle.time, value: latestCandle.vwap }});
-                }}
-                if (latestCandle.ema20) {{
-                  emaSeries.update({{ time: shiftedCandle.time, value: latestCandle.ema20 }});
-                }}
-              }}
-              if (liveState && liveState.ltp) {{
-                const el = window.parent.document.getElementById('live_ltp_display');
-                if (el) {{
-                  el.innerText = '₹' + Number(liveState.ltp).toFixed(2);
-                }}
-              }}
-            }}
-          }}
-        }} catch (err) {{}}
-      }}, 1000);
     }}
 
     window.addEventListener('resize', () => {{
