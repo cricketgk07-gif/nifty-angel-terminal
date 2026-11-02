@@ -47,6 +47,7 @@ def write_redis_key(key: str, value):
         pass
 
 
+# Safe dictionary validation for state data
 raw_state = read_redis_key("nifty_live_state")
 state_data = raw_state if isinstance(raw_state, dict) else {}
 
@@ -141,8 +142,6 @@ pdl_display = pivots.get("PDL", "—")
 
 active_trade_type = hud.get("type") if (hud and hud.get("entry_spot")) else None
 is_trade_closed = hud.get("trade_closed", False) if hud else False
-
-now_ist = datetime.datetime.now(IST).time()
 
 if active_trade_type and not is_trade_closed:
     status_label = f"<b style='color:#00e676;'>🟢 Active: TRIGGERED {active_trade_type} (BUY)</b>"
@@ -399,7 +398,6 @@ html_code = f"""
       candleSeries.setMarkers(formattedMarkers);
     }}
 
-    // Classical Floor Pivots
     const visiblePivots = {{
       'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
       'PDH': {{ color: '#42a5f5', title: 'PDH' }},
@@ -420,7 +418,6 @@ html_code = f"""
       }}
     }});
 
-    // ORB High & Low Bands
     if (orbLevels && orbLevels.orb_h) {{
       candleSeries.createPriceLine({{
         price: parseFloat(orbLevels.orb_h),
