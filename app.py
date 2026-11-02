@@ -5,6 +5,7 @@ import datetime
 import zoneinfo
 import streamlit as st
 import streamlit.components.v1 as components
+from upstash_redis import Redis
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 
@@ -14,31 +15,38 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-STATE_FILE = "nifty_live_state.json"
 BUDGET_CEILING_DEFAULT = 80.0
 
+# -------------------------------------------------------------
+# Upstash Redis Initialization
+# -------------------------------------------------------------
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL") or (st.secrets.get("UPSTASH_REDIS_REST_URL") if hasattr(st, "secrets") else None)
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN") or (st.secrets.get("UPSTASH_REDIS_REST_TOKEN") if hasattr(st, "secrets") else None)
+
+redis_client = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN) if UPSTASH_URL and UPSTASH_TOKEN else None
+
 def read_redis_key(key: str):
-    """Reads state locally from Oracle VM file storage."""
+    """Reads live state dictionary from Upstash Redis."""
     try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-    except Exception:
-        pass
+        if redis_client:
+            val = redis_client.get(key)
+            if val:
+                return json.loads(val) if isinstance(val, str) else val
+    except Exception as e:
+        print(f"[UPSTASH READ ERROR]: {e}")
     return {}
 
 def write_redis_key(key: str, value):
-    """Writes state locally to Oracle VM file storage."""
+    """Writes state key to Upstash Redis."""
     try:
-        # If writing budget, update inside state dict or separate file
-        state = read_redis_key("nifty_live_state")
-        if not isinstance(state, dict):
-            state = {}
-        state[key] = value
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f)
-    except Exception:
-        pass
+        if redis_client:
+            state = read_redis_key("nifty_live_state")
+            if not isinstance(state, dict):
+                state = {}
+            state[key] = value
+            redis_client.set("nifty_live_state", json.dumps(state))
+    except Exception as e:
+        print(f"[UPSTASH WRITE ERROR]: {e}")
 
 # Safe dictionary validation for state data
 raw_state = read_redis_key("nifty_live_state")
@@ -395,6 +403,9 @@ html_code = f"""
 
     Object.entries(pivots).forEach(([k, val]) => {{
       const numVal = parseFloat(val);
+      if (!isNaN(numVal) && numVal > 0 && visibleP_vals = visiblePivots[k]) {{
+        // safe check
+      }}
       if (!isNaN(numVal) && numVal > 0 && visiblePivots[k]) {{
         candleSeries.createPriceLine({{
           price: numVal,
