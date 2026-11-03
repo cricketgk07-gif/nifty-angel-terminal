@@ -250,26 +250,40 @@ complete_banner_html = (
 st.markdown(complete_banner_html, unsafe_allow_html=True)
 
 # -------------------------------------------------------------
-# 5. Today's Trade Execution Summary Table (Wipes/Replaces on New Day)
+# 5. Dynamic Trade Execution Summary Table 
+# (Shows Last Trade Session details until a new trade triggers today, then replaces)
 # -------------------------------------------------------------
-st.markdown("### 📊 Today's Trade Execution Summary")
+st.markdown("### 📊 Trade Execution Summary")
 
 todays_trade = state_data.get("todays_trade_summary", hud)
+has_todays_trade = todays_trade and (todays_trade.get("entry_spot") or todays_trade.get("entry"))
 
-if todays_trade and todays_trade.get("entry_spot"):
+# Fall back to previous day summary if no trade has triggered for today yet
+display_trade = todays_trade if has_todays_trade else prev_day_summary
+
+if display_trade and (display_trade.get("entry_spot") or display_trade.get("entry") or display_trade.get("init_sl")):
+    entry_s = display_trade.get("entry_spot") or display_trade.get("entry") or "—"
+    opt_s = display_trade.get("entry_opt") or display_trade.get("opt_entry") or 0.0
+    sl_s = display_trade.get("sl_spot") or display_trade.get("init_sl") or "—"
+    exit_r = display_trade.get("exit_reason") or display_trade.get("outcome") or "ACTIVE"
+    pnl_pts = display_trade.get("secured_pts") if display_trade.get("secured_pts") is not None else display_trade.get("final_pts", 0.0)
+    
+    trade_label = "🟢 TODAY'S LIVE / COMPLETED TRADE" if has_todays_trade else f"📅 LAST TRADE SESSION ({display_trade.get('date', 'Previous Session')})"
+    st.markdown(f"<div style='font-size:12px; color:#ffb74d; font-weight:bold; margin-bottom:4px;'>{trade_label}</div>", unsafe_allow_html=True)
+    
     trade_data_table = [{
-        "Date": todays_trade.get("date", datetime.datetime.now(IST).strftime("%Y-%m-%d")),
-        "Setup": f"{todays_trade.get('regime', 'ORB')} {todays_trade.get('type', '—')}",
-        "Contract": todays_trade.get("symbol", "—"),
-        "Entry Spot": todays_trade.get("entry_spot", "—"),
-        "Entry Opt": f"₹{todays_trade.get('entry_opt', 0.0):.2f}",
-        "Initial SL": todays_trade.get("sl_spot", "—"),
-        "Exit Status": todays_trade.get("exit_reason", "ACTIVE"),
-        "Net PnL (Pts)": f"{todays_trade.get('secured_pts', 0.0):+.1f}"
+        "Date / Status": display_trade.get("date", datetime.datetime.now(IST).strftime("%Y-%m-%d")),
+        "Setup": f"{display_trade.get('regime', 'ORB')} {display_trade.get('type', '—')}",
+        "Contract": display_trade.get("symbol", "NIFTY OPT"),
+        "Entry Spot": entry_s,
+        "Entry Opt": f"₹{float(opt_s):.2f}" if opt_s != '—' and opt_s else '—',
+        "Initial SL": sl_s,
+        "Exit Status": exit_r,
+        "Net PnL": f"{float(pnl_pts):+.1f} pts"
     }]
     st.table(trade_data_table)
 else:
-    st.info("No trade executed yet for today. Monitoring live 15-min ORB breakout signals...")
+    st.info("No trade data available yet. Monitoring live 15-min ORB breakout signals...")
 
 # -------------------------------------------------------------
 # 6. Interactive Candlestick Chart (Lightweight Charts Canvas & Past 10 Days Hover Tags)
