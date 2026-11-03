@@ -9,5 +9,5 @@ logzero
 python-dotenv
 plotly
 pyarrow
-scikit-learn==1.6.1
+scikit-learn
 upstash-redis
