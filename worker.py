@@ -3,10 +3,10 @@ from datetime import datetime, time as dtime
 import time
 import os
 import json
+import urllib.request
 import joblib
 import pandas as pd
 import numpy as np
-import urllib.request
 import requests
 from dotenv import load_dotenv
 from SmartApi import SmartConnect
@@ -14,7 +14,31 @@ from upstash_redis import Redis
 
 load_dotenv()
 
-# Load Upstash Redis credentials from environment (.env or Streamlit secrets)
+# ==========================================
+# 0. MODEL AUTO-DOWNLOAD & UPSTASH INIT
+# ==========================================
+# Direct URLs to your GitHub Release assets
+MODEL_URL = "https://github.com/cricketgk07-gif/nifty-angel-terminal/releases/download/v1.0/trained_orb_model.pkl"
+CUTOFF_URL = "https://github.com/cricketgk07-gif/nifty-angel-terminal/releases/download/v1.0/model_cutoff.pkl"
+
+# Auto-download model files on startup if missing from local container storage
+if not os.path.exists('trained_orb_model.pkl'):
+    print("[INIT] Downloading trained_orb_model.pkl from GitHub Releases...")
+    try:
+        urllib.request.urlretrieve(MODEL_URL, 'trained_orb_model.pkl')
+        print("[INIT] Model downloaded successfully.")
+    except Exception as e:
+        print(f"[INIT ERROR] Failed to download model: {e}")
+
+if not os.path.exists('model_cutoff.pkl'):
+    print("[INIT] Downloading model_cutoff.pkl from GitHub Releases...")
+    try:
+        urllib.request.urlretrieve(CUTOFF_URL, 'model_cutoff.pkl')
+        print("[INIT] Cutoff downloaded successfully.")
+    except Exception as e:
+        print(f"[INIT ERROR] Failed to download cutoff: {e}")
+
+# Load Upstash Redis credentials from environment (.env or Render environment variables)
 try:
     url = os.getenv("UPSTASH_REDIS_REST_URL")
     token = os.getenv("UPSTASH_REDIS_REST_TOKEN")
@@ -34,7 +58,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 print('==================================================')
-print('  ORACLE ANGEL ONE ALL-IN-ONE TRADER DAEMON       ')
+print('  RENDER ANGEL ONE ALL-IN-ONE TRADER DAEMON       ')
 print('==================================================')
 
 # Load trained ML model and cutoff threshold
