@@ -3,6 +3,7 @@ import json
 import os
 import datetime
 import zoneinfo
+import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -14,35 +15,39 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-STATE_FILE = "nifty_live_state.json"
-BUDGET_CEILING_DEFAULT = 80.0
+UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
+UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+BUDGET_CEILING_DEFAULT = float(os.getenv("BUDGET_CEILING", "80.0"))
+
 
 def read_redis_key(key: str):
-    """Reads state locally from Oracle VM file storage."""
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return None
+    url = f"{UPSTASH_REDIS_REST_URL}/get/{key}"
+    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
     try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
+        r = requests.get(url, headers=headers, timeout=3)
+        if r.status_code == 200:
+            val = r.json().get("result")
+            if val:
+                return json.loads(val)
     except Exception:
         pass
-    return {}
+    return None
+
 
 def write_redis_key(key: str, value):
-    """Writes state locally to Oracle VM file storage."""
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return
+    url = f"{UPSTASH_REDIS_REST_URL}/set/{key}"
+    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
     try:
-        # If writing budget, update inside state dict or separate file
-        state = read_redis_key("nifty_live_state")
-        if not isinstance(state, dict):
-            state = {}
-        state[key] = value
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f)
+        requests.post(url, headers=headers, data=json.dumps(value), timeout=3)
     except Exception:
         pass
 
-# Safe dictionary validation for state data
-raw_state = read_redis_key("nifty_live_state")
-state_data = raw_state if isinstance(raw_state, dict) else {}
+
+state_data = read_redis_key("nifty_live_state") or {}
 
 ltp = float(state_data.get("ltp", 0.0))
 opt_ltp = float(state_data.get("opt_ltp", 0.0))
@@ -56,7 +61,9 @@ prev_day_summary = state_data.get("prev_day_summary", {})
 hud = state_data.get("hud", {})
 
 trades_taken = state_data.get("trades_taken_today", 0)
-current_budget = float(state_data.get("user_selected_budget", BUDGET_CEILING_DEFAULT))
+
+saved_budget = read_redis_key("user_selected_budget")
+current_budget = float(saved_budget) if saved_budget is not None else BUDGET_CEILING_DEFAULT
 
 # -------------------------------------------------------------
 # 1. Header Bar & Real-time Point Monitor
@@ -133,6 +140,8 @@ pdl_display = pivots.get("PDL", "—")
 
 active_trade_type = hud.get("type") if (hud and hud.get("entry_spot")) else None
 is_trade_closed = hud.get("trade_closed", False) if hud else False
+
+now_ist = datetime.datetime.now(IST).time()
 
 if active_trade_type and not is_trade_closed:
     status_label = f"<b style='color:#00e676;'>🟢 Active: TRIGGERED {active_trade_type} (BUY)</b>"
@@ -248,6 +257,8 @@ history_cards_json = json.dumps(history_cards)
 pivots_json = json.dumps(pivots)
 orb_json = json.dumps(orb_levels)
 fib_json = json.dumps(fib_lines)
+redis_url_str = UPSTASH_REDIS_REST_URL
+redis_token_str = UPSTASH_REDIS_REST_TOKEN
 
 html_code = f"""
 <!DOCTYPE html>
@@ -387,6 +398,7 @@ html_code = f"""
       candleSeries.setMarkers(formattedMarkers);
     }}
 
+    // Classical Floor Pivots
     const visiblePivots = {{
       'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
       'PDH': {{ color: '#42a5f5', title: 'PDH' }},
@@ -407,6 +419,7 @@ html_code = f"""
       }}
     }});
 
+    // ORB High & Low Bands
     if (orbLevels && orbLevels.orb_h) {{
       candleSeries.createPriceLine({{
         price: parseFloat(orbLevels.orb_h),
@@ -430,6 +443,75 @@ html_code = f"""
 
     if (formattedCandles.length > 0) {{
       chart.timeScale().fitContent();
+    }}
+
+    chart.subscribeCrosshairMove(param => {{
+      if (!param || !param.time || !param.point) {{
+        hoverCard.style.display = 'none';
+        return;
+      }}
+      const rawSecKey = String(param.time - IST_OFFSET);
+      const cardData = historyCards[rawSecKey] || historyCards[String(param.time)];
+      if (cardData) {{
+        const isCe = cardData.type === 'CE';
+        const color = isCe ? '#00e676' : '#ff5252';
+        hoverCard.innerHTML = `
+          <div style="font-weight:bold; color:${{color}}; margin-bottom:4px;">${{cardData.title}}</div>
+          <div><b>Time:</b> ${{cardData.time_str}}</div>
+          <div><b>Index Entry:</b> ${{cardData.entry}} | <b>Opt:</b> ₹${{cardData.opt_entry || '—'}}</div>
+          <div><b>Initial SL:</b> ${{cardData.sl}} | <b>Opt SL:</b> ₹${{cardData.opt_sl || '—'}}</div>
+          <div><b>Max Trailed SL:</b> ${{cardData.max_trail_sl || cardData.sl}}</div>
+          <div><b>Target:</b> ${{cardData.target || '—'}}</div>
+          <div style="margin-top:4px; font-weight:bold; color:#ffb74d;">Status: ${{cardData.outcome}}</div>
+        `;
+        hoverCard.style.display = 'block';
+        hoverCard.style.left = Math.min(param.point.x + 15, container.clientWidth - 240) + 'px';
+        hoverCard.style.top = Math.max(param.point.y - 80, 10) + 'px';
+      }} else {{
+        hoverCard.style.display = 'none';
+      }}
+    }});
+
+    const redisUrl = "{redis_url_str}";
+    const redisToken = "{redis_token_str}";
+
+    if (redisUrl && redisToken) {{
+      setInterval(async () => {{
+        try {{
+          const res = await fetch(redisUrl + '/get/nifty_live_state', {{
+            headers: {{ 'Authorization': 'Bearer ' + redisToken }}
+          }});
+          if (res.ok) {{
+            const dataObj = await res.json();
+            if (dataObj && dataObj.result) {{
+              const liveState = JSON.parse(dataObj.result);
+              if (liveState && liveState.candles && liveState.candles.length > 0) {{
+                const latestCandle = liveState.candles[liveState.candles.length - 1];
+                const shiftedCandle = {{
+                  time: latestCandle.time + IST_OFFSET,
+                  open: latestCandle.open,
+                  high: latestCandle.high,
+                  low: latestCandle.low,
+                  close: latestCandle.close
+                }};
+                candleSeries.update(shiftedCandle);
+                if (latestCandle.vwap) {{
+                  vwapSeries.update({{ time: shiftedCandle.time, value: latestCandle.vwap }});
+                }}
+                if (latestCandle.ema20) {{
+                  emaSeries.update({{ time: shiftedCandle.time, value: latestCandle.ema20 }});
+                }}
+              }}
+              if (liveState && liveState.ltp) {{
+                const el = window.parent.document.getElementById('live_ltp_display');
+                if (el) {{
+                  el.innerText = '₹' + Number(liveState.ltp).toFixed(2);
+                }}
+              }}
+            }}
+          }}
+        }} catch (err) {{}}
+      }}, 1000);
     }}
 
     window.addEventListener('resize', () => {{
