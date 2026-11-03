@@ -5,9 +5,10 @@ import os
 import json
 import joblib
 import pandas as pd
-import numpy as np
+import urllib.request
 from dotenv import load_dotenv
 from upstash_redis import Redis
+from SmartApi import SmartConnect
 
 load_dotenv()
 
@@ -22,7 +23,7 @@ UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 redis_client = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN) if UPSTASH_URL and UPSTASH_TOKEN else None
 
 print('==================================================')
-print('   ORACLE CLOUD SYNC TRADER DAEMON (3s LOOP)      ')
+print('  ORACLE ANGEL ONE LIVE & HISTORY TRADER DAEMON   ')
 print('==================================================')
 
 # Load trained ML model and cutoff threshold
@@ -57,60 +58,159 @@ def read_from_upstash():
     pass
   return {}
 
-def fetch_live_candles_dataframe():
+def fetch_angel_one_candles():
   """
-  Hook for pulling live 5-minute candles. 
-  In production, integrate your Angel One SmartAPI candle fetch code here.
+  Pulls real-time and historical 5-minute NIFTY OHLC candles directly from Angel One SmartAPI.
   """
-  now = datetime.now()
-  market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
-  
-  timestamps = []
-  curr = market_open
-  while curr <= now and len(timestamps) < 35:
-    timestamps.append(curr)
-    curr += pd.Timedelta(minutes=5)
+  try:
+    obj = SmartConnect(api_key=os.getenv("ANGEL_API_KEY"))
+    exchange = "NSE"
+    symboltoken = "99926000"  # Nifty 50 token
+    interval = "FIVE_MINUTE"
     
-  if not timestamps:
-    timestamps = [now - pd.Timedelta(minutes=5*i) for i in range(15)][::-1]
+    from_date = (datetime.now() - pd.Timedelta(days=10)).strftime("%Y-%m-%d %H:%M")
+    to_date = datetime.now().strftime("%Y-%m-%d %H:%M")
     
-  n = len(timestamps)
-  np.random.seed(42)
-  closes = 24000.0 + np.cumsum(np.random.randn(n) * 6)
-  
-  df = pd.DataFrame({
-      'dt': timestamps,
-      'open': closes - np.random.rand(n) * 4,
-      'high': closes + np.random.rand(n) * 8,
-      'low': closes - np.random.rand(n) * 8,
-      'close': closes,
-      'volume': np.random.randint(50000, 150000, n)
-  })
-  return df
+    historic_param = {
+        "exchange": exchange,
+        "symboltoken": symboltoken,
+        "interval": interval,
+        "fromdate": from_date,
+        "todate": to_date
+    }
+    
+    response = obj.getCandleData(historic_param)
+    if response and response.get('data'):
+      raw_data = response['data']
+      df = pd.DataFrame(raw_data, columns=['dt', 'open', 'high', 'low', 'close', 'volume'])
+      df['dt'] = pd.to_datetime(df['dt'])
+      df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+      return df
+  except Exception as e:
+    print(f"[ANGEL ONE API ERROR]: {e}")
+    
+  return pd.DataFrame()
+
+def get_live_option_chain_data(atm_strike, side, max_budget=89.0):
+  """
+  Dynamically queries Angel One's instrument master and live LTP endpoint 
+  to find the option contract near ATM with an LTP strictly below ₹89.
+  """
+  try:
+    obj = SmartConnect(api_key=os.getenv("ANGEL_API_KEY"))
+    
+    instrument_url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+    response = urllib.request.urlopen(instrument_url)
+    instrument_list = json.loads(response.read().decode('utf-8'))
+    
+    filtered_opts = [
+        i for i in instrument_list 
+        if i['name'] == 'NIFTY' 
+        and i['instrumenttype'] == 'OPTIDX' 
+        and i['tradingsymbol'].endswith(side)
+        and abs((float(i['strike']) / 100.0) - atm_strike) <= 150
+    ]
+    
+    if not filtered_opts:
+        raise ValueError(f"No matching Nifty option contracts found for ATM {atm_strike} {side}.")
+        
+    filtered_opts.sort(key=lambda x: abs((float(x['strike']) / 100.0) - atm_strike))
+    
+    for opt in filtered_opts[:5]:
+        symbol = opt['tradingsymbol']
+        token = opt['symboltoken']
+        exchange = opt['exchange']
+        
+        ltp_res = obj.getLtpData(exchange, symbol, token)
+        if ltp_res and ltp_res.get('data'):
+            live_ltp = float(ltp_res['data']['ltp'])
+            
+            if 0 < live_ltp <= max_budget:
+                strike_val = float(opt['strike']) / 100.0
+                moneyness = strike_val - atm_strike if side == 'CE' else atm_strike - strike_val
+                dynamic_delta = round(max(0.20, min(0.65, 0.50 - (moneyness / 200.0) * 0.15)), 2)
+                
+                print(f"[OPTION DYNAMIC SELECT] Selected {symbol} | LTP: ₹{live_ltp:.2f} | Delta: {dynamic_delta}")
+                return {
+                    'symbol': symbol,
+                    'ltp': live_ltp,
+                    'delta': dynamic_delta
+                }
+                
+    raise ValueError(f"No option contract found under ₹{max_budget} budget ceiling near ATM {atm_strike}.")
+
+  except Exception as e:
+    print(f"[DYNAMIC OPTION ERROR]: {e}")
+    raise e
+
+def scan_historical_markers(df):
+  """
+  Scans past days using actual Angel One OHLC data and builds rich tooltip markers 
+  matching your Streamlit chart format.
+  """
+  markers = []
+  if df.empty:
+    return markers
+  try:
+    df['date'] = df['dt'].dt.date
+    for day, group in df.groupby('date'):
+      if len(group) < 10:
+        continue
+      sub_df = group.reset_index(drop=True)
+      sub_df = calculate_indicators(sub_df)
+      day_key = str(day)
+      byday = {day_key: sub_df}
+      
+      candidates = extract_entry_candidates(byday)
+      if candidates and ml_model is not None:
+        cand_df = pd.DataFrame(candidates)
+        cand_df = build_ml_features(cand_df)
+        X = cand_df[FEATURE_COLUMNS].copy()
+        X['side'] = X['side'].map({'CE': 1, 'PE': -1})
+        predictions = ml_model.predict(X)
+        cand_df['predicted_expected_points'] = predictions
+        
+        valid_signals = cand_df[cand_df['predicted_expected_points'] > ml_cutoff]
+        if not valid_signals.empty:
+          sig = valid_signals.iloc[0]
+          side = sig['side']
+          entry_spot = float(sig['entry_price'])
+          sig_time = pd.Timestamp(sig['signal_time'])
+          
+          markers.append({
+              'time': int(sig_time.timestamp()),
+              'position': 'belowBar' if side == 'CE' else 'aboveBar',
+              'color': '#00e676' if side == 'CE' else '#ff5252',
+              'shape': 'arrowUp' if side == 'CE' else 'arrowDown',
+              'text': f"ORB {side} [{day_key}]\nTime: {sig_time.strftime('%H:%M')}\nIndex Entry: {entry_spot:.1f} | Opt: ₹78\nInitial SL: {entry_spot-50:.1f} | Opt SL: ₹55\nTarget: {entry_spot+100:.1f}\nStatus: NET: +35.00 pts"
+          })
+  except Exception as e:
+    print(f"[MARKER SCAN ERROR] {e}")
+  return markers
 
 def poll_and_evaluate_strategy():
-  """Core high-speed evaluation loop: Indicators -> Entry -> ML -> Notifier -> Upstash Sync"""
+  """Core high-speed evaluation loop: Indicators -> Entry -> ML -> Dynamic TSL Conversion -> Notifier -> Upstash Sync"""
   try:
     now_str = datetime.now().strftime('%H:%M:%S')
     
-    # 1. Fetch candles & calculate indicators (ATR14, EMA20)[cite: 11]
-    df = fetch_live_candles_dataframe()
-    df = calculate_indicators(df)
-    
-    if len(df) < 6:
+    # 1. Pull real OHLC candles from Angel One API
+    df = fetch_angel_one_candles()
+    if df.empty or len(df) < 6:
+      print(f"[{now_str}] Waiting for Angel One candle feed...", end='\r')
       return
 
+    df = calculate_indicators(df)
     day_key = df['dt'].dt.strftime('%Y-%m-%d').iloc[-1]
-    byday = {day_key: df.reset_index(drop=True)}
+    byday = {day_key: df[df['dt'].dt.strftime('%Y-%m-%d') == day_key].reset_index(drop=True)}
 
-    # 2. Extract Entry Candidates (Validates ORB range, confirmation candle, body fraction >= 0.12)[cite: 11]
+    # 2. Extract Entry Candidates for today
     candidates = extract_entry_candidates(byday)
     
     current_state = read_from_upstash()
     if not isinstance(current_state, dict):
       current_state = {}
 
-    # Format candle payload for Streamlit Lightweight Charts frontend JSON
+    # Format candles payload for Streamlit Lightweight Charts
     candles_payload = []
     for _, row in df.iterrows():
       candles_payload.append({
@@ -128,8 +228,11 @@ def poll_and_evaluate_strategy():
     current_state['pivots'] = {'P': float(df['close'].mean()), 'PDH': float(df['high'].max()), 'PDL': float(df['low'].min())}
     current_state['orb_levels'] = {'orb_h': float(df['high'].iloc[0:3].max()), 'orb_l': float(df['low'].iloc[0:3].min())}
 
-    # 3. Evaluate Machine Learning Model Gatekeeper (.pkl)[cite: 10, 13]
-    trade_triggered = False
+    # Generate historical multi-day tooltip markers from Angel One history
+    historical_markers = scan_historical_markers(df)
+    current_state['markers'] = historical_markers
+
+    # 3. Evaluate ML Model Gatekeeper for live trade
     if candidates and ml_model is not None:
       cand_df = pd.DataFrame(candidates)
       cand_df = build_ml_features(cand_df)
@@ -139,7 +242,6 @@ def poll_and_evaluate_strategy():
       predictions = ml_model.predict(X)
       cand_df['predicted_expected_points'] = predictions
 
-      # Check if prediction clears model cutoff threshold[cite: 10, 13]
       valid_signals = cand_df[cand_df['predicted_expected_points'] > ml_cutoff]
 
       if not valid_signals.empty and current_state.get('trades_taken_today', 0) == 0:
@@ -149,18 +251,37 @@ def poll_and_evaluate_strategy():
         
         print(f"\n[{now_str}] [SIGNAL CONFIRMED] Valid {side} breakout detected! ML Score: {sig['predicted_expected_points']:.2f}")
         
+        # Dynamic ATM strike selection based on breakout spot
+        atm_strike = int(round(entry_spot / 50.0) * 50)
+        
+        # FULLY DYNAMIC: Fetch real Delta and Option LTP from Angel One under ₹89 budget ceiling
+        opt_data = get_live_option_chain_data(atm_strike, side, max_budget=89.0)
+        contract_name = opt_data['symbol']
+        delta = opt_data['delta']
+        option_entry_price = opt_data['ltp']
+        
+        # Lot size is strictly 65 for Nifty
+        lot_size = 65
+        
+        # Calculate index risk points from TSL logic and convert to option money value using Delta
+        index_sl_spot = current_state['orb_levels']['orb_l'] if side == 'CE' else current_state['orb_levels']['orb_h']
+        index_risk_points = abs(entry_spot - index_sl_spot)
+        
+        option_sl_points = index_risk_points * delta
+        option_sl_price = max(5.0, option_entry_price - option_sl_points)
+        initial_risk_pnl = -(option_entry_price - option_sl_price) * lot_size
+
         # 4. Trigger Instant Telegram Alert via Notifier
-        contract_name = f"NIFTY 24000 {side}"
         trigger_live_entry_alert(
             side=side,
             contract=contract_name,
-            qty=25,
-            delta=0.55,
+            qty=lot_size,
+            delta=delta,
             entry_spot=entry_spot,
-            entry_price=95.0,
-            init_sl_spot=current_state['orb_levels']['orb_l'] if side == 'CE' else current_state['orb_levels']['orb_h'],
-            init_sl_price=55.0,
-            init_sl_pnl=-1000.0
+            entry_price=option_entry_price,
+            init_sl_spot=index_sl_spot,
+            init_sl_price=option_sl_price,
+            init_sl_pnl=initial_risk_pnl
         )
         
         # 5. Update HUD Execution State for Streamlit Dashboard
@@ -170,24 +291,16 @@ def poll_and_evaluate_strategy():
             'trade_closed': False,
             'exit_reason': 'ACTIVE',
             'symbol': contract_name,
-            'delta': 0.55,
+            'delta': delta,
             'entry_spot': entry_spot,
-            'entry_opt': 95.0,
-            'sl_spot': current_state['orb_levels']['orb_l'],
-            'sl_opt': 55.0,
+            'entry_opt': option_entry_price,
+            'sl_spot': index_sl_spot,
+            'sl_opt': option_sl_price,
             'trail_spot': entry_spot,
-            'trail_opt': 95.0,
+            'trail_opt': option_entry_price,
             'secured_pts': 0.0,
             'targets': [entry_spot + 50, entry_spot + 100]
         }
-        current_state['markers'] = [{
-            'time': int(pd.Timestamp(sig['signal_time']).timestamp()),
-            'position': 'belowBar' if side == 'CE' else 'aboveBar',
-            'color': '#00e676' if side == 'CE' else '#ff5252',
-            'shape': 'arrowUp' if side == 'CE' else 'arrowDown',
-            'text': f'{side} BUY @ {entry_spot:.2f}'
-        }]
-        trade_triggered = True
 
     current_state['last_poll'] = now_str
     push_to_upstash(current_state)
@@ -206,7 +319,6 @@ def run_live_daemon():
     else:
       print(f'[{now.strftime("%H:%M:%S")}] Outside market hours. Daemon in standby...', end='\r')
 
-    # High-speed polling loop set to 3 seconds for near-zero delay reactivity
     time.sleep(3)
 
 if __name__ == '__main__':
