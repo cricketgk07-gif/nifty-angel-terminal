@@ -1,4 +1,3 @@
-# app.py
 import html
 import json
 import os
@@ -6,56 +5,47 @@ import datetime
 import zoneinfo
 import streamlit as st
 import streamlit.components.v1 as components
-from upstash_redis import Redis
-from dotenv import load_dotenv
-
-load_dotenv()
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 
 st.set_page_config(
-    page_title="NIFTY ORB Master Terminal (55.7k)",
+    page_title="NIFTY ORB Master Terminal (59.2k)",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
+STATE_FILE = "nifty_live_state.json"
 BUDGET_CEILING_DEFAULT = 80.0
 
-# Connect to Upstash Redis for cloud-to-frontend synchronization
-UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
-UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
-redis_client = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN) if UPSTASH_URL and UPSTASH_TOKEN else None
-
-def read_redis_state():
-    """Reads live state from Upstash Redis cloud cache."""
+def read_redis_key(key: str):
+    """Reads state locally from Oracle VM file storage."""
     try:
-        if redis_client:
-            val = redis_client.get("nifty_live_state")
-            if val:
-                return json.loads(val) if isinstance(val, str) else val
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
     except Exception:
         pass
     return {}
 
-def write_redis_budget(key: str, value):
-    """Saves user selections like budget back to Redis cache."""
+def write_redis_key(key: str, value):
+    """Writes state locally to Oracle VM file storage."""
     try:
-        if redis_client:
-            state = read_redis_state()
-            if not isinstance(state, dict):
-                state = {}
-            state[key] = value
-            redis_client.set("nifty_live_state", json.dumps(state))
+        # If writing budget, update inside state dict or separate file
+        state = read_redis_key("nifty_live_state")
+        if not isinstance(state, dict):
+            state = {}
+        state[key] = value
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
     except Exception:
         pass
 
 # Safe dictionary validation for state data
-state_data = read_redis_state()
-if not isinstance(state_data, dict):
-    state_data = {}
+raw_state = read_redis_key("nifty_live_state")
+state_data = raw_state if isinstance(raw_state, dict) else {}
 
-ltp = float(state_data.get("ltp", 24045.0))
-opt_ltp = float(state_data.get("opt_ltp", 95.00))
+ltp = float(state_data.get("ltp", 0.0))
+opt_ltp = float(state_data.get("opt_ltp", 0.0))
 candles = state_data.get("candles", [])
 markers = state_data.get("markers", [])
 history_cards = state_data.get("history_cards", {})
@@ -97,7 +87,7 @@ with col_budget:
         help="Strike selector picks contracts trading closest to and below this ceiling.",
     )
     if new_budget != current_budget:
-        write_redis_budget("user_selected_budget", new_budget)
+        write_redis_key("user_selected_budget", new_budget)
         st.rerun()
 
 with col_refresh:
@@ -119,15 +109,15 @@ if prev_day_summary and prev_day_summary.get("type"):
     prev_summary_html = (
         '<div style="background:#181c27; border:1px solid #363a45; border-radius:6px; padding:10px 14px; margin-bottom:12px;">'
         '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; flex-wrap:wrap; gap:8px;">'
-        f'<span style="font-size:12px; font-weight:bold; color:#ffb74d;">📅 PREVIOUS SESSION REPORT ({prev_day_summary.get("date", "—")})</span>'
-        f'<span style="font-size:13px; font-weight:bold; color:{p_pnl_color};">NET SECURED: {p_sign}{p_pts:.1f} pts (₹{p_sign}{p_inr}) [{prev_day_summary.get("exit_reason", "—")}]</span>'
+        f'<span style="font-size:12px; font-weight:bold; color:#ffb74d;">📅 PREVIOUS SESSION REPORT ({prev_day_summary.get("date")})</span>'
+        f'<span style="font-size:13px; font-weight:bold; color:{p_pnl_color};">NET SECURED: {p_sign}{p_pts:.1f} pts (₹{p_sign}{p_inr}) [{prev_day_summary.get("exit_reason")}]</span>'
         '</div>'
         '<div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">'
-        f'<div style="background:#1f2430; padding:4px 10px; border-radius:4px;"><span style="color:#90a4ae; font-size:11px;">SETUP:</span> <b style="color:{p_color}; font-size:12px;">{prev_day_summary.get("regime", "—")} {p_type}</b></div>'
-        f'<div style="background:#1f2430; padding:4px 10px; border-radius:4px;"><span style="color:#90a4ae; font-size:11px;">ENTRY:</span> <b style="color:#fff; font-size:12px;">{prev_day_summary.get("entry_spot", "—")}</b> <span style="color:#787b86; font-size:11px;">({prev_day_summary.get("entry_time", "—")})</span></div>'
-        f'<div style="background:#1f2430; padding:4px 10px; border-radius:4px;"><span style="color:#90a4ae; font-size:11px;">INITIAL SL:</span> <b style="color:#ef5350; font-size:12px;">{prev_day_summary.get("init_sl", "—")}</b></div>'
-        f'<div style="background:#1f2430; padding:4px 10px; border-radius:4px;"><span style="color:#90a4ae; font-size:11px;">TARGET:</span> <b style="color:#ffb74d; font-size:12px;">{prev_day_summary.get("target_p", "—")}</b></div>'
-        f'<div style="background:#1f2430; padding:4px 10px; border-radius:4px;"><span style="color:#90a4ae; font-size:11px;">EXIT PRICE:</span> <b style="color:#fff; font-size:12px;">{prev_day_summary.get("exit_spot", "—")}</b></div>'
+        f'<div style="background:#1f2430; padding:4px 10px; border-radius:4px;"><span style="color:#90a4ae; font-size:11px;">SETUP:</span> <b style="color:{p_color}; font-size:12px;">{prev_day_summary.get("regime")} {p_type}</b></div>'
+        f'<div style="background:#1f2430; padding:4px 10px; border-radius:4px;"><span style="color:#90a4ae; font-size:11px;">ENTRY:</span> <b style="color:#fff; font-size:12px;">{prev_day_summary.get("entry_spot")}</b> <span style="color:#787b86; font-size:11px;">({prev_day_summary.get("entry_time")})</span></div>'
+        f'<div style="background:#1f2430; padding:4px 10px; border-radius:4px;"><span style="color:#90a4ae; font-size:11px;">INITIAL SL:</span> <b style="color:#ef5350; font-size:12px;">{prev_day_summary.get("init_sl")}</b></div>'
+        f'<div style="background:#1f2430; padding:4px 10px; border-radius:4px;"><span style="color:#90a4ae; font-size:11px;">TARGET:</span> <b style="color:#ffb74d; font-size:12px;">{prev_day_summary.get("target_p")}</b></div>'
+        f'<div style="background:#1f2430; padding:4px 10px; border-radius:4px;"><span style="color:#90a4ae; font-size:11px;">EXIT PRICE:</span> <b style="color:#fff; font-size:12px;">{prev_day_summary.get("exit_spot")}</b></div>'
         '</div>'
         '</div>'
     )
@@ -154,7 +144,7 @@ else:
     status_label = "<b style='color:#78909c;'>🚫 No Trade Today (Limit Reached)</b>"
 
 # -------------------------------------------------------------
-# 4. Streamlined Strip Panel (Execution & Strike Monitor)
+# 4. Streamlined Strip Panel
 # -------------------------------------------------------------
 if active_trade_type:
     is_call = (active_trade_type == "CE")
@@ -250,7 +240,7 @@ complete_banner_html = (
 st.markdown(complete_banner_html, unsafe_allow_html=True)
 
 # -------------------------------------------------------------
-# 5. Interactive Candlestick Chart (Lightweight Charts Canvas & Tooltip Hover)
+# 5. Interactive Candlestick Chart (Lightweight Charts Canvas)
 # -------------------------------------------------------------
 candles_json = json.dumps(candles)
 markers_json = json.dumps(markers)
@@ -275,7 +265,7 @@ html_code = f"""
       overflow: hidden;
     }}
     #chart_container {{
-      width: 100%;
+      width: 100vw;
       height: 620px;
       position: relative;
     }}
@@ -307,7 +297,7 @@ html_code = f"""
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
       z-index: 1000;
       pointer-events: none;
-      min-width: 220px;
+      min-width: 230px;
     }}
   </style>
 </head>
@@ -320,6 +310,7 @@ html_code = f"""
   <script>
     const rawCandles = {candles_json} || [];
     const rawMarkers = {markers_json} || [];
+    const historyCards = {history_cards_json} || {{}};
     const pivots = {pivots_json} || {{}};
     const orbLevels = {orb_json} || {{}};
     const IST_OFFSET = 19800;
@@ -332,6 +323,11 @@ html_code = f"""
       close: c.close,
       vwap: c.vwap,
       ema20: c.ema20
+    }}));
+
+    const formattedMarkers = rawMarkers.map(m => ({{
+      ...m,
+      time: m.time + IST_OFFSET
     }}));
 
     const container = document.getElementById('chart_container');
@@ -387,8 +383,8 @@ html_code = f"""
     }});
     emaSeries.setData(formattedCandles.filter(d => d.ema20).map(d => ({{ time: d.time, value: d.ema20 }})));
 
-    if (rawMarkers.length > 0) {{
-      candleSeries.setMarkers(rawMarkers.map(m => ({{ ...m, time: m.time + IST_OFFSET }})));
+    if (formattedMarkers.length > 0) {{
+      candleSeries.setMarkers(formattedMarkers);
     }}
 
     const visiblePivots = {{
@@ -435,28 +431,6 @@ html_code = f"""
     if (formattedCandles.length > 0) {{
       chart.timeScale().fitContent();
     }}
-
-    chart.subscribeCrosshairMove(param => {{
-      if (!param.time || !param.point || param.point.x < 0 || param.point.y < 0) {{
-        hoverCard.style.display = 'none';
-        return;
-      }}
-      const data = param.seriesData.get(candleSeries);
-      if (data) {{
-        const dStr = new Date((param.time - IST_OFFSET) * 1000).toLocaleTimeString();
-        hoverCard.style.display = 'block';
-        hoverCard.style.left = Math.min(param.point.x + 15, container.clientWidth - 240) + 'px';
-        hoverCard.style.top = Math.max(param.point.y - 60, 10) + 'px';
-        hoverCard.innerHTML = `
-          <b>Time:</b> ${{dStr}}<br/>
-          <b>Open:</b> ${{data.open.toFixed(2)}} | <b>High:</b> ${{data.high.toFixed(2)}}<br/>
-          <b>Low:</b> ${{data.low.toFixed(2)}} | <b>Close:</b> ${{data.close.toFixed(2)}}<br/>
-          <span style="color:#00e676; font-weight:bold;">⚡ ORB Active Signal Point</span>
-        `;
-      }} else {{
-        hoverCard.style.display = 'none';
-      }}
-    }});
 
     window.addEventListener('resize', () => {{
       chart.applyOptions({{ width: container.clientWidth }});
