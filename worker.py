@@ -5,22 +5,36 @@ import os
 import json
 import joblib
 import pandas as pd
+import numpy as np
 import urllib.request
+import requests
 from dotenv import load_dotenv
 from SmartApi import SmartConnect
+from upstash_redis import Redis
 
 load_dotenv()
 
-from strategy_entry import calculate_indicators, extract_entry_candidates, trigger_live_entry_alert
-from strategy_ml import build_ml_features, FEATURE_COLUMNS
-from strategy_tsl import run_ detailed_replay, trigger_live_trailing_alert, trigger_live_closure_alert
-import notifier
+# Load Upstash Redis credentials from environment (.env or Streamlit secrets)
+try:
+    url = os.getenv("UPSTASH_REDIS_REST_URL")
+    token = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+    redis_client = Redis(url=url, token=token) if url and token else None
+    if redis_client:
+        print("[INIT] Connected to Upstash Redis cloud cache successfully.")
+    else:
+        print("[INIT WARNING] Upstash credentials missing, falling back to local storage.")
+except Exception as e:
+    print(f"[INIT ERROR] Upstash connection failed: {e}")
+    redis_client = None
 
+STATE_KEY = "nifty_live_state"
 STATE_FILE = "nifty_live_state.json"
 BUDGET_CEILING_DEFAULT = 80.0
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 print('==================================================')
-print('  ORACLE ANGEL ONE LIVE & HISTORY TRADER DAEMON   ')
+print('  ORACLE ANGEL ONE ALL-IN-ONE TRADER DAEMON       ')
 print('==================================================')
 
 # Load trained ML model and cutoff threshold
@@ -36,8 +50,148 @@ try:
 except Exception as e:
     print(f'[INIT ERROR] Failed to load model files: {e}')
 
+
+# ==========================================
+# 1. NOTIFIER FUNCTIONS (Built-in)
+# ==========================================
+def _send_telegram(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    try:
+        response = requests.post(url, json=payload, timeout=5)
+        return response.status_code == 200
+    except Exception as e:
+        print(f"Telegram alert failed: {e}")
+        return False
+
+def trigger_live_entry_alert(side, contract, qty, delta, entry_spot, entry_price, init_sl_spot, init_sl_price, init_sl_pnl):
+    init_sl_pts = -40.0 if side == 'CE' else 40.0
+    stages_str = "+50 (+5) → +75 (+30) → +100 (+65) → +125 (+90) → +150 (+125) → +200+"
+    msg = (
+        f"⚡ **GOLDEN LOCKED STRATEGY: BUY {side}**\n\n"
+        f"📦 **CONTRACT:** {contract} (Qty: {qty}, Δ: {delta})\n"
+        f"• **ENTRY (SPOT):** {entry_spot} | ₹{entry_price}\n"
+        f"• **INITIAL SL:** {init_sl_spot} ({init_sl_pts} pts) | ₹{init_sl_price} (₹{init_sl_pnl})\n"
+        f"• **TRAILING STAGES:** {stages_str}\n"
+        f"⏰ **Trigger Time:** {datetime.now().strftime('%H:%M:%S')}"
+    )
+    _send_telegram(msg)
+
+
+# ==========================================
+# 2. INDICATORS & ENTRY CANDIDATES (Built-in)
+# ==========================================
+def calculate_indicators(df):
+    df['prev_close'] = df['close'].shift(1)
+    df['tr'] = np.maximum(
+        df['high'] - df['low'],
+        np.maximum(abs(df['high'] - df['prev_close']), abs(df['low'] - df['prev_close']))
+    )
+    df['atr14'] = df['tr'].rolling(window=14).mean().bfill()
+    df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
+    return df
+
+def extract_entry_candidates(byday):
+    candidates = []
+    for day_key, group in byday.items():
+        if len(group) < 6 or group.iloc[0]['dt'].time() != dtime(9, 15):
+            continue
+
+        orb_window = group.iloc[0:3]
+        orb_high = orb_window['high'].max()
+        orb_low = orb_window['low'].min()
+        orb_width = orb_high - orb_low
+
+        if orb_width > 160.0 or orb_width < 12:
+            continue
+
+        for i in range(3, len(group) - 2):
+            row = group.iloc[i]
+            t = row['dt'].time()
+            if t > dtime(14, 30) or t < dtime(9, 30):
+                continue
+
+            side = 'CE' if (row['close'] > orb_high and row['close'] > row['ema20']) else ('PE' if (row['close'] < orb_low and row['close'] < row['ema20']) else None)
+
+            if side:
+                conf_row = group.iloc[i + 1]
+                entry_row = group.iloc[i + 2]
+
+                is_ce_confirmed = (side == 'CE' and conf_row['close'] > orb_high and conf_row['close'] > conf_row['open'])
+                is_pe_confirmed = (side == 'PE' and conf_row['close'] < orb_low and conf_row['close'] < conf_row['open'])
+
+                if is_ce_confirmed or is_pe_confirmed:
+                    rng = row['high'] - row['low']
+                    if rng == 0:
+                        continue
+                    loc = (row['close'] - row['low']) / rng
+                    body_frac = abs(row['close'] - row['open']) / rng
+
+                    if body_frac < 0.12:
+                        continue
+
+                    candidates.append({
+                        'day': day_key,
+                        'month_num': row['dt'].strftime('%Y-%m'),
+                        'side': side,
+                        'signal_time': row['dt'],
+                        'entry_time': entry_row['dt'],
+                        'entry_price': entry_row['open'],
+                        'orb_width': orb_width,
+                        'range': rng,
+                        'loc': loc,
+                        'body_frac': body_frac,
+                        'atr14': row['atr14'],
+                        'ema_dist_atr': ((row['close'] - row['ema20']) / row['atr14']) if row['atr14'] > 0 else 0,
+                        'ext_atr': (abs(row['close'] - row['ema20']) / row['atr14']) if row['atr14'] > 0 else 0,
+                    })
+                    break
+    return candidates
+
+
+# ==========================================
+# 3. ML FEATURE BUILDER (Built-in)
+# ==========================================
+FEATURE_COLUMNS = [
+    'side', 'orb_width', 'range', 'loc', 'body_frac', 'upper_wick', 'lower_wick',
+    'atr14', 'ema_dist_atr', 'ext_atr', 'range_lag1', 'range_lag2', 'range_lag3',
+    'loc_lag1', 'loc_lag2', 'loc_lag3', 'prior3_move_atr', 'dir_close_loc',
+    'dir_ema_dist_atr', 'dir_prior1_move_atr', 'dir_prior3_move_atr',
+    'prev_avg_range3_atr', 'signal_range_atr', 'conf_loc_dir', 'stay_orb',
+    'beyond_buffer', 'directional_close', 'break_signal_extreme',
+    'close_loc_ok', 'close_loc_strong', 'close_mid', 'conf_open',
+    'conf_high', 'conf_low', 'conf_close',
+]
+
+def build_ml_features(cand_df):
+    for col in ['range', 'loc']:
+        cand_df[f'{col}_lag1'] = cand_df[col].shift(1).fillna(0)
+        cand_df[f'{col}_lag2'] = cand_df[col].shift(2).fillna(0)
+        cand_df[f'{col}_lag3'] = cand_df[col].shift(3).fillna(0)
+
+    cand_df['prior3_move_atr'] = cand_df['range'].rolling(3).sum().fillna(0) / cand_df['atr14']
+    cand_df['prev_avg_range3_atr'] = cand_df['range'].rolling(3).mean().fillna(0) / cand_df['atr14']
+
+    for f_name in FEATURE_COLUMNS:
+        if f_name not in cand_df.columns:
+            cand_df[f_name] = 0.0
+    return cand_df
+
+
+# ==========================================
+# 4. STATE SYNC (Upstash Cloud + Local Backup)
+# ==========================================
 def read_state():
-    """Reads current live state locally (synchronized with app.py)."""
+    try:
+        if redis_client:
+            val = redis_client.get(STATE_KEY)
+            if val:
+                return json.loads(val) if isinstance(val, str) else val
+    except Exception as e:
+        print(f"[REDIS READ ERROR]: {e}")
+        
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, "r") as f:
@@ -47,23 +201,25 @@ def read_state():
     return {}
 
 def write_state(state_dict):
-    """Writes live state locally so Streamlit app.py instantly reflects updates."""
+    try:
+        if redis_client:
+            redis_client.set(STATE_KEY, json.dumps(state_dict))
+    except Exception as e:
+        print(f"[REDIS WRITE ERROR]: {e}")
+        
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(state_dict, f)
-    except Exception as e:
-        print(f"[STATE WRITE ERROR]: {e}")
+    except Exception:
+        pass
 
+
+# ==========================================
+# 5. ANGEL ONE API & SCANNER
+# ==========================================
 def fetch_angel_one_candles():
-    """
-    Pulls real-time and historical 5-minute NIFTY OHLC candles directly from Angel One SmartAPI.
-    Strictly zero mock data.
-    """
     try:
         obj = SmartConnect(api_key=os.getenv("ANGEL_API_KEY"))
-        # Authenticate if session tokens are set
-        # obj.generateSession(os.getenv("ANGEL_CLIENT_ID"), os.getenv("ANGEL_PASSWORD"))
-        
         exchange = "NSE"
         symboltoken = "99926000"  # Nifty 50 token
         interval = "FIVE_MINUTE"
@@ -88,17 +244,11 @@ def fetch_angel_one_candles():
             return df
     except Exception as e:
         print(f"[ANGEL ONE API ERROR]: {e}")
-        
     return pd.DataFrame()
 
 def get_live_option_chain_data(atm_strike, side, max_budget=80.0):
-    """
-    Dynamically queries Angel One's scrip master and live LTP endpoint 
-    to find the option contract near ATM with an LTP strictly below the budget ceiling.
-    """
     try:
         obj = SmartConnect(api_key=os.getenv("ANGEL_API_KEY"))
-        
         instrument_url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
         response = urllib.request.urlopen(instrument_url)
         instrument_list = json.loads(response.read().decode('utf-8'))
@@ -124,30 +274,18 @@ def get_live_option_chain_data(atm_strike, side, max_budget=80.0):
             ltp_res = obj.getLtpData(exchange, symbol, token)
             if ltp_res and ltp_res.get('data'):
                 live_ltp = float(ltp_res['data']['ltp'])
-                
                 if 0 < live_ltp <= max_budget:
                     strike_val = float(opt['strike']) / 100.0
                     moneyness = strike_val - atm_strike if side == 'CE' else atm_strike - strike_val
                     dynamic_delta = round(max(0.20, min(0.65, 0.50 - (moneyness / 200.0) * 0.15)), 2)
+                    return {'symbol': symbol, 'ltp': live_ltp, 'delta': dynamic_delta}
                     
-                    print(f"[OPTION DYNAMIC SELECT] Selected {symbol} | LTP: ₹{live_ltp:.2f} | Delta: {dynamic_delta}")
-                    return {
-                        'symbol': symbol,
-                        'ltp': live_ltp,
-                        'delta': dynamic_delta
-                    }
-                    
-        raise ValueError(f"No option contract found under ₹{max_budget} budget ceiling near ATM {atm_strike}.")
-
+        raise ValueError(f"No option contract found under ₹{max_budget} budget ceiling.")
     except Exception as e:
         print(f"[DYNAMIC OPTION ERROR]: {e}")
         raise e
 
 def scan_historical_markers(df):
-    """
-    Scans past 10+ days using actual Angel One OHLC data and builds rich tooltip markers 
-    matching your Streamlit chart format.
-    """
     markers = []
     if df.empty:
         return markers
@@ -159,9 +297,8 @@ def scan_historical_markers(df):
             sub_df = group.reset_index(drop=True)
             sub_df = calculate_indicators(sub_df)
             day_key = str(day)
-            byday = {day_key: sub_df}
+            candidates = extract_entry_candidates({day_key: sub_df})
             
-            candidates = extract_entry_candidates(byday)
             if candidates and ml_model is not None:
                 cand_df = pd.DataFrame(candidates)
                 cand_df = build_ml_features(cand_df)
@@ -182,18 +319,19 @@ def scan_historical_markers(df):
                         'position': 'belowBar' if side == 'CE' else 'aboveBar',
                         'color': '#00e676' if side == 'CE' else '#ff5252',
                         'shape': 'arrowUp' if side == 'CE' else 'arrowDown',
-                        'text': f"ORB {side} [{day_key}]\nTime: {sig_time.strftime('%H:%M')}\nIndex Entry: {entry_spot:.1f} | Opt: ₹75\nInitial SL: {entry_spot-40:.1f} | Opt SL: ₹55\nStatus: ACTIVE"
+                        'text': f"ORB {side} [{day_key}]\nTime: {sig_time.strftime('%H:%M')}\nIndex Entry: {entry_spot:.1f} | Opt: ₹75"
                     })
     except Exception as e:
         print(f"[MARKER SCAN ERROR] {e}")
     return markers
 
+
+# ==========================================
+# 6. MAIN EXECUTION LOOP
+# ==========================================
 def poll_and_evaluate_strategy():
-    """Core high-speed evaluation loop: Indicators -> Entry -> ML -> Dynamic TSL Conversion -> Notifier -> State Sync"""
     try:
         now_str = datetime.now().strftime('%H:%M:%S')
-        
-        # 1. Pull real OHLC candles from Angel One API
         df = fetch_angel_one_candles()
         if df.empty or len(df) < 6:
             print(f"[{now_str}] Waiting for Angel One candle feed...", end='\r')
@@ -203,39 +341,28 @@ def poll_and_evaluate_strategy():
         day_key = df['dt'].dt.strftime('%Y-%m-%d').iloc[-1]
         byday = {day_key: df[df['dt'].dt.strftime('%Y-%m-%d') == day_key].reset_index(drop=True)}
 
-        # 2. Extract Entry Candidates for today
         candidates = extract_entry_candidates(byday)
-        
         current_state = read_state()
         if not isinstance(current_state, dict):
             current_state = {}
 
-        # Get user budget ceiling from state (default to ₹80.0 or user slider)
         user_budget = float(current_state.get("user_selected_budget", BUDGET_CEILING_DEFAULT))
 
-        # Format candles payload for Streamlit Lightweight Charts
         candles_payload = []
         for _, row in df.iterrows():
             candles_payload.append({
                 'time': int(row['dt'].timestamp()),
-                'open': float(row['open']),
-                'high': float(row['high']),
-                'low': float(row['low']),
-                'close': float(row['close']),
-                'vwap': float(row.get('close', 0)),
-                'ema20': float(row.get('ema20', row['close']))
+                'open': float(row['open']), 'high': float(row['high']),
+                'low': float(row['low']), 'close': float(row['close']),
+                'vwap': float(row.get('close', 0)), 'ema20': float(row.get('ema20', row['close']))
             })
 
         current_state['candles'] = candles_payload
         current_state['ltp'] = float(df['close'].iloc[-1])
         current_state['pivots'] = {'P': float(df['close'].mean()), 'PDH': float(df['high'].max()), 'PDL': float(df['low'].min())}
         current_state['orb_levels'] = {'orb_h': float(df['high'].iloc[0:3].max()), 'orb_l': float(df['low'].iloc[0:3].min())}
+        current_state['markers'] = scan_historical_markers(df)
 
-        # Generate 10-day historical tooltip markers from Angel One history
-        historical_markers = scan_historical_markers(df)
-        current_state['markers'] = historical_markers
-
-        # 3. Evaluate ML Model Gatekeeper for live trade
         if candidates and ml_model is not None:
             cand_df = pd.DataFrame(candidates)
             cand_df = build_ml_features(cand_df)
@@ -244,7 +371,6 @@ def poll_and_evaluate_strategy():
             
             predictions = ml_model.predict(X)
             cand_df['predicted_expected_points'] = predictions
-
             valid_signals = cand_df[cand_df['predicted_expected_points'] > ml_cutoff]
 
             if not valid_signals.empty and current_state.get('trades_taken_today', 0) == 0:
@@ -252,62 +378,34 @@ def poll_and_evaluate_strategy():
                 side = sig['side']
                 entry_spot = float(sig['entry_price'])
                 
-                print(f"\n[{now_str}] [SIGNAL CONFIRMED] Valid {side} breakout detected! ML Score: {sig['predicted_expected_points']:.2f}")
+                print(f"\n[{now_str}] [SIGNAL CONFIRMED] Valid {side} breakout! ML Score: {sig['predicted_expected_points']:.2f}")
                 
-                # Dynamic ATM strike selection based on breakout spot
                 atm_strike = int(round(entry_spot / 50.0) * 50)
-                
-                # FULLY DYNAMIC: Fetch real Delta and Option LTP from Angel One under user budget ceiling (e.g. ₹80)
                 opt_data = get_live_option_chain_data(atm_strike, side, max_budget=user_budget)
                 contract_name = opt_data['symbol']
                 delta = opt_data['delta']
                 option_entry_price = opt_data['ltp']
-                
-                # Lot size is strictly 65 for Nifty
                 lot_size = 65
                 
-                # Calculate index risk points from TSL logic and convert to option money value using Delta
                 index_sl_spot = current_state['orb_levels']['orb_l'] if side == 'CE' else current_state['orb_levels']['orb_h']
                 index_risk_points = abs(entry_spot - index_sl_spot)
-                
                 option_sl_points = index_risk_points * delta
                 option_sl_price = max(5.0, option_entry_price - option_sl_points)
                 initial_risk_pnl = -(option_entry_price - option_sl_price) * lot_size
 
-                # 4. Trigger Instant Telegram Alert via Notifier
-                trigger_live_entry_alert(
-                    side=side,
-                    contract=contract_name,
-                    qty=lot_size,
-                    delta=delta,
-                    entry_spot=entry_spot,
-                    entry_price=option_entry_price,
-                    init_sl_spot=index_sl_spot,
-                    init_sl_price=option_sl_price,
-                    init_sl_pnl=initial_risk_pnl
-                )
+                trigger_live_entry_alert(side, contract_name, lot_size, delta, entry_spot, option_entry_price, index_sl_spot, option_sl_price, initial_risk_pnl)
                 
-                # 5. Update HUD Execution State for Streamlit Dashboard
                 current_state['trades_taken_today'] = 1
                 current_state['hud'] = {
-                    'type': side,
-                    'trade_closed': False,
-                    'exit_reason': 'ACTIVE',
-                    'symbol': contract_name,
-                    'delta': delta,
-                    'entry_spot': entry_spot,
-                    'entry_opt': option_entry_price,
-                    'sl_spot': index_sl_spot,
-                    'sl_opt': option_sl_price,
-                    'trail_spot': entry_spot,
-                    'trail_opt': option_entry_price,
-                    'secured_pts': 0.0,
+                    'type': side, 'trade_closed': False, 'exit_reason': 'ACTIVE',
+                    'symbol': contract_name, 'delta': delta, 'entry_spot': entry_spot,
+                    'entry_opt': option_entry_price, 'sl_spot': index_sl_spot, 'sl_opt': option_sl_price,
+                    'trail_spot': entry_spot, 'trail_opt': option_entry_price, 'secured_pts': 0.0,
                     'targets': [entry_spot + 50, entry_spot + 100]
                 }
 
         current_state['last_poll'] = now_str
         write_state(current_state)
-
     except Exception as e:
         print(f"[PIPELINE ERROR] {e}")
 
@@ -315,13 +413,10 @@ def run_live_daemon():
     while True:
         now = datetime.now()
         current_time = now.time()
-
-        # Active market session check (09:15 to 15:30 IST)
         if dtime(9, 15) <= current_time <= dtime(15, 30):
             poll_and_evaluate_strategy()
         else:
-            print(f'[{now.strftime("%H:%M:%S")}] Outside market hours. Daemon in standby...', end='\r')
-
+            print(f'[{now.strftime("%H:%M:%S")}] Outside market hours. Standby...', end='\r')
         time.sleep(3)
 
 if __name__ == '__main__':
