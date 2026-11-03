@@ -7,6 +7,7 @@ import joblib
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
+from upstash_redis import Redis
 
 load_dotenv()
 
@@ -15,13 +16,16 @@ from strategy_ml import build_ml_features, FEATURE_COLUMNS
 from strategy_tsl import run_detailed_replay, trigger_live_trailing_alert, trigger_live_closure_alert
 import notifier
 
+# Connect to Upstash Redis cloud storage
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+redis_client = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN) if UPSTASH_URL and UPSTASH_TOKEN else None
+
 print('==================================================')
-print('      ORACLE HIGH-SPEED TRADER DAEMON ACTIVE      ')
+print('   ORACLE CLOUD SYNC TRADER DAEMON (3s LOOP)      ')
 print('==================================================')
 
-STATE_FILE = "nifty_live_state.json"
-
-# Load trained ML model and cutoff
+# Load trained ML model and cutoff threshold
 ml_model = None
 ml_cutoff = 0.52
 try:
@@ -34,30 +38,29 @@ try:
 except Exception as e:
   print(f'[INIT ERROR] Failed to load model files: {e}')
 
-def update_redis_state(state_dict):
-  """Saves live state updates locally for Streamlit dashboard rendering."""
+def push_to_upstash(state_dict):
+  """Pushes live state updates directly to Upstash Redis cloud cache for Streamlit."""
   try:
-    with open(STATE_FILE, "w") as f:
-      json.dump(state_dict, f)
+    if redis_client:
+      redis_client.set("nifty_live_state", json.dumps(state_dict))
   except Exception as e:
-    print(f"[LOCAL WRITE ERROR]: {e}")
+    print(f"[UPSTASH WRITE ERROR]: {e}")
 
-def read_redis_state():
-  """Reads current live state from local file storage."""
+def read_from_upstash():
+  """Reads current live state from Upstash Redis cloud cache."""
   try:
-    if os.path.exists(STATE_FILE):
-      with open(STATE_FILE, "r") as f:
-        val = json.load(f)
-        if isinstance(val, dict):
-          return val
+    if redis_client:
+      val = redis_client.get("nifty_live_state")
+      if val:
+        return json.loads(val) if isinstance(val, str) else val
   except Exception:
     pass
   return {}
 
 def fetch_live_candles_dataframe():
   """
-  Placeholder or hook for pulling live 5-minute candles. 
-  In production, replace this block with your Angel One SmartAPI candle fetch logic.
+  Hook for pulling live 5-minute candles. 
+  In production, integrate your Angel One SmartAPI candle fetch code here.
   """
   now = datetime.now()
   market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
@@ -86,11 +89,11 @@ def fetch_live_candles_dataframe():
   return df
 
 def poll_and_evaluate_strategy():
-  """Core high-speed evaluation loop: Indicators -> Entry -> ML -> Notifier -> State Sync"""
+  """Core high-speed evaluation loop: Indicators -> Entry -> ML -> Notifier -> Upstash Sync"""
   try:
     now_str = datetime.now().strftime('%H:%M:%S')
     
-    # 1. Fetch data & calculate indicators (ATR14, EMA20)[cite: 11]
+    # 1. Fetch candles & calculate indicators (ATR14, EMA20)[cite: 11]
     df = fetch_live_candles_dataframe()
     df = calculate_indicators(df)
     
@@ -100,14 +103,14 @@ def poll_and_evaluate_strategy():
     day_key = df['dt'].dt.strftime('%Y-%m-%d').iloc[-1]
     byday = {day_key: df.reset_index(drop=True)}
 
-    # 2. Extract Entry Candidates (Checks ORB range, confirmation candle, body fraction >= 0.12)[cite: 11]
+    # 2. Extract Entry Candidates (Validates ORB range, confirmation candle, body fraction >= 0.12)[cite: 11]
     candidates = extract_entry_candidates(byday)
     
-    current_state = read_redis_state()
+    current_state = read_from_upstash()
     if not isinstance(current_state, dict):
       current_state = {}
 
-    # Format candles for Streamlit/Lightweight Charts frontend JSON
+    # Format candle payload for Streamlit Lightweight Charts frontend JSON
     candles_payload = []
     for _, row in df.iterrows():
       candles_payload.append({
@@ -136,7 +139,7 @@ def poll_and_evaluate_strategy():
       predictions = ml_model.predict(X)
       cand_df['predicted_expected_points'] = predictions
 
-      # Check if model prediction clears the cutoff threshold[cite: 10, 13]
+      # Check if prediction clears model cutoff threshold[cite: 10, 13]
       valid_signals = cand_df[cand_df['predicted_expected_points'] > ml_cutoff]
 
       if not valid_signals.empty and current_state.get('trades_taken_today', 0) == 0:
@@ -146,7 +149,7 @@ def poll_and_evaluate_strategy():
         
         print(f"\n[{now_str}] [SIGNAL CONFIRMED] Valid {side} breakout detected! ML Score: {sig['predicted_expected_points']:.2f}")
         
-        # 4. Trigger Telegram Alert via Notifier
+        # 4. Trigger Instant Telegram Alert via Notifier
         contract_name = f"NIFTY 24000 {side}"
         trigger_live_entry_alert(
             side=side,
@@ -160,7 +163,7 @@ def poll_and_evaluate_strategy():
             init_sl_pnl=-1000.0
         )
         
-        # 5. Update HUD Execution Monitor State
+        # 5. Update HUD Execution State for Streamlit Dashboard
         current_state['trades_taken_today'] = 1
         current_state['hud'] = {
             'type': side,
@@ -187,7 +190,7 @@ def poll_and_evaluate_strategy():
         trade_triggered = True
 
     current_state['last_poll'] = now_str
-    update_redis_state(current_state)
+    push_to_upstash(current_state)
 
   except Exception as e:
     print(f"[PIPELINE ERROR] {e}")
@@ -203,7 +206,7 @@ def run_live_daemon():
     else:
       print(f'[{now.strftime("%H:%M:%S")}] Outside market hours. Daemon in standby...', end='\r')
 
-    # Optimized high-speed loop (3 seconds) for near-zero delay reactivity
+    # High-speed polling loop set to 3 seconds for near-zero delay reactivity
     time.sleep(3)
 
 if __name__ == '__main__':
