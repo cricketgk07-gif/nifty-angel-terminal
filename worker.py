@@ -8,6 +8,9 @@ import joblib
 import pandas as pd
 import numpy as np
 import requests
+import http.server
+import socketserver
+import threading
 from dotenv import load_dotenv
 from SmartApi import SmartConnect
 from upstash_redis import Redis
@@ -15,9 +18,51 @@ from upstash_redis import Redis
 load_dotenv()
 
 # ==========================================
-# 0. MODEL AUTO-DOWNLOAD & UPSTASH INIT
+# 0. RENDER PORT & HEALTH CHECK SERVER
 # ==========================================
-# Direct URLs to your GitHub Release assets
+PORT = int(os.environ.get("PORT", 10000))
+
+class HealthHandler(http.server.BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"WORKER_RUNNING_OK")
+
+    def log_message(self, format, *args):
+        pass  # Suppress default access logs
+
+def run_ping_server():
+    try:
+        with socketserver.TCPServer(("0.0.0.0", PORT), HealthHandler) as httpd:
+            print(f"[Health Server] Listening on port {PORT}...")
+            httpd.serve_forever()
+    except Exception as e:
+        print(f"[Health Server Error] {e}")
+
+# Start the health check server in a background thread to satisfy Render's port scan requirement
+threading.Thread(target=run_ping_server, daemon=True).start()
+
+# Optional keepalive self-ping thread
+def self_ping_keepalive():
+    while True:
+        time.sleep(480)
+        try:
+            requests.get(f"http://127.0.0.1:{PORT}/", timeout=5)
+        except Exception:
+            pass
+
+threading.Thread(target=self_ping_keepalive, daemon=True).start()
+
+
+# ==========================================
+# 1. MODEL AUTO-DOWNLOAD & UPSTASH INIT
+# ==========================================
 MODEL_URL = "https://github.com/cricketgk07-gif/nifty-angel-terminal/releases/download/v1.0/trained_orb_model.pkl"
 CUTOFF_URL = "https://github.com/cricketgk07-gif/nifty-angel-terminal/releases/download/v1.0/model_cutoff.pkl"
 
@@ -38,7 +83,7 @@ if not os.path.exists('model_cutoff.pkl'):
     except Exception as e:
         print(f"[INIT ERROR] Failed to download cutoff: {e}")
 
-# Load Upstash Redis credentials from environment (.env or Render environment variables)
+# Load Upstash Redis credentials
 try:
     url = os.getenv("UPSTASH_REDIS_REST_URL")
     token = os.getenv("UPSTASH_REDIS_REST_TOKEN")
@@ -76,7 +121,7 @@ except Exception as e:
 
 
 # ==========================================
-# 1. NOTIFIER FUNCTIONS (Built-in)
+# 2. NOTIFIER FUNCTIONS
 # ==========================================
 def _send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -105,7 +150,7 @@ def trigger_live_entry_alert(side, contract, qty, delta, entry_spot, entry_price
 
 
 # ==========================================
-# 2. INDICATORS & ENTRY CANDIDATES (Built-in)
+# 3. INDICATORS & CANDIDATES
 # ==========================================
 def calculate_indicators(df):
     df['prev_close'] = df['close'].shift(1)
@@ -176,7 +221,7 @@ def extract_entry_candidates(byday):
 
 
 # ==========================================
-# 3. ML FEATURE BUILDER (Built-in)
+# 4. ML FEATURE BUILDER
 # ==========================================
 FEATURE_COLUMNS = [
     'side', 'orb_width', 'range', 'loc', 'body_frac', 'upper_wick', 'lower_wick',
@@ -205,7 +250,7 @@ def build_ml_features(cand_df):
 
 
 # ==========================================
-# 4. STATE SYNC (Upstash Cloud + Local Backup)
+# 5. STATE SYNC (Upstash Cloud + Local)
 # ==========================================
 def read_state():
     try:
@@ -239,11 +284,11 @@ def write_state(state_dict):
 
 
 # ==========================================
-# 5. ANGEL ONE API & SCANNER
+# 6. ANGEL ONE API & SCANNER
 # ==========================================
 def fetch_angel_one_candles():
     try:
-        obj = SmartConnect(api_key=os.getenv("ANGEL_API_KEY"))
+        obj = SmartConnect(api_key=os.getenv("API_KEY") or os.getenv("ANGEL_API_KEY"))
         exchange = "NSE"
         symboltoken = "99926000"  # Nifty 50 token
         interval = "FIVE_MINUTE"
@@ -272,7 +317,7 @@ def fetch_angel_one_candles():
 
 def get_live_option_chain_data(atm_strike, side, max_budget=80.0):
     try:
-        obj = SmartConnect(api_key=os.getenv("ANGEL_API_KEY"))
+        obj = SmartConnect(api_key=os.getenv("API_KEY") or os.getenv("ANGEL_API_KEY"))
         instrument_url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
         response = urllib.request.urlopen(instrument_url)
         instrument_list = json.loads(response.read().decode('utf-8'))
@@ -351,7 +396,7 @@ def scan_historical_markers(df):
 
 
 # ==========================================
-# 6. MAIN EXECUTION LOOP
+# 7. MAIN EXECUTION LOOP
 # ==========================================
 def poll_and_evaluate_strategy():
     try:
