@@ -1,3 +1,4 @@
+# app.py
 import html
 import json
 import os
@@ -249,7 +250,29 @@ complete_banner_html = (
 st.markdown(complete_banner_html, unsafe_allow_html=True)
 
 # -------------------------------------------------------------
-# 5. Interactive Candlestick Chart (Lightweight Charts Canvas)
+# 5. Today's Trade Execution Summary Table (Wipes/Replaces on New Day)
+# -------------------------------------------------------------
+st.markdown("### 📊 Today's Trade Execution Summary")
+
+todays_trade = state_data.get("todays_trade_summary", hud)
+
+if todays_trade and todays_trade.get("entry_spot"):
+    trade_data_table = [{
+        "Date": todays_trade.get("date", datetime.datetime.now(IST).strftime("%Y-%m-%d")),
+        "Setup": f"{todays_trade.get('regime', 'ORB')} {todays_trade.get('type', '—')}",
+        "Contract": todays_trade.get("symbol", "—"),
+        "Entry Spot": todays_trade.get("entry_spot", "—"),
+        "Entry Opt": f"₹{todays_trade.get('entry_opt', 0.0):.2f}",
+        "Initial SL": todays_trade.get("sl_spot", "—"),
+        "Exit Status": todays_trade.get("exit_reason", "ACTIVE"),
+        "Net PnL (Pts)": f"{todays_trade.get('secured_pts', 0.0):+.1f}"
+    }]
+    st.table(trade_data_table)
+else:
+    st.info("No trade executed yet for today. Monitoring live 15-min ORB breakout signals...")
+
+# -------------------------------------------------------------
+# 6. Interactive Candlestick Chart (Lightweight Charts Canvas & Past 10 Days Hover Tags)
 # -------------------------------------------------------------
 candles_json = json.dumps(candles)
 markers_json = json.dumps(markers)
