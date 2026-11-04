@@ -190,7 +190,7 @@ def get_dynamic_budget():
 
 
 # ==========================================
-# 3. Strategy Modules Integration
+# 3. Strategy Modules Integration (Exact User Code)
 # ==========================================
 FEATURE_COLUMNS = [
     'side', 'orb_width', 'range', 'loc', 'body_frac', 'upper_wick', 'lower_wick',
@@ -237,6 +237,7 @@ def extract_entry_candidates(byday):
             row = group.iloc[i]
             t = row['dt'].time()
 
+            # Exact window: 09:30 to 14:30
             if t > datetime.time(14, 30) or t < datetime.time(9, 30):
                 continue
 
@@ -431,7 +432,7 @@ def run_detailed_replay(cand_df, raw_arrays):
 
 
 # ==========================================
-# 4. Strategy Core Engine & REST Poller
+# 4. Strategy Core Engine & Pipeline
 # ==========================================
 class DedicatedTradingWorker:
     def __init__(self):
@@ -473,11 +474,11 @@ class DedicatedTradingWorker:
 
         self.nfo_df = self.load_scrip_master()
         self.init_historical_candles()
+        self.fetch_daily_pivots_and_levels()
         self.run_full_strategy_pipeline()
         self.simulate_historical_trades()
         self.update_pretrade_contract_forecast()
 
-        # Start background option poller and REST index fallback poller
         threading.Thread(target=self.background_option_poller, daemon=True).start()
         threading.Thread(target=self.background_index_poller, daemon=True).start()
 
@@ -517,7 +518,7 @@ class DedicatedTradingWorker:
 
     def init_historical_candles(self):
         now = datetime.datetime.now(IST)
-        for days_back in [12, 7]:
+        for days_back in [15, 7]:
             from_dt = now - datetime.timedelta(days=days_back)
             from_str = from_dt.strftime("%Y-%m-%d 09:15")
             to_str = now.strftime("%Y-%m-%d %H:%M")
@@ -550,6 +551,43 @@ class DedicatedTradingWorker:
                     break
             except Exception as e:
                 print(f"[Candles Error]: {e}")
+
+    def fetch_daily_pivots_and_levels(self):
+        now = datetime.datetime.now(IST)
+        from_str = (now - datetime.timedelta(days=35)).strftime("%Y-%m-%d 09:15")
+        to_str = now.strftime("%Y-%m-%d 15:30")
+        try:
+            resp = self.api.getCandleData({
+                "exchange": "NSE",
+                "symboltoken": INDEX_TOKEN,
+                "interval": "ONE_DAY",
+                "fromdate": from_str,
+                "todate": to_str,
+            })
+            if resp and resp.get("status") and resp.get("data") and len(resp["data"]) >= 2:
+                df_d = pd.DataFrame(resp["data"], columns=["time", "open", "high", "low", "close", "vol"])
+                df_d["high"] = df_d["high"].astype(float)
+                df_d["low"] = df_d["low"].astype(float)
+                df_d["close"] = df_d["close"].astype(float)
+
+                prev_bar = df_d.iloc[-2]
+                pdh = round(float(prev_bar["high"]), 2)
+                pdl = round(float(prev_bar["low"]), 2)
+                pdc = round(float(prev_bar["close"]), 2)
+                P = round((pdh + pdl + pdc) / 3.0, 2)
+                rng = round(pdh - pdl, 2)
+
+                self.pivot_lines = {
+                    "P": P,
+                    "R1": round((2.0 * P) - pdl, 2), "S1": round((2.0 * P) - pdh, 2),
+                    "R2": round(P + rng, 2), "S2": round(P - rng, 2),
+                    "R3": round(pdh + (2.0 * (P - pdl)), 2), "S3": round(pdl - (2.0 * (pdh - P)), 2),
+                    "PDH": pdh,
+                    "PDL": pdl,
+                }
+                print(f"[Daily Pivots Loaded]: PDH={pdh}, PDL={pdl}, P={P}")
+        except Exception as e:
+            print(f"[Daily Pivots Error]: {e}")
 
     def find_budget_strike(self, spot_ref, is_ce, budget_target=None):
         if budget_target is None:
@@ -779,6 +817,7 @@ class DedicatedTradingWorker:
         df_h = pd.DataFrame(self.candles)
         df_h["date_str"] = df_h["dt"].apply(lambda d: d.astimezone(IST).strftime("%Y-%m-%d"))
 
+        # Proper cumulative VWAP starting from each day's market open (09:15)
         df_h["hlc3"] = (df_h["high"] + df_h["low"] + df_h["close"]) / 3.0
         candle_spread = (df_h["high"] - df_h["low"]) + (df_h["close"] - df_h["open"]).abs()
         df_h["calc_vol"] = candle_spread * 1250.0 + 500.0
@@ -805,6 +844,10 @@ class DedicatedTradingWorker:
             "direction": "UP",
         }
 
+        # Sync calculated VWAP back into candles dictionary
+        for i in range(len(self.candles)):
+            self.candles[i]["vwap"] = float(df_h.iloc[i]["vwap"])
+
     def background_option_poller(self):
         while True:
             time.sleep(15)
@@ -826,7 +869,6 @@ class DedicatedTradingWorker:
                     pass
 
     def background_index_poller(self):
-        """REST fallback poller to ensure live ticks and candles update every 2 seconds."""
         while True:
             time.sleep(2.0)
             if is_market_hours():
@@ -1167,9 +1209,9 @@ class DedicatedTradingWorker:
             "today_trade_record": self.today_trade_record,
             "trades_taken_today": self.trades_taken_today,
             "trade_date": self.today.strftime("%Y-%m-%d"),
+            "pivots": self.pivot_lines,
             "orb_levels": self.orb_levels,
             "fib_lines": self.fib_lines,
-            "pivots": self.pivot_lines,
             "markers": self.markers,
             "history_cards": self.history_cards,
             "contract_preview": self.contract_preview,
@@ -1198,6 +1240,7 @@ def run_worker():
                         engine.trades_taken_today = 0
                         engine.nfo_df = engine.load_scrip_master()
                         engine.init_historical_candles()
+                        engine.fetch_daily_pivots_and_levels()
                         engine.run_full_strategy_pipeline()
                         engine.simulate_historical_trades()
                         try:
