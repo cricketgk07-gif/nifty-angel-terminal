@@ -4,11 +4,11 @@ import http.server
 import json
 import math
 import os
+import urllib.request
+import joblib
 import socketserver
 import threading
 import time
-import urllib.request
-import joblib
 import pandas as pd
 import numpy as np
 import pyotp
@@ -190,7 +190,7 @@ def get_dynamic_budget():
 
 
 # ==========================================
-# 3. Strategy Modules Integration (Exact User Code)
+# 3. Strategy Modules Integration
 # ==========================================
 FEATURE_COLUMNS = [
     'side', 'orb_width', 'range', 'loc', 'body_frac', 'upper_wick', 'lower_wick',
@@ -204,7 +204,6 @@ FEATURE_COLUMNS = [
 ]
 
 def calculate_indicators(df):
-    """Calculates ATR14 and EMA20 across the dataframe."""
     df['prev_close'] = df['close'].shift(1)
     df['tr'] = np.maximum(
         df['high'] - df['low'],
@@ -219,7 +218,6 @@ def calculate_indicators(df):
 
 
 def extract_entry_candidates(byday):
-    """Scans daily groups for valid ORB breakouts meeting confirmation and body fraction filters."""
     candidates = []
     for day_key, group in byday.items():
         if len(group) < 6:
@@ -328,7 +326,6 @@ def build_ml_features(cand_df):
 
 
 def run_detailed_replay(cand_df, raw_arrays):
-    """Simulates trade execution using exact milestone TSL rules and returns detailed logs."""
     records = []
     for r in cand_df.itertuples(index=False):
         day = str(r.day)[:10]
@@ -434,7 +431,7 @@ def run_detailed_replay(cand_df, raw_arrays):
 
 
 # ==========================================
-# 4. Strategy Core Engine & Daemon Daemon
+# 4. Strategy Core Engine & REST Poller
 # ==========================================
 class DedicatedTradingWorker:
     def __init__(self):
@@ -480,7 +477,9 @@ class DedicatedTradingWorker:
         self.simulate_historical_trades()
         self.update_pretrade_contract_forecast()
 
+        # Start background option poller and REST index fallback poller
         threading.Thread(target=self.background_option_poller, daemon=True).start()
+        threading.Thread(target=self.background_index_poller, daemon=True).start()
 
         if self.candles:
             self.sync_state(self.candles[-1]["close"], force=True)
@@ -635,7 +634,6 @@ class DedicatedTradingWorker:
         return clean_targets[:6]
 
     def simulate_historical_trades(self):
-        """Simulates historical trade markers using strategy_entry & strategy_tsl modules."""
         if not self.candles:
             return
 
@@ -669,7 +667,7 @@ class DedicatedTradingWorker:
         X['side'] = X['side'].map({'CE': 1, 'PE': -1})
         preds = ml_model.predict(X)
         cand_df['predicted_expected_points'] = preds
-        cand_df['target_points'] = cand_df['predicted_expected_points'] # placeholder target for filter
+        cand_df['target_points'] = cand_df['predicted_expected_points']
 
         valid_signals = cand_df[cand_df['predicted_expected_points'] > ml_cutoff]
         if valid_signals.empty:
@@ -827,6 +825,27 @@ class DedicatedTradingWorker:
                 except Exception:
                     pass
 
+    def background_index_poller(self):
+        """REST fallback poller to ensure live ticks and candles update every 2 seconds."""
+        while True:
+            time.sleep(2.0)
+            if is_market_hours():
+                try:
+                    res = self.api.ltpData("NSE", "Nifty 50", INDEX_TOKEN)
+                    if isinstance(res, dict) and res.get("status") and res.get("data"):
+                        ltp = float(res["data"].get("ltp", 0.0))
+                        if ltp > 0:
+                            self.on_tick(ltp)
+                except Exception:
+                    try:
+                        res2 = self.api.ltpData("NSE", "NIFTY", INDEX_TOKEN)
+                        if isinstance(res2, dict) and res2.get("status") and res2.get("data"):
+                            ltp = float(res2["data"].get("ltp", 0.0))
+                            if ltp > 0:
+                                self.on_tick(ltp)
+                    except Exception:
+                        pass
+
     def on_tick(self, ltp):
         if not is_market_hours():
             return
@@ -837,7 +856,7 @@ class DedicatedTradingWorker:
         t_sec = int(bar_dt.timestamp())
 
         if now.time() >= datetime.time(15, 15) and self.locked_trade and not self.locked_trade.get("closed"):
-            self.close_trade(ltp, "MANDATORY 15:15 EOD SQUARE-OFF")
+            self.execute_eod_exit(ltp)
             return
 
         if self.active_bar is None or self.active_bar["time"] != t_sec:
@@ -1148,7 +1167,6 @@ class DedicatedTradingWorker:
             "today_trade_record": self.today_trade_record,
             "trades_taken_today": self.trades_taken_today,
             "trade_date": self.today.strftime("%Y-%m-%d"),
-            "daily_atr10": self.daily_atr10,
             "orb_levels": self.orb_levels,
             "fib_lines": self.fib_lines,
             "pivots": self.pivot_lines,
@@ -1179,7 +1197,6 @@ def run_worker():
                         engine.today_trade_record = None
                         engine.trades_taken_today = 0
                         engine.nfo_df = engine.load_scrip_master()
-                        engine.fetch_daily_atr_and_levels()
                         engine.init_historical_candles()
                         engine.run_full_strategy_pipeline()
                         engine.simulate_historical_trades()
