@@ -518,7 +518,6 @@ class DedicatedTradingWorker:
 
     def init_historical_candles(self):
         now = datetime.datetime.now(IST)
-        # Fetch starting strictly from 09:15 AM across past days
         for days_back in [15, 7]:
             from_dt = now - datetime.timedelta(days=days_back)
             from_str = from_dt.strftime("%Y-%m-%d 09:15")
@@ -818,7 +817,6 @@ class DedicatedTradingWorker:
         df_h = pd.DataFrame(self.candles)
         df_h["date_str"] = df_h["dt"].apply(lambda d: d.astimezone(IST).strftime("%Y-%m-%d"))
 
-        # Proper cumulative VWAP starting from each day's market open (09:15)
         df_h["hlc3"] = (df_h["high"] + df_h["low"] + df_h["close"]) / 3.0
         candle_spread = (df_h["high"] - df_h["low"]) + (df_h["close"] - df_h["open"]).abs()
         df_h["calc_vol"] = candle_spread * 1250.0 + 500.0
