@@ -519,11 +519,16 @@ class DedicatedTradingWorker:
 
     def init_historical_candles(self):
         now = datetime.datetime.now(IST)
-        # Try fetching with progressive day spans to ensure candles are always successfully populated starting from 09:15
-        for days_back in [5, 10, 20]:
-            from_dt = now - datetime.timedelta(days=days_back)
+        # Safely bind todate to the previous or current market close time (e.g., 15:30) to avoid future timestamp rejections
+        safe_to_dt = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        if now < safe_to_dt:
+            safe_to_dt = now - datetime.timedelta(days=1)
+            safe_to_dt = safe_to_dt.replace(hour=15, minute=30, second=0, microsecond=0)
+
+        to_str = safe_to_dt.strftime("%Y-%m-%d %H:%M")
+        for days_back in [7, 14, 30]:
+            from_dt = safe_to_dt - datetime.timedelta(days=days_back)
             from_str = from_dt.strftime("%Y-%m-%d 09:15")
-            to_str = now.strftime("%Y-%m-%d %H:%M")
             try:
                 resp = self.api.getCandleData({
                     "exchange": "NSE",
@@ -549,7 +554,7 @@ class DedicatedTradingWorker:
                     df_c = pd.DataFrame(cand_list)
                     df_c = calculate_indicators(df_c)
                     self.candles = df_c.to_dict("records")
-                    print(f"[Candles Loaded]: Successfully loaded {len(self.candles)} candles starting from 09:15.")
+                    print(f"[Candles Loaded]: Successfully loaded {len(self.candles)} candles starting from 09:15 up to {to_str}.")
                     break
             except Exception as e:
                 print(f"[Candles Error (Span {days_back}d)]: {e}")
