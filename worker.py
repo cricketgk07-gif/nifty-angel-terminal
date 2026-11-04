@@ -190,7 +190,7 @@ def get_dynamic_budget():
 
 
 # ==========================================
-# 3. Strategy Modules Integration (Exact User Code)
+# 3. Strategy Modules Integration
 # ==========================================
 FEATURE_COLUMNS = [
     'side', 'orb_width', 'range', 'loc', 'body_frac', 'upper_wick', 'lower_wick',
@@ -518,6 +518,7 @@ class DedicatedTradingWorker:
 
     def init_historical_candles(self):
         now = datetime.datetime.now(IST)
+        # Fetch starting strictly from 09:15 AM across past days
         for days_back in [15, 7]:
             from_dt = now - datetime.timedelta(days=days_back)
             from_str = from_dt.strftime("%Y-%m-%d 09:15")
@@ -547,7 +548,7 @@ class DedicatedTradingWorker:
                     df_c = pd.DataFrame(cand_list)
                     df_c = calculate_indicators(df_c)
                     self.candles = df_c.to_dict("records")
-                    print(f"[Candles Loaded]: {len(self.candles)} candles across multiple days.")
+                    print(f"[Candles Loaded]: {len(self.candles)} candles starting from 09:15.")
                     break
             except Exception as e:
                 print(f"[Candles Error]: {e}")
@@ -844,7 +845,6 @@ class DedicatedTradingWorker:
             "direction": "UP",
         }
 
-        # Sync calculated VWAP back into candles dictionary
         for i in range(len(self.candles)):
             self.candles[i]["vwap"] = float(df_h.iloc[i]["vwap"])
 
