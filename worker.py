@@ -214,6 +214,7 @@ def calculate_indicators(df):
     )
     df['atr14'] = df['tr'].rolling(window=14).mean().bfill()
     df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
+    df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
     return df
 
 
@@ -518,7 +519,8 @@ class DedicatedTradingWorker:
 
     def init_historical_candles(self):
         now = datetime.datetime.now(IST)
-        for days_back in [15, 7]:
+        # Try fetching with progressive day spans to ensure candles are always successfully populated starting from 09:15
+        for days_back in [5, 10, 20]:
             from_dt = now - datetime.timedelta(days=days_back)
             from_str = from_dt.strftime("%Y-%m-%d 09:15")
             to_str = now.strftime("%Y-%m-%d %H:%M")
@@ -530,7 +532,7 @@ class DedicatedTradingWorker:
                     "fromdate": from_str,
                     "todate": to_str,
                 })
-                if resp and resp.get("status") and resp.get("data") and len(resp["data"]) > 10:
+                if resp and resp.get("status") and resp.get("data") and len(resp["data"]) > 0:
                     cand_list = []
                     for b in resp["data"]:
                         dt_parsed = pd.to_datetime(b[0])
@@ -547,10 +549,10 @@ class DedicatedTradingWorker:
                     df_c = pd.DataFrame(cand_list)
                     df_c = calculate_indicators(df_c)
                     self.candles = df_c.to_dict("records")
-                    print(f"[Candles Loaded]: {len(self.candles)} candles starting from 09:15.")
+                    print(f"[Candles Loaded]: Successfully loaded {len(self.candles)} candles starting from 09:15.")
                     break
             except Exception as e:
-                print(f"[Candles Error]: {e}")
+                print(f"[Candles Error (Span {days_back}d)]: {e}")
 
     def fetch_daily_pivots_and_levels(self):
         now = datetime.datetime.now(IST)
@@ -845,6 +847,8 @@ class DedicatedTradingWorker:
 
         for i in range(len(self.candles)):
             self.candles[i]["vwap"] = float(df_h.iloc[i]["vwap"])
+            if "ema9" in df_h.columns:
+                self.candles[i]["ema9"] = float(df_h.iloc[i]["ema9"])
 
     def background_option_poller(self):
         while True:
@@ -1194,6 +1198,7 @@ class DedicatedTradingWorker:
                     "low": float(c["low"]),
                     "close": float(c["close"]),
                     "vwap": float(c.get("vwap", c["close"])),
+                    "ema9": float(c.get("ema9", c["close"])),
                 }
 
         sorted_times = sorted(clean_map.keys())
