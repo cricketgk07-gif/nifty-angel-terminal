@@ -159,7 +159,6 @@ orb_mid = float(fib_lines.get("ORB_MID", ltp))
 orb_h_val = float(orb_levels.get("orb_h", 999999.0))
 orb_l_val = float(orb_levels.get("orb_l", 0.0))
 
-# Strategic Selection: Breakout vs Fade logic
 if is_high_vol:
     is_strat_call = (ltp >= orb_mid)
 else:
@@ -208,7 +207,6 @@ if active_trade_type:
         )
 
 else:
-    # Standby Preview Mode dynamically follows strategy setup
     chosen_f = ce_f if is_strat_call else pe_f
     contract_title = f"{'CALL OPTION (CE)' if is_strat_call else 'PUT OPTION (PE)'} PREVIEW"
     contract_symbol = chosen_f.get("symbol", "NIFTY OPT")
@@ -452,7 +450,6 @@ html_code = f"""
       candleSeries.setMarkers(formattedMarkers);
     }}
 
-    // Classical Floor Pivots
     const visiblePivots = {{
       'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
       'R1':  {{ color: '#ef5350', title: 'R1' }},
@@ -483,7 +480,6 @@ html_code = f"""
       }}
     }});
 
-    // ORB High & Low Bands
     if (orbLevels && orbLevels.orb_h) {{
       candleSeries.createPriceLine({{
         price: parseFloat(orbLevels.orb_h),
@@ -505,7 +501,6 @@ html_code = f"""
       }});
     }}
 
-    // Dynamic ORB Fibonacci Lines
     if (fibLines) {{
       const fibTitles = {{
         'ORB_MID': 'ORB MID',
@@ -532,7 +527,6 @@ html_code = f"""
       chart.timeScale().fitContent();
     }}
 
-    // Crosshair Hover Handler: Shows Tooltip on Buy Signals
     chart.subscribeCrosshairMove(param => {{
       if (!param || !param.time || !param.point) {{
         hoverCard.style.display = 'none';
