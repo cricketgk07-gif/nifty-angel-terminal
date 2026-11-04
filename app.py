@@ -150,7 +150,7 @@ regime_mode_desc = f"BREAKOUT (≥{vol_threshold:.0f} ATR: 3x ATR Runner)" if is
 active_trade_type = hud.get("type") if (hud and hud.get("entry_spot")) else None
 is_trade_closed = hud.get("trade_closed", False) if hud else False
 
-status_label = "Awaiting 09:30-10:00 Window Trigger" if trades_taken == 0 else ("1/1 Daily Trade Locked (Execution Active)" if not is_trade_closed else f"Trade Closed [{hud.get('exit_reason', 'STOP HIT')}]")
+status_label = "Awaiting 09:30-14:30 Window Trigger" if trades_taken == 0 else ("1/1 Daily Trade Locked (Execution Active)" if not is_trade_closed else f"Trade Closed [{hud.get('exit_reason', 'STOP HIT')}]")
 
 # -------------------------------------------------------------
 # 4. Streamlined Strip Panel with Dynamic Trailing SL & N-Targets
