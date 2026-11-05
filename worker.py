@@ -45,11 +45,11 @@ try:
     if os.path.exists('trained_orb_model.pkl') and os.path.exists('model_cutoff.pkl'):
         ml_model = joblib.load('trained_orb_model.pkl')
         ml_cutoff = joblib.load('model_cutoff.pkl')
-        print(f'[INIT] Loaded compressed trained ML model and cutoff successfully: {ml_cutoff}')[cite: 2]
+        print(f'[INIT] Loaded compressed trained ML model and cutoff successfully: {ml_cutoff}')
     else:
         print('[INIT ERROR] Model files (.pkl) not found in local directory!')
 except Exception as e:
-    print(f'[INIT ERROR] Failed to load local model files: {e}')[cite: 2]
+    print(f'[INIT ERROR] Failed to load local model files: {e}')
 
 # ==========================================
 # 1. Health Server & Keepalive (Render Fix)
@@ -64,7 +64,7 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"WORKER_RUNNING_OK")[cite: 2]
+        self.wfile.write(b"WORKER_RUNNING_OK")
 
     def log_message(self, format, *args):
         pass
@@ -79,7 +79,7 @@ def self_ping_keepalive():
     while True:
         time.sleep(480)
         try:
-            requests.get(f"http://127.0.0.1:{PORT}/", timeout=5)[cite: 2]
+            requests.get(f"http://127.0.0.1:{PORT}/", timeout=5)
         except Exception:
             pass
 
@@ -89,19 +89,19 @@ threading.Thread(target=self_ping_keepalive, daemon=True).start()
 # 2. Math & Redis Helpers
 # ==========================================
 def norm_cdf(x):
-    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0[cite: 2]
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
 def compute_contract_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
     tau = max(days_to_exp / 365.0, 0.001)
     d1 = (math.log(s / k) + (r + 0.5 * iv ** 2) * tau) / (iv * math.sqrt(tau))
     ce_delta = norm_cdf(d1)
-    return round(ce_delta if is_ce else (1.0 - ce_delta), 2)[cite: 2]
+    return round(ce_delta if is_ce else (1.0 - ce_delta), 2)
 
 def is_market_hours():
     now = datetime.datetime.now(IST)
     if now.weekday() >= 5:
         return False
-    return datetime.time(9, 15) <= now.time() <= datetime.time(15, 30)[cite: 2]
+    return datetime.time(9, 15) <= now.time() <= datetime.time(15, 30)
 
 def send_telegram_alert(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -115,7 +115,7 @@ def send_telegram_alert(message: str):
     }
     try:
         r = requests.post(url, json=payload, timeout=6)
-        return r.status_code == 200[cite: 2]
+        return r.status_code == 200
     except Exception:
         return False
 
@@ -127,7 +127,7 @@ def push_to_redis(key, data_obj):
     try:
         requests.post(url, headers=headers, data=json.dumps(data_obj), timeout=3)
     except Exception as e:
-        print(f"[Redis Push Error]: {e}")[cite: 2]
+        print(f"[Redis Push Error]: {e}")
 
 def read_from_redis(key="nifty_live_state"):
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
@@ -350,9 +350,9 @@ class DedicatedTradingWorker:
             self.auth_token = self.session["data"]["jwtToken"]
             self.feed_token = self.api.getfeedToken()
             self.last_login_date = datetime.datetime.now(IST).date()
-            print(f"[Auth Success]: SmartAPI session generated for {self.last_login_date}")[cite: 2]
+            print(f"[Auth Success]: SmartAPI session generated for {self.last_login_date}")
         except Exception as e:
-            print(f"[Auth Error]: Session generation failed: {e}")[cite: 2]
+            print(f"[Auth Error]: Session generation failed: {e}")
 
     def load_scrip_master(self):
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -404,10 +404,10 @@ class DedicatedTradingWorker:
                     df_c = pd.DataFrame(cand_list)
                     df_c = calculate_indicators(df_c)
                     self.candles = df_c.to_dict("records")
-                    print(f"[Candles Loaded]: {len(self.candles)} candles starting from 09:15.")[cite: 2]
+                    print(f"[Candles Loaded]: {len(self.candles)} candles starting from 09:15.")
                     break
             except Exception as e:
-                print(f"[Candles Error]: {e}")[cite: 2]
+                print(f"[Candles Error]: {e}")
 
     def generate_historical_trade_markers(self):
         """Backtests past days' candles to populate historical markers and hover cards for past sessions."""
@@ -504,7 +504,7 @@ class DedicatedTradingWorker:
                     "PDL": pdl,
                 }
         except Exception as e:
-            print(f"[Daily Pivots Error]: {e}")[cite: 2]
+            print(f"[Daily Pivots Error]: {e}")
 
     def find_budget_strike(self, spot_ref, is_ce):
         budget_target = get_dynamic_budget()
@@ -942,7 +942,7 @@ class DedicatedTradingWorker:
 def run_worker():
     while True:
         try:
-            print("[Supervisor]: Initializing SmartAPI Session...")[cite: 2]
+            print("[Supervisor]: Initializing SmartAPI Session...")
             engine = DedicatedTradingWorker()
 
             def schedule_checker():
@@ -976,14 +976,14 @@ def run_worker():
                     engine.on_tick(ltp)
 
             def on_open(wsapp):
-                print("[WebSocket]: Connected & Subscribed to Nifty Index Token 99926000")[cite: 2]
+                print("[WebSocket]: Connected & Subscribed to Nifty Index Token 99926000")
                 sws.subscribe("correl_id_1", 1, [{"exchangeType": 1, "tokens": [INDEX_TOKEN]}])
 
             def on_error(wsapp, error):
-                print(f"[WebSocket Error]: {error}")[cite: 2]
+                print(f"[WebSocket Error]: {error}")
 
             def on_close(wsapp):
-                print("[WebSocket Closed]: Connection dropped.")[cite: 2]
+                print("[WebSocket Closed]: Connection dropped.")
 
             sws.on_open = on_open
             sws.on_data = on_data
@@ -992,7 +992,7 @@ def run_worker():
             sws.connect()
 
         except Exception as e:
-            print(f"[Supervisor Error]: {e}. Reconnecting in 10s...")[cite: 2]
+            print(f"[Supervisor Error]: {e}. Reconnecting in 10s...")
             time.sleep(10)
 
 if __name__ == "__main__":
