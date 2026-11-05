@@ -1,5 +1,5 @@
 """Nifty 50 ORB 1-Lot Production Script - Fully Synchronized
-with Updated Entry (body_frac < 0.12), TSL Milestone Tiers, and Compressed Local PKL Loading.
+with Updated Entry (body_frac < 0.12), TSL Milestone Tiers, and Direct Local PKL Loading.
 """
 
 from pathlib import Path
@@ -36,7 +36,7 @@ BUDGET_CEILING = float(os.getenv("BUDGET_CEILING", "80.0"))
 PORT = int(os.getenv("PORT", 10000))
 
 # ==========================================
-# 0. DIRECT LOCAL COMPRESSED ML MODEL SETUP (.pkl)
+# 0. DIRECT LOCAL ML MODEL SETUP (.pkl)
 # ==========================================
 ml_model = None
 ml_cutoff = 0.52
@@ -44,11 +44,11 @@ try:
     if os.path.exists('trained_orb_model.pkl') and os.path.exists('model_cutoff.pkl'):
         ml_model = joblib.load('trained_orb_model.pkl')
         ml_cutoff = joblib.load('model_cutoff.pkl')
-        print(f'[INIT] Loaded compressed trained ML model (33MB) and cutoff successfully: {ml_cutoff}')
+        print(f'[INIT] Loaded compressed trained ML model and cutoff successfully: {ml_cutoff}')[cite: 2]
     else:
         print('[INIT ERROR] Model files (.pkl) not found in local directory!')
 except Exception as e:
-    print(f'[INIT ERROR] Failed to load local model files: {e}')
+    print(f'[INIT ERROR] Failed to load local model files: {e}')[cite: 2]
 
 # ==========================================
 # 1. Health Server & Keepalive (Render Fix)
@@ -63,7 +63,7 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"WORKER_RUNNING_OK")
+        self.wfile.write(b"WORKER_RUNNING_OK")[cite: 2]
 
     def log_message(self, format, *args):
         pass
@@ -78,7 +78,7 @@ def self_ping_keepalive():
     while True:
         time.sleep(480)
         try:
-            requests.get(f"http://127.0.0.1:{PORT}/", timeout=5)
+            requests.get(f"http://127.0.0.1:{PORT}/", timeout=5)[cite: 2]
         except Exception:
             pass
 
@@ -88,19 +88,19 @@ threading.Thread(target=self_ping_keepalive, daemon=True).start()
 # 2. Math & Redis Helpers
 # ==========================================
 def norm_cdf(x):
-    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0[cite: 2]
 
 def compute_contract_delta(s, k, days_to_exp, is_ce=True, iv=0.14, r=0.07):
     tau = max(days_to_exp / 365.0, 0.001)
     d1 = (math.log(s / k) + (r + 0.5 * iv ** 2) * tau) / (iv * math.sqrt(tau))
     ce_delta = norm_cdf(d1)
-    return round(ce_delta if is_ce else (1.0 - ce_delta), 2)
+    return round(ce_delta if is_ce else (1.0 - ce_delta), 2)[cite: 2]
 
 def is_market_hours():
     now = datetime.datetime.now(IST)
     if now.weekday() >= 5:
         return False
-    return datetime.time(9, 15) <= now.time() <= datetime.time(15, 30)
+    return datetime.time(9, 15) <= now.time() <= datetime.time(15, 30)[cite: 2]
 
 def send_telegram_alert(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -114,7 +114,7 @@ def send_telegram_alert(message: str):
     }
     try:
         r = requests.post(url, json=payload, timeout=6)
-        return r.status_code == 200
+        return r.status_code == 200[cite: 2]
     except Exception:
         return False
 
@@ -126,7 +126,7 @@ def push_to_redis(key, data_obj):
     try:
         requests.post(url, headers=headers, data=json.dumps(data_obj), timeout=3)
     except Exception as e:
-        print(f"[Redis Push Error]: {e}")
+        print(f"[Redis Push Error]: {e}")[cite: 2]
 
 def read_from_redis(key="nifty_live_state"):
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
@@ -205,6 +205,7 @@ def extract_entry_candidates(byday):
             row = group.iloc[i]
             t = row['dt'].time()
 
+            # Session hours restored up to 14:30 as per strategy_entry.py
             if t > datetime.time(14, 30) or t < datetime.time(9, 30):
                 continue
 
@@ -243,6 +244,7 @@ def extract_entry_candidates(byday):
                     loc = (close_v - low_v) / rng
                     body_frac = abs(close_v - open_v) / rng
 
+                    # Optimized body fraction (< 0.12) as per strategy_entry.py
                     if body_frac < 0.12:
                         continue
 
@@ -348,9 +350,9 @@ class DedicatedTradingWorker:
             self.auth_token = self.session["data"]["jwtToken"]
             self.feed_token = self.api.getfeedToken()
             self.last_login_date = datetime.datetime.now(IST).date()
-            print(f"[Auth Success]: SmartAPI session generated for {self.last_login_date}")
+            print(f"[Auth Success]: SmartAPI session generated for {self.last_login_date}")[cite: 2]
         except Exception as e:
-            print(f"[Auth Error]: Session generation failed: {e}")
+            print(f"[Auth Error]: Session generation failed: {e}")[cite: 2]
 
     def load_scrip_master(self):
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -402,10 +404,10 @@ class DedicatedTradingWorker:
                     df_c = pd.DataFrame(cand_list)
                     df_c = calculate_indicators(df_c)
                     self.candles = df_c.to_dict("records")
-                    print(f"[Candles Loaded]: {len(self.candles)} candles starting from 09:15.")
+                    print(f"[Candles Loaded]: {len(self.candles)} candles starting from 09:15.")[cite: 2]
                     break
             except Exception as e:
-                print(f"[Candles Error]: {e}")
+                print(f"[Candles Error]: {e}")[cite: 2]
 
     def fetch_daily_pivots_and_levels(self):
         now = datetime.datetime.now(IST)
@@ -440,7 +442,7 @@ class DedicatedTradingWorker:
                     "PDL": pdl,
                 }
         except Exception as e:
-            print(f"[Daily Pivots Error]: {e}")
+            print(f"[Daily Pivots Error]: {e}")[cite: 2]
 
     def find_budget_strike(self, spot_ref, is_ce):
         budget_target = get_dynamic_budget()
@@ -738,6 +740,7 @@ class DedicatedTradingWorker:
             tr['peak'] = min(tr.get('peak', entry_p), live_spot)
             max_fav = entry_p - tr['peak']
 
+        # TSL Milestone Tiers Logic synchronized from strategy_tsl.py
         if max_fav >= 200.0:
             excess_blocks = int((max_fav - 200.0) // 25.0)
             milestone = 200.0 + (excess_blocks * 25.0)
@@ -878,7 +881,7 @@ class DedicatedTradingWorker:
 def run_worker():
     while True:
         try:
-            print("[Supervisor]: Initializing SmartAPI Session...")
+            print("[Supervisor]: Initializing SmartAPI Session...")[cite: 2]
             engine = DedicatedTradingWorker()
 
             def schedule_checker():
@@ -911,14 +914,14 @@ def run_worker():
                     engine.on_tick(ltp)
 
             def on_open(wsapp):
-                print("[WebSocket]: Connected & Subscribed to Nifty Index Token 99926000")
+                print("[WebSocket]: Connected & Subscribed to Nifty Index Token 99926000")[cite: 2]
                 sws.subscribe("correl_id_1", 1, [{"exchangeType": 1, "tokens": [INDEX_TOKEN]}])
 
             def on_error(wsapp, error):
-                print(f"[WebSocket Error]: {error}")
+                print(f"[WebSocket Error]: {error}")[cite: 2]
 
             def on_close(wsapp):
-                print("[WebSocket Closed]: Connection dropped.")
+                print("[WebSocket Closed]: Connection dropped.")[cite: 2]
 
             sws.on_open = on_open
             sws.on_data = on_data
@@ -927,7 +930,7 @@ def run_worker():
             sws.connect()
 
         except Exception as e:
-            print(f"[Supervisor Error]: {e}. Reconnecting in 10s...")
+            print(f"[Supervisor Error]: {e}. Reconnecting in 10s...")[cite: 2]
             time.sleep(10)
 
 if __name__ == "__main__":
