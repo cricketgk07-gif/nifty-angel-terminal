@@ -1,0 +1,13 @@
+streamlit
+pandas
+numpy
+pyotp
+requests
+smartapi-python
+websocket-client
+logzero
+python-dotenv
+plotly
+pyarrow
+scikit-learn
+upstash-redis
