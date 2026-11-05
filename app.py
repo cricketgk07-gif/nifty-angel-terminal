@@ -254,6 +254,10 @@ complete_banner_html = (
     '<div style="font-size:11px; color:#90a4ae;">PDH / PDL</div>'
     f'<div style="font-size:13px; font-weight:bold; color:#42a5f5;">{pdh_display} / {pdl_display}</div>'
     '</div>'
+    '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
+    f'<div style="font-size:11px; color:#90a4ae;">FIB 50% / 100% / 161% ({fib_dir})</div>'
+    f'<div style="font-size:13px; font-weight:bold; color:#b388ff;">{fib_50} / {fib_100} / {fib_161}</div>'
+    '</div>'
     '</div>'
     '<div style="border-top:1px solid #2a2e39; padding-top:8px;">'
     f'<div style="font-size:11px; color:#787b86; margin-bottom:4px; font-weight:bold;">EXECUTION & STRIKE MONITOR (BUDGET: ≤ ₹{current_budget:.0f})</div>'
@@ -341,7 +345,7 @@ html_code = f"""
   <script>
     const rawCandles = {candles_json} || [];
     const rawMarkers = {markers_json} || [];
-    const historyCards = {history_cards_json} || {{}};
+    let historyCards = {history_cards_json} || {{}};
     const pivots = {pivots_json} || {{}};
     const orbLevels = {orb_json} || {{}};
     const fibLines = {fib_json} || {{}};
@@ -358,11 +362,8 @@ html_code = f"""
     }}));
 
     const formattedMarkers = rawMarkers.map(m => ({{
-      time: m.time + IST_OFFSET,
-      position: m.position,
-      color: m.color,
-      shape: m.shape,
-      text: m.text
+      ...m,
+      time: m.time + IST_OFFSET
     }}));
 
     const container = document.getElementById('chart_container');
@@ -422,6 +423,79 @@ html_code = f"""
       candleSeries.setMarkers(formattedMarkers);
     }}
 
+    const visiblePivots = {{
+      'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
+      'R1':  {{ color: '#ef5350', title: 'R1' }},
+      'R2':  {{ color: '#e53935', title: 'R2' }},
+      'R3':  {{ color: '#d32f2f', title: 'R3' }},
+      'R4':  {{ color: '#c62828', title: 'R4' }},
+      'R5':  {{ color: '#b71c1c', title: 'R5' }},
+      'S1':  {{ color: '#26a69a', title: 'S1' }},
+      'S2':  {{ color: '#00897b', title: 'S2' }},
+      'S3':  {{ color: '#00796b', title: 'S3' }},
+      'S4':  {{ color: '#00695c', title: 'S4' }},
+      'S5':  {{ color: '#004d40', title: 'S5' }},
+      'PDH': {{ color: '#42a5f5', title: 'PDH' }},
+      'PDL': {{ color: '#ab47bc', title: 'PDL' }},
+    }};
+
+    Object.entries(pivots).forEach(([k, val]) => {{
+      const numVal = parseFloat(val);
+      if (!isNaN(numVal) && numVal > 0 && visiblePivots[k]) {{
+        candleSeries.createPriceLine({{
+          price: numVal,
+          color: visiblePivots[k].color,
+          lineWidth: 1,
+          lineStyle: LightweightCharts.LineStyle.Dashed,
+          axisLabelVisible: true,
+          title: visiblePivots[k].title,
+        }});
+      }}
+    }});
+
+    if (orbLevels && orbLevels.orb_h) {{
+      candleSeries.createPriceLine({{
+        price: parseFloat(orbLevels.orb_h),
+        color: '#00e676',
+        lineWidth: 2,
+        lineStyle: LightweightCharts.LineStyle.Solid,
+        axisLabelVisible: true,
+        title: 'ORB HIGH',
+      }});
+    }}
+    if (orbLevels && orbLevels.orb_l) {{
+      candleSeries.createPriceLine({{
+        price: parseFloat(orbLevels.orb_l),
+        color: '#ff5252',
+        lineWidth: 2,
+        lineStyle: LightweightCharts.LineStyle.Solid,
+        axisLabelVisible: true,
+        title: 'ORB LOW',
+      }});
+    }}
+
+    if (fibLines) {{
+      const fibTitles = {{
+        'ORB_MID': 'ORB MID',
+        'fib_50': 'FIB 50%',
+        'fib_100': 'FIB 100%',
+        'fib_161': 'FIB 161.8%'
+      }};
+      Object.entries(fibLines).forEach(([fKey, fVal]) => {{
+        const numVal = parseFloat(fVal);
+        if (!isNaN(numVal) && numVal > 0 && fibTitles[fKey]) {{
+          candleSeries.createPriceLine({{
+            price: numVal,
+            color: '#b388ff',
+            lineWidth: 1,
+            lineStyle: LightweightCharts.LineStyle.Dotted,
+            axisLabelVisible: true,
+            title: fibTitles[fKey],
+          }});
+        }}
+      }});
+    }}
+
     if (formattedCandles.length > 0) {{
       chart.timeScale().fitContent();
     }}
@@ -476,16 +550,22 @@ html_code = f"""
                   close: latestCandle.close
                 }};
                 candleSeries.update(shiftedCandle);
+                if (latestCandle.vwap) {{
+                  vwapSeries.update({{ time: shiftedCandle.time, value: latestCandle.vwap }});
+                }}
+                if (latestCandle.ema9) {{
+                  emaSeries.update({{ time: shiftedCandle.time, value: latestCandle.ema9 }});
+                }}
               }}
               if (liveState && liveState.markers) {{
                 const updatedMarkers = liveState.markers.map(m => ({{
-                  time: m.time + IST_OFFSET,
-                  position: m.position,
-                  color: m.color,
-                  shape: m.shape,
-                  text: m.text
+                  ...m,
+                  time: m.time + IST_OFFSET
                 }}));
                 candleSeries.setMarkers(updatedMarkers);
+              }}
+              if (liveState && liveState.history_cards) {{
+                historyCards = liveState.history_cards;
               }}
               if (liveState && liveState.ltp) {{
                 const el = window.parent.document.getElementById('live_ltp_display');
