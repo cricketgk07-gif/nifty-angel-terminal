@@ -441,8 +441,9 @@ class DedicatedTradingWorker:
                     sig = valid.iloc[0]
                     side = sig['side']
                     entry_spot = float(sig['entry_price'])
-                    t_sec = int(pd.Timestamp(sig['signal_time']).timestamp())
-                    trigger_time_str = pd.Timestamp(sig['signal_time']).strftime('%H:%M')
+                    dt_val = pd.Timestamp(sig['signal_time'])
+                    t_sec = int(dt_val.timestamp())
+                    trigger_time_str = dt_val.strftime('%H:%M')
 
                     init_sl = entry_spot - 40.0 if side == 'CE' else entry_spot + 40.0
                     target_p = entry_spot + 100.0 if side == 'CE' else entry_spot - 100.0
@@ -453,10 +454,10 @@ class DedicatedTradingWorker:
                             "position": "belowBar" if side == 'CE' else "aboveBar",
                             "color": "#00e676" if side == 'CE' else "#ff5252",
                             "shape": "arrowUp" if side == 'CE' else "arrowDown",
-                            "text": f"{side}",
+                            "text": f"BUY {side}",
                         })
 
-                    self.history_cards[str(t_sec)] = {
+                    card_payload = {
                         "title": f"ORB {side} [{day_key}]",
                         "time_str": trigger_time_str,
                         "entry": round(entry_spot, 1),
@@ -468,6 +469,8 @@ class DedicatedTradingWorker:
                         "type": side,
                         "outcome": "NET: +35.00 pts",
                     }
+                    self.history_cards[str(t_sec)] = card_payload
+                    self.history_cards[str(t_sec + 19800)] = card_payload
             except Exception as e:
                 print(f"[Historical Marker Error for {day_key}]: {e}")
 
