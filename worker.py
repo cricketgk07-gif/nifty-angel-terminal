@@ -375,7 +375,7 @@ class DedicatedTradingWorker:
 
     def init_historical_candles(self):
         now = datetime.datetime.now(IST)
-        for days_back in [15, 7]:
+        for days_back in [5, 3]:  # Optimized lookback to prevent OOM
             from_dt = now - datetime.timedelta(days=days_back)
             from_str = from_dt.strftime("%Y-%m-%d 09:15")
             to_str = now.strftime("%Y-%m-%d %H:%M")
@@ -923,7 +923,7 @@ class DedicatedTradingWorker:
                     "vwap": float(c.get("vwap", c["close"])),
                 }
 
-        recent_candles = [clean_map[t] for t in sorted(clean_map.keys())][-450:]
+        recent_candles = [clean_map[t] for t in sorted(clean_map.keys())][-200:]
 
         payload = {
             "ltp": float(live_ltp), "opt_ltp": float(opt_ltp),
