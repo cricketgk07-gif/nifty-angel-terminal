@@ -1,0 +1,10 @@
+pandas
+numpy
+scikit-learn==1.6.1
+joblib
+pyotp
+requests
+ijson
+smartapi-python
+websocket-client
+logzero
