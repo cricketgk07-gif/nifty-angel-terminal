@@ -70,6 +70,7 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 def run_ping_server():
+    socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer(("0.0.0.0", PORT), HealthHandler) as httpd:
         httpd.serve_forever()
 
@@ -375,7 +376,6 @@ class DedicatedTradingWorker:
 
     def init_historical_candles(self):
         now = datetime.datetime.now(IST)
-        # Optimized low-memory lookback (3 days) to prevent Render OOM (512MB RAM)
         for days_back in [3, 2]:
             from_dt = now - datetime.timedelta(days=days_back)
             from_str = from_dt.strftime("%Y-%m-%d 09:15")
