@@ -6,7 +6,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 st.set_page_config(
-    page_title="NIFTY ML-ORB Terminal",
+    page_title="NIFTY ML-ORB Master Terminal",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -57,9 +57,6 @@ contract_preview = state_data.get("contract_preview", {})
 prev_day_summary = state_data.get("prev_day_summary", {})
 hud = state_data.get("hud", {})
 
-daily_atr10 = float(state_data.get("daily_atr10", 321.8))
-is_high_vol = state_data.get("is_high_vol", True)
-vol_threshold = float(state_data.get("vol_threshold", 229.0))
 trades_taken = state_data.get("trades_taken_today", 0)
 
 saved_budget = read_redis_key("user_selected_budget")
@@ -70,10 +67,10 @@ current_budget = float(saved_budget) if saved_budget is not None else BUDGET_CEI
 # -------------------------------------------------------------
 col_title, col_budget, col_refresh = st.columns([3, 2, 1])
 
-regime_str = "BREAKOUT DAY" if is_high_vol else "FADE DAY"
-badge_color = "#00e676" if is_high_vol else "#2962ff"
-badge_text_color = "#000000" if is_high_vol else "#ffffff"
-regime_badge = f"<span style='background:{badge_color}; color:{badge_text_color}; padding:3px 10px; border-radius:4px; font-size:12px; font-weight:bold; margin-left:10px;'>{regime_str} (10-ATR: {daily_atr10:.1f})</span>"
+regime_str = "ML-ORB ACTIVE"
+badge_color = "#00e676"
+badge_text_color = "#000000"
+regime_badge = f"<span style='background:{badge_color}; color:{badge_text_color}; padding:3px 10px; border-radius:4px; font-size:12px; font-weight:bold; margin-left:10px;'>{regime_str}</span>"
 
 with col_title:
     st.markdown(
@@ -130,14 +127,14 @@ orb_l_display = orb_levels.get("orb_l", "—")
 pivot_p_display = pivots.get("P", "—")
 pdh_display = pivots.get("PDH", "—")
 pdl_display = pivots.get("PDL", "—")
-fib_dir = fib_lines.get("direction", "UP")
+fib_dir = fib_lines.get("direction", "NEUTRAL")
 fib_50 = fib_lines.get("fib_50", "—")
 fib_100 = fib_lines.get("fib_100", "—")
 fib_161 = fib_lines.get("fib_161", "—")
 
 ce_f = contract_preview.get("CE", {})
 pe_f = contract_preview.get("PE", {})
-regime_mode_desc = f"BREAKOUT (≥{vol_threshold:.0f} ATR: 3x ATR Runner)" if is_high_vol else f"FADE (<{vol_threshold:.0f} ATR: 0.5 ATR Sweep to VWAP)"
+regime_mode_desc = "Nifty 5-Min Opening Range Breakout (ML Gatekeeper Active)"
 
 active_trade_type = hud.get("type") if (hud and hud.get("entry_spot")) else None
 is_trade_closed = hud.get("trade_closed", False) if hud else False
@@ -234,11 +231,7 @@ complete_banner_html = (
     '</div>'
     '<div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:10px;">'
     '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
-    '<div style="font-size:11px; color:#90a4ae;">DAILY 10-ATR</div>'
-    f'<div style="font-size:13px; font-weight:bold; color:#ffb74d;">{daily_atr10:.1f} / {vol_threshold:.0f}</div>'
-    '</div>'
-    '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
-    '<div style="font-size:11px; color:#90a4ae;">REGIME MODE</div>'
+    '<div style="font-size:11px; color:#90a4ae;">STRATEGY ENGINE</div>'
     f'<div style="font-size:13px; font-weight:bold; color:#42a5f5;">{regime_mode_desc}</div>'
     '</div>'
     '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
@@ -268,7 +261,7 @@ complete_banner_html = (
 st.markdown(complete_banner_html, unsafe_allow_html=True)
 
 # -------------------------------------------------------------
-# 5. Interactive Candlestick Chart with Full Levels & Video-Matched Hover Card
+# 5. Interactive Candlestick Chart with Full Levels & Hover Cards
 # -------------------------------------------------------------
 candles_json = json.dumps(candles)
 markers_json = json.dumps(markers)
@@ -279,7 +272,7 @@ fib_json = json.dumps(fib_lines)
 redis_url_str = UPSTASH_REDIS_REST_URL
 redis_token_str = UPSTASH_REDIS_REST_TOKEN
 
-chart_regime_text = f"BREAKOUT DAY (10-ATR: {daily_atr10:.0f} ≥ {vol_threshold:.0f})"
+chart_regime_text = "NIFTY ML-ORB LIVE ENGINE"
 chart_badge_bg = "rgba(0, 230, 118, 0.2)"
 chart_border_color = "#00e676"
 
@@ -422,7 +415,7 @@ html_code = f"""
       candleSeries.setMarkers(formattedMarkers);
     }}
 
-    // --- Full Pivot, ORB, and Fib Levels Restored as in Video ---
+    // --- Full Pivot, S/R, and Fib Levels ---
     const visiblePivots = {{
       'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
       'R1':  {{ color: '#ef5350', title: 'R1' }},
@@ -500,7 +493,7 @@ html_code = f"""
       chart.timeScale().fitContent();
     }}
 
-    // --- Hover Card Crosshair Interaction Matching Video Format ---
+    // --- Hover Card Crosshair Interaction ---
     chart.subscribeCrosshairMove(param => {{
       if (!param || !param.time || !param.point) {{
         hoverCard.style.display = 'none';
