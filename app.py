@@ -6,7 +6,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 st.set_page_config(
-    page_title="NIFTY ML-ORB Master Terminal",
+    page_title="NIFTY ML-ORB Terminal",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -127,10 +127,6 @@ orb_l_display = orb_levels.get("orb_l", "—")
 pivot_p_display = pivots.get("P", "—")
 pdh_display = pivots.get("PDH", "—")
 pdl_display = pivots.get("PDL", "—")
-fib_dir = fib_lines.get("direction", "NEUTRAL")
-fib_50 = fib_lines.get("fib_50", "—")
-fib_100 = fib_lines.get("fib_100", "—")
-fib_161 = fib_lines.get("fib_161", "—")
 
 ce_f = contract_preview.get("CE", {})
 pe_f = contract_preview.get("PE", {})
@@ -142,12 +138,9 @@ is_trade_closed = hud.get("trade_closed", False) if hud else False
 status_label = "Awaiting 09:30-14:30 Window Trigger" if trades_taken == 0 else ("1/1 Daily Trade Locked (Execution Active)" if not is_trade_closed else f"Trade Closed [{hud.get('exit_reason', 'STOP HIT')}]")
 
 # -------------------------------------------------------------
-# 4. Streamlined Strip Panel with Dynamic Trailing SL & N-Targets
+# 4. Streamlined Strip Panel
 # -------------------------------------------------------------
 orb_mid = float(fib_lines.get("ORB_MID", ltp))
-orb_h_val = float(orb_levels.get("orb_h", 999999.0))
-orb_l_val = float(orb_levels.get("orb_l", 0.0))
-
 is_strat_call = (ltp >= orb_mid)
 
 if active_trade_type:
@@ -184,7 +177,6 @@ if active_trade_type:
             f'<div style="font-size:12px;"><span style="color:#90a4ae; font-weight:bold;">{lbl} :</span> '
             f'<b style="color:#ffb74d;">{tg_val:.1f} (₹{tg_opt:.2f})</b></div>'
         )
-
 else:
     chosen_f = ce_f if is_strat_call else pe_f
     contract_title = f"{'CALL OPTION (CE)' if is_strat_call else 'PUT OPTION (PE)'} PREVIEW"
@@ -254,10 +246,6 @@ complete_banner_html = (
     '<div style="font-size:11px; color:#90a4ae;">PDH / PDL</div>'
     f'<div style="font-size:13px; font-weight:bold; color:#42a5f5;">{pdh_display} / {pdl_display}</div>'
     '</div>'
-    '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
-    f'<div style="font-size:11px; color:#90a4ae;">FIB 50% / 100% / 161% ({fib_dir})</div>'
-    f'<div style="font-size:13px; font-weight:bold; color:#b388ff;">{fib_50} / {fib_100} / {fib_161}</div>'
-    '</div>'
     '</div>'
     '<div style="border-top:1px solid #2a2e39; padding-top:8px;">'
     f'<div style="font-size:11px; color:#787b86; margin-bottom:4px; font-weight:bold;">EXECUTION & STRIKE MONITOR (BUDGET: ≤ ₹{current_budget:.0f})</div>'
@@ -269,14 +257,13 @@ complete_banner_html = (
 st.markdown(complete_banner_html, unsafe_allow_html=True)
 
 # -------------------------------------------------------------
-# 5. Interactive Candlestick Chart (Lightweight Charts Canvas)
+# 5. Interactive Candlestick Chart (Essential Levels Only)
 # -------------------------------------------------------------
 candles_json = json.dumps(candles)
 markers_json = json.dumps(markers)
 history_cards_json = json.dumps(history_cards)
 pivots_json = json.dumps(pivots)
 orb_json = json.dumps(orb_levels)
-fib_json = json.dumps(fib_lines)
 redis_url_str = UPSTASH_REDIS_REST_URL
 redis_token_str = UPSTASH_REDIS_REST_TOKEN
 
@@ -348,7 +335,6 @@ html_code = f"""
     let historyCards = {history_cards_json} || {{}};
     const pivots = {pivots_json} || {{}};
     const orbLevels = {orb_json} || {{}};
-    const fibLines = {fib_json} || {{}};
     const IST_OFFSET = 19800;
 
     const formattedCandles = rawCandles.map(c => ({{
@@ -423,32 +409,23 @@ html_code = f"""
       candleSeries.setMarkers(formattedMarkers);
     }}
 
-    const visiblePivots = {{
+    // --- Essential Price Lines Only ---
+    const cleanPivots = {{
       'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
-      'R1':  {{ color: '#ef5350', title: 'R1' }},
-      'R2':  {{ color: '#e53935', title: 'R2' }},
-      'R3':  {{ color: '#d32f2f', title: 'R3' }},
-      'R4':  {{ color: '#c62828', title: 'R4' }},
-      'R5':  {{ color: '#b71c1c', title: 'R5' }},
-      'S1':  {{ color: '#26a69a', title: 'S1' }},
-      'S2':  {{ color: '#00897b', title: 'S2' }},
-      'S3':  {{ color: '#00796b', title: 'S3' }},
-      'S4':  {{ color: '#00695c', title: 'S4' }},
-      'S5':  {{ color: '#004d40', title: 'S5' }},
       'PDH': {{ color: '#42a5f5', title: 'PDH' }},
       'PDL': {{ color: '#ab47bc', title: 'PDL' }},
     }};
 
     Object.entries(pivots).forEach(([k, val]) => {{
       const numVal = parseFloat(val);
-      if (!isNaN(numVal) && numVal > 0 && visiblePivots[k]) {{
+      if (!isNaN(numVal) && numVal > 0 && cleanPivots[k]) {{
         candleSeries.createPriceLine({{
           price: numVal,
-          color: visiblePivots[k].color,
+          color: cleanPivots[k].color,
           lineWidth: 1,
           lineStyle: LightweightCharts.LineStyle.Dashed,
           axisLabelVisible: true,
-          title: visiblePivots[k].title,
+          title: cleanPivots[k].title,
         }});
       }}
     }});
@@ -474,39 +451,18 @@ html_code = f"""
       }});
     }}
 
-    if (fibLines) {{
-      const fibTitles = {{
-        'ORB_MID': 'ORB MID',
-        'fib_50': 'FIB 50%',
-        'fib_100': 'FIB 100%',
-        'fib_161': 'FIB 161.8%'
-      }};
-      Object.entries(fibLines).forEach(([fKey, fVal]) => {{
-        const numVal = parseFloat(fVal);
-        if (!isNaN(numVal) && numVal > 0 && fibTitles[fKey]) {{
-          candleSeries.createPriceLine({{
-            price: numVal,
-            color: '#b388ff',
-            lineWidth: 1,
-            lineStyle: LightweightCharts.LineStyle.Dotted,
-            axisLabelVisible: true,
-            title: fibTitles[fKey],
-          }});
-        }}
-      }});
-    }}
-
     if (formattedCandles.length > 0) {{
       chart.timeScale().fitContent();
     }}
 
+    // --- Hover Card Crosshair Interaction ---
     chart.subscribeCrosshairMove(param => {{
       if (!param || !param.time || !param.point) {{
         hoverCard.style.display = 'none';
         return;
       }}
       const rawSecKey = String(param.time - IST_OFFSET);
-      const cardData = historyCards[rawSecKey] || historyCards[String(param.time)];
+      const cardData = historyCards[rawSecKey] || historyCards[String(param.time)] || historyCards[String(param.time + IST_OFFSET)];
       if (cardData) {{
         const isCe = cardData.type === 'CE';
         const color = isCe ? '#00e676' : '#ff5252';
