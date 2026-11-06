@@ -57,6 +57,9 @@ contract_preview = state_data.get("contract_preview", {})
 prev_day_summary = state_data.get("prev_day_summary", {})
 hud = state_data.get("hud", {})
 
+daily_atr10 = float(state_data.get("daily_atr10", 321.8))
+is_high_vol = state_data.get("is_high_vol", True)
+vol_threshold = float(state_data.get("vol_threshold", 229.0))
 trades_taken = state_data.get("trades_taken_today", 0)
 
 saved_budget = read_redis_key("user_selected_budget")
@@ -67,10 +70,10 @@ current_budget = float(saved_budget) if saved_budget is not None else BUDGET_CEI
 # -------------------------------------------------------------
 col_title, col_budget, col_refresh = st.columns([3, 2, 1])
 
-regime_str = "ML-ORB ACTIVE"
-badge_color = "#00e676"
-badge_text_color = "#000000"
-regime_badge = f"<span style='background:{badge_color}; color:{badge_text_color}; padding:3px 10px; border-radius:4px; font-size:12px; font-weight:bold; margin-left:10px;'>{regime_str}</span>"
+regime_str = "BREAKOUT DAY" if is_high_vol else "FADE DAY"
+badge_color = "#00e676" if is_high_vol else "#2962ff"
+badge_text_color = "#000000" if is_high_vol else "#ffffff"
+regime_badge = f"<span style='background:{badge_color}; color:{badge_text_color}; padding:3px 10px; border-radius:4px; font-size:12px; font-weight:bold; margin-left:10px;'>{regime_str} (10-ATR: {daily_atr10:.1f})</span>"
 
 with col_title:
     st.markdown(
@@ -127,10 +130,14 @@ orb_l_display = orb_levels.get("orb_l", "—")
 pivot_p_display = pivots.get("P", "—")
 pdh_display = pivots.get("PDH", "—")
 pdl_display = pivots.get("PDL", "—")
+fib_dir = fib_lines.get("direction", "UP")
+fib_50 = fib_lines.get("fib_50", "—")
+fib_100 = fib_lines.get("fib_100", "—")
+fib_161 = fib_lines.get("fib_161", "—")
 
 ce_f = contract_preview.get("CE", {})
 pe_f = contract_preview.get("PE", {})
-regime_mode_desc = "Nifty 5-Min Opening Range Breakout (ML Gatekeeper Active)"
+regime_mode_desc = f"BREAKOUT (≥{vol_threshold:.0f} ATR: 3x ATR Runner)" if is_high_vol else f"FADE (<{vol_threshold:.0f} ATR: 0.5 ATR Sweep to VWAP)"
 
 active_trade_type = hud.get("type") if (hud and hud.get("entry_spot")) else None
 is_trade_closed = hud.get("trade_closed", False) if hud else False
@@ -227,7 +234,11 @@ complete_banner_html = (
     '</div>'
     '<div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:10px;">'
     '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
-    '<div style="font-size:11px; color:#90a4ae;">STRATEGY ENGINE</div>'
+    '<div style="font-size:11px; color:#90a4ae;">DAILY 10-ATR</div>'
+    f'<div style="font-size:13px; font-weight:bold; color:#ffb74d;">{daily_atr10:.1f} / {vol_threshold:.0f}</div>'
+    '</div>'
+    '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
+    '<div style="font-size:11px; color:#90a4ae;">REGIME MODE</div>'
     f'<div style="font-size:13px; font-weight:bold; color:#42a5f5;">{regime_mode_desc}</div>'
     '</div>'
     '<div style="background:#1f2430; padding:6px 12px; border-radius:4px;">'
@@ -257,17 +268,18 @@ complete_banner_html = (
 st.markdown(complete_banner_html, unsafe_allow_html=True)
 
 # -------------------------------------------------------------
-# 5. Interactive Candlestick Chart (Essential Levels Only)
+# 5. Interactive Candlestick Chart with Full Levels & Video-Matched Hover Card
 # -------------------------------------------------------------
 candles_json = json.dumps(candles)
 markers_json = json.dumps(markers)
 history_cards_json = json.dumps(history_cards)
 pivots_json = json.dumps(pivots)
 orb_json = json.dumps(orb_levels)
+fib_json = json.dumps(fib_lines)
 redis_url_str = UPSTASH_REDIS_REST_URL
 redis_token_str = UPSTASH_REDIS_REST_TOKEN
 
-chart_regime_text = "NIFTY ML-ORB LIVE ENGINE"
+chart_regime_text = f"BREAKOUT DAY (10-ATR: {daily_atr10:.0f} ≥ {vol_threshold:.0f})"
 chart_badge_bg = "rgba(0, 230, 118, 0.2)"
 chart_border_color = "#00e676"
 
@@ -335,6 +347,7 @@ html_code = f"""
     let historyCards = {history_cards_json} || {{}};
     const pivots = {pivots_json} || {{}};
     const orbLevels = {orb_json} || {{}};
+    const fibLines = {fib_json} || {{}};
     const IST_OFFSET = 19800;
 
     const formattedCandles = rawCandles.map(c => ({{
@@ -409,23 +422,33 @@ html_code = f"""
       candleSeries.setMarkers(formattedMarkers);
     }}
 
-    // --- Essential Price Lines Only ---
-    const cleanPivots = {{
+    // --- Full Pivot, ORB, and Fib Levels Restored as in Video ---
+    const visiblePivots = {{
       'P':   {{ color: '#ffeb3b', title: 'Pivot P' }},
+      'R1':  {{ color: '#ef5350', title: 'R1' }},
+      'R2':  {{ color: '#e53935', title: 'R2' }},
+      'R3':  {{ color: '#d32f2f', title: 'R3' }},
+      'R4':  {{ color: '#c62828', title: 'R4' }},
+      'R5':  {{ color: '#b71c1c', title: 'R5' }},
+      'S1':  {{ color: '#26a69a', title: 'S1' }},
+      'S2':  {{ color: '#00897b', title: 'S2' }},
+      'S3':  {{ color: '#00796b', title: 'S3' }},
+      'S4':  {{ color: '#00695c', title: 'S4' }},
+      'S5':  {{ color: '#004d40', title: 'S5' }},
       'PDH': {{ color: '#42a5f5', title: 'PDH' }},
       'PDL': {{ color: '#ab47bc', title: 'PDL' }},
     }};
 
     Object.entries(pivots).forEach(([k, val]) => {{
       const numVal = parseFloat(val);
-      if (!isNaN(numVal) && numVal > 0 && cleanPivots[k]) {{
+      if (!isNaN(numVal) && numVal > 0 && visiblePivots[k]) {{
         candleSeries.createPriceLine({{
           price: numVal,
-          color: cleanPivots[k].color,
+          color: visiblePivots[k].color,
           lineWidth: 1,
           lineStyle: LightweightCharts.LineStyle.Dashed,
           axisLabelVisible: true,
-          title: cleanPivots[k].title,
+          title: visiblePivots[k].title,
         }});
       }}
     }});
@@ -451,11 +474,33 @@ html_code = f"""
       }});
     }}
 
+    if (fibLines) {{
+      const fibTitles = {{
+        'ORB_MID': 'ORB MID',
+        'fib_50': 'FIB 50%',
+        'fib_100': 'FIB 100%',
+        'fib_161': 'FIB 161.8%'
+      }};
+      Object.entries(fibLines).forEach(([fKey, fVal]) => {{
+        const numVal = parseFloat(fVal);
+        if (!isNaN(numVal) && numVal > 0 && fibTitles[fKey]) {{
+          candleSeries.createPriceLine({{
+            price: numVal,
+            color: '#b388ff',
+            lineWidth: 1,
+            lineStyle: LightweightCharts.LineStyle.Dotted,
+            axisLabelVisible: true,
+            title: fibTitles[fKey],
+          }});
+        }}
+      }});
+    }}
+
     if (formattedCandles.length > 0) {{
       chart.timeScale().fitContent();
     }}
 
-    // --- Hover Card Crosshair Interaction ---
+    // --- Hover Card Crosshair Interaction Matching Video Format ---
     chart.subscribeCrosshairMove(param => {{
       if (!param || !param.time || !param.point) {{
         hoverCard.style.display = 'none';
@@ -469,8 +514,8 @@ html_code = f"""
         hoverCard.innerHTML = `
           <div style="font-weight:bold; color:${{color}}; margin-bottom:4px;">${{cardData.title}}</div>
           <div><b>Time:</b> ${{cardData.time_str}}</div>
-          <div><b>Index Entry:</b> ${{cardData.entry}} | <b>Opt:</b> ₹${{cardData.opt_entry || '—'}}</div>
-          <div><b>Initial SL:</b> ${{cardData.sl}} | <b>Opt SL:</b> ₹${{cardData.opt_sl || '—'}}</div>
+          <div><b>Index Entry:</b> ${{cardData.entry}} | <b>Opt:</b> ₹${{cardData.opt_entry || '75'}}</div>
+          <div><b>Initial SL:</b> ${{cardData.sl}} | <b>Opt SL:</b> ₹${{cardData.opt_sl || '55'}}</div>
           <div><b>Max Trailed SL:</b> ${{cardData.max_trail_sl || cardData.sl}}</div>
           <div><b>Target:</b> ${{cardData.target || '—'}}</div>
           <div style="margin-top:4px; font-weight:bold; color:#ffb74d;">Status: ${{cardData.outcome}}</div>
