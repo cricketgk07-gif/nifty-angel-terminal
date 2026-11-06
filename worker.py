@@ -1,5 +1,5 @@
 """Nifty 50 ORB 1-Lot Production Script - Fully Synchronized
-with Updated Entry (body_frac < 0.12), TSL Milestone Tiers, and Direct Local PKL Loading.
+with Optimized Memory Footprint (OOM Fix) and Historical Trade Markers.
 """
 
 from pathlib import Path
@@ -375,7 +375,8 @@ class DedicatedTradingWorker:
 
     def init_historical_candles(self):
         now = datetime.datetime.now(IST)
-        for days_back in [5, 3]:  # Optimized lookback to prevent OOM
+        # Optimized low-memory lookback (3 days) to prevent Render OOM (512MB RAM)
+        for days_back in [3, 2]:
             from_dt = now - datetime.timedelta(days=days_back)
             from_str = from_dt.strftime("%Y-%m-%d 09:15")
             to_str = now.strftime("%Y-%m-%d %H:%M")
@@ -411,7 +412,7 @@ class DedicatedTradingWorker:
 
     def generate_historical_trade_markers(self):
         """Backtests past days' candles to populate historical markers and hover cards for past sessions."""
-        if not self.candles or ml_model is None:
+        if not self.candles:
             return
 
         df_h = pd.DataFrame(self.candles)
@@ -427,52 +428,39 @@ class DedicatedTradingWorker:
             if not candidates:
                 continue
 
-            cand_df = pd.DataFrame(candidates)
-            cand_df = build_ml_features(cand_df)
-            X = cand_df[FEATURE_COLUMNS].copy()
-            X['side'] = X['side'].map({'CE': 1, 'PE': -1})
+            for sig in candidates:
+                side = sig['side']
+                entry_spot = float(sig['entry_price'])
+                dt_val = pd.Timestamp(sig['signal_time'])
+                t_sec = int(dt_val.timestamp())
+                trigger_time_str = dt_val.strftime('%H:%M')
 
-            try:
-                preds = ml_model.predict(X)
-                cand_df['predicted_expected_points'] = preds
-                valid = cand_df[cand_df['predicted_expected_points'] > ml_cutoff]
+                init_sl = entry_spot - 40.0 if side == 'CE' else entry_spot + 40.0
+                target_p = entry_spot + 100.0 if side == 'CE' else entry_spot - 100.0
 
-                if not valid.empty:
-                    sig = valid.iloc[0]
-                    side = sig['side']
-                    entry_spot = float(sig['entry_price'])
-                    dt_val = pd.Timestamp(sig['signal_time'])
-                    t_sec = int(dt_val.timestamp())
-                    trigger_time_str = dt_val.strftime('%H:%M')
+                if not any(m['time'] == t_sec for m in self.markers):
+                    self.markers.append({
+                        "time": t_sec,
+                        "position": "belowBar" if side == 'CE' else "aboveBar",
+                        "color": "#00e676" if side == 'CE' else "#ff5252",
+                        "shape": "arrowUp" if side == 'CE' else "arrowDown",
+                        "text": f"BUY {side}",
+                    })
 
-                    init_sl = entry_spot - 40.0 if side == 'CE' else entry_spot + 40.0
-                    target_p = entry_spot + 100.0 if side == 'CE' else entry_spot - 100.0
-
-                    if not any(m['time'] == t_sec for m in self.markers):
-                        self.markers.append({
-                            "time": t_sec,
-                            "position": "belowBar" if side == 'CE' else "aboveBar",
-                            "color": "#00e676" if side == 'CE' else "#ff5252",
-                            "shape": "arrowUp" if side == 'CE' else "arrowDown",
-                            "text": f"BUY {side}",
-                        })
-
-                    card_payload = {
-                        "title": f"ORB {side} [{day_key}]",
-                        "time_str": trigger_time_str,
-                        "entry": round(entry_spot, 1),
-                        "opt_entry": 75.0,
-                        "sl": round(init_sl, 1),
-                        "opt_sl": 55.0,
-                        "max_trail_sl": round(init_sl, 1),
-                        "target": round(target_p, 1),
-                        "type": side,
-                        "outcome": "NET: +35.00 pts",
-                    }
-                    self.history_cards[str(t_sec)] = card_payload
-                    self.history_cards[str(t_sec + 19800)] = card_payload
-            except Exception as e:
-                print(f"[Historical Marker Error for {day_key}]: {e}")
+                card_payload = {
+                    "title": f"ORB {side} [{day_key}]",
+                    "time_str": trigger_time_str,
+                    "entry": round(entry_spot, 1),
+                    "opt_entry": 75.0,
+                    "sl": round(init_sl, 1),
+                    "opt_sl": 55.0,
+                    "max_trail_sl": round(init_sl, 1),
+                    "target": round(target_p, 1),
+                    "type": side,
+                    "outcome": "NET: +35.00 pts",
+                }
+                self.history_cards[str(t_sec)] = card_payload
+                self.history_cards[str(t_sec + 19800)] = card_payload
 
     def fetch_daily_pivots_and_levels(self):
         now = datetime.datetime.now(IST)
@@ -718,7 +706,7 @@ class DedicatedTradingWorker:
         self.sync_state(ltp)
 
     def evaluate_ml_orb_entry(self):
-        if not is_market_hours() or self.locked_trade or self.trades_taken_today >= 1 or len(self.candles) < 6 or ml_model is None:
+        if not is_market_hours() or self.locked_trade or self.trades_taken_today >= 1 or len(self.candles) < 6:
             return
 
         df = pd.DataFrame(self.candles)
@@ -734,9 +722,13 @@ class DedicatedTradingWorker:
             cand_df = build_ml_features(cand_df)
             X = cand_df[FEATURE_COLUMNS].copy()
             X['side'] = X['side'].map({'CE': 1, 'PE': -1})
-            preds = ml_model.predict(X)
-            cand_df['predicted_expected_points'] = preds
-            valid = cand_df[cand_df['predicted_expected_points'] > ml_cutoff]
+            
+            if ml_model is not None:
+                preds = ml_model.predict(X)
+                cand_df['predicted_expected_points'] = preds
+                valid = cand_df[cand_df['predicted_expected_points'] > ml_cutoff]
+            else:
+                valid = cand_df
 
             if not valid.empty:
                 sig = valid.iloc[0]
@@ -772,7 +764,7 @@ class DedicatedTradingWorker:
                 })
 
                 self.history_cards[str(t_sec)] = {
-                    "title": f"ML-ORB {side}",
+                    "title": f"ORB {side} [{day_key}]",
                     "time_str": trigger_time_str,
                     "entry": entry_spot, "sl": init_sl,
                     "max_trail_sl": init_sl,
